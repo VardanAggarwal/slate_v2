@@ -136,6 +136,21 @@ Rules:
 ### recall(query, k) → results   [$0, local]
 Vector seed over claims/concepts → spreading activation through `relations` and `concept_members` (decay per hop, weight by strength/recency/state) → ranked results with why-now signals (port: bridge 🌉, frequency 🔁, time-gap 🕰️). Two-hop activation is what surfaces non-obvious connections.
 
+### Read/browse API   [$0, local SQL — lives in recall.py or a small read.py]
+Direct lookups, no LLM, no embeddings. These back the MCP tools and replace v1's
+panel browse routes (`GET /sources/{id}`, `GET /concepts/{id}`) and v1 MCP tools
+(`get_note`, `list_recent_notes`, `assemble_context`):
+
+- `get_episode(id)` — raw_text, title, ts, receipt, blueprint (post-consolidation), claims it supports
+- `list_episodes(limit, before?)` — recent notes (id, title, ts, essence)
+- `get_concept(id)` — label, canonical, state/strength, member claims **with provenance**
+  (which episodes, verbatim sentences), relations incl. bridges, last_activity
+- `get_claim(id)` — text, strength, supporting episodes + verbatim sentences
+- `assemble_context(topic)` — the Claude-first read: recall(topic) → group hits by
+  concept → return canonical + claims + provenance as compact markdown, sized for
+  injection into a conversation. Port intent (not code) from v1 `mcp_server.py`.
+- `stats()` — counts (episodes, claims, concepts, relations), last consolidation run
+
 ### reconstruct(episode_id) / synthesize(concept_ids|bridge_id)   [on demand]
 - reconstruct: essence + spine + claims (+ verbatim sentences as style residue) → regenerate doc; report fidelity vs raw_text. North-star metric: unique-claim bytes ÷ reconstructable bytes.
 - synthesize: pull two bridged concepts' claims + provenance → draft a NEW document about the connection. This is "create new docs from emerging learnings".
@@ -176,13 +191,13 @@ Repo, venv, deps (`fastapi`, `fastmcp`, `sqlite-vec`, `sentence-transformers`, `
 All of §5-consolidate. Build sync-mode first (direct calls) for fast iteration; add Batch API mode after the prompts settle. Run on replayed corpus; iterate on merge/split prompt against real data.
 ✅ claims deduped (count < raw claim instances); ≥1 sensible merge; SPLIT path exercised in a test; `cli.py rebuild` reproduces identical semantic store from the event log; cost-per-run logged.
 
-### Phase 3 — Recall
-Spreading activation + ranking + why-now.
-✅ side-by-side eval vs old `search()` on ~10 real queries — new engine must surface at least one 2-hop result old search can't.
+### Phase 3 — Recall + read API
+Spreading activation + ranking + why-now, plus the full read/browse API (§5: get_episode, list_episodes, get_concept, get_claim, assemble_context, stats).
+✅ side-by-side eval vs old `search()` on ~10 real queries — new engine must surface at least one 2-hop result old search can't; `get_concept` on a real concept shows claims with correct episode provenance.
 
 ### Phase 4 — MCP server
-Port OAuth; tools: `save_note` (→ encode, returns receipt), `recall`, `timeline`, `digest`. Deploy via docker-compose; connect from Claude.ai.
-✅ save a note from a Claude conversation and get a receipt with a real echo from the replayed corpus.
+Port OAuth; tools: `save_note` (→ encode, returns receipt), `recall`, `assemble_context`, `get_note`, `list_recent_notes`, `get_concept`, `timeline`, `digest` — v1 tool names (`get_note`, `list_recent_notes`, `assemble_context`, `search_corpus`→`recall`) kept compatible where sensible so existing Claude.ai connector habits carry over. Deploy via docker-compose; connect from Claude.ai.
+✅ save a note from a Claude conversation and get a receipt with a real echo from the replayed corpus; `assemble_context` on a known topic returns concept-grouped context usable in-conversation.
 
 ### Phase 5 — Nightly cron
 Host cron (or sidecar loop) → `python -m cli consolidate` (Batch mode). Failure handling: a failed run leaves episodes unconsolidated → safely picked up next night. Log to `consolidation_runs`.
@@ -201,6 +216,12 @@ Host cron (or sidecar loop) → `python -m cli consolidate` (Batch mode). Failur
 - full-corpus re-consolidation (~500 episodes): ~$3–5 batched — cheap enough to redo when models improve
 - recall/timeline: $0 (local)
 - Pricing refs: Haiku 4.5 $1/$5 per MTok; Sonnet 4.6 $3/$15; Batch −50%; cache reads ~0.1×, min cacheable prefix Haiku=4096 tok. Only LLM-call count should scale with daily writing volume, never with corpus size.
+
+## 8b. Explicit non-goals (v2.0)
+
+- **Discover subsystem** (RSS/Reddit/YouTube feeds, external-item scoring, interests, influence detection — v1 `engine/discover.py`) is OUT of scope for the initial build. The episodic model supports it later without schema change: consumed content becomes episodes with `source='feed'`, and consolidation treats them like any other episode. Don't build it now; don't design it out either.
+- **Web UI.** Headless only; any future UI is a client of the MCP/HTTP API.
+- v1's `respond.py` (URL fetch + corpus-grounded response generation) — revisit after Phase 6; `assemble_context` covers most of its value inside Claude conversations.
 
 ## 9. Open decisions (decide during build, don't block on them)
 

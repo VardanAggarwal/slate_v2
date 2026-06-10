@@ -1,1 +1,1 @@
-"""FastMCP + OAuth 2.1. Tools: save_note, recall, timeline, reconstruct, synthesize, digest. Port SlateOAuthProvider from old engine/mcp_server.py."""
+"""FastMCP + OAuth 2.1. Tools: save_note, recall, assemble_context, get_note, list_recent_notes, get_concept, timeline, reconstruct, synthesize, digest. Port SlateOAuthProvider from old engine/mcp_server.py. See PLAN.md §5 Read/browse API + Phase 4."""
