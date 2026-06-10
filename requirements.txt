@@ -8,3 +8,4 @@ anthropic
 google-genai
 nltk
 pytest
+python-dotenv
