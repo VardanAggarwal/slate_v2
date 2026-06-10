@@ -151,6 +151,26 @@ panel browse routes (`GET /sources/{id}`, `GET /concepts/{id}`) and v1 MCP tools
   injection into a conversation. Port intent (not code) from v1 `mcp_server.py`.
 - `stats()` — counts (episodes, claims, concepts, relations), last consolidation run
 
+### MCP usage pattern (the headline use case)
+In any Claude conversation with the connector active, Claude should *proactively*
+pull relevant older concepts into context. This is engineered, not automatic:
+
+- **Trigger conditions live in tool descriptions.** Models under-reach for tools;
+  write descriptions that say WHEN to call, e.g. `recall`: "Call this whenever the
+  user shares an opinion, idea, plan, or draft on a topic they may have thought
+  about before — before composing your response." Same for the MCP server-level
+  `instructions` string.
+- **Two-stage retrieval.** `recall` returns compact headlines only (concept label,
+  one-line canonical, why-now signal, similarity — ~50 tokens/hit) so it's cheap
+  for Claude to call speculatively. `assemble_context` / `get_concept` are the
+  escalation for full claims + provenance. Budget assemble_context output
+  (~1-2K tokens max, most-relevant-first).
+- **Receipts close the loop at save time.** `save_note`'s response (echoes /
+  contradictions / novelties) is written FOR Claude to narrate back to the user
+  ("this contradicts your March note on X") — phrase it as renderable markdown.
+- Document a recommended claude.ai project instruction in the README, e.g.
+  "When we discuss ideas, check Slate (recall) for my prior thinking first."
+
 ### reconstruct(episode_id) / synthesize(concept_ids|bridge_id)   [on demand]
 - reconstruct: essence + spine + claims (+ verbatim sentences as style residue) → regenerate doc; report fidelity vs raw_text. North-star metric: unique-claim bytes ÷ reconstructable bytes.
 - synthesize: pull two bridged concepts' claims + provenance → draft a NEW document about the connection. This is "create new docs from emerging learnings".
