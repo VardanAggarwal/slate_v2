@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+fastmcp
+sqlite-vec
+sentence-transformers
+numpy
+anthropic
+google-genai
+nltk
+pytest

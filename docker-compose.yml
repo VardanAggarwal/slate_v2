@@ -1,0 +1,19 @@
+services:
+  engine:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+
+  # Nightly consolidation (PLAN.md §7 Phase 5) — sidecar loop alternative to host cron.
+  # Uncomment once consolidate is implemented:
+  # consolidator:
+  #   build: .
+  #   env_file: .env
+  #   volumes:
+  #     - ./data:/app/data
+  #   command: sh -c "while true; do python cli.py consolidate; sleep 86400; done"
+  #   restart: unless-stopped

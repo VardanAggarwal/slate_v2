@@ -1,0 +1,1 @@
+"""Nightly sleep phase: blueprint extraction, claim canonicalization, concept merge/split/create, latent bridges, decay/strengthen. Sole writer to the semantic store, only via events. Batch API. See PLAN.md §5."""
