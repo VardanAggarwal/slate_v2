@@ -9,3 +9,4 @@ google-genai
 nltk
 pytest
 python-dotenv
+pytest-asyncio
