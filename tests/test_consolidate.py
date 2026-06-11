@@ -171,6 +171,36 @@ def test_failed_run_leaves_episodes_unconsolidated(conn, monkeypatch):
     assert run["status"] == "failed"
 
 
+def test_retry_reuses_blueprint_and_canon_events(conn, fake_llm, monkeypatch):
+    encode(conn, S1, source="test")
+    original_concept_pass = "core.consolidate._concept_pass_chunk"
+    import core.consolidate as consolidate_mod
+
+    real_chunk = consolidate_mod._concept_pass_chunk
+    state = {"fail": True}
+
+    def flaky_chunk(*args, **kwargs):
+        if state["fail"]:
+            state["fail"] = False
+            raise LLMError("transient concept-pass failure")
+        return real_chunk(*args, **kwargs)
+
+    monkeypatch.setattr(consolidate_mod, "_concept_pass_chunk", flaky_chunk)
+    with pytest.raises(LLMError):
+        consolidate(conn)
+
+    blueprints_before = fake_llm["blueprint"]
+    canon_events = len(store.events_since(conn, 0, types=["CANONICALIZED"]))
+    claims_before = conn.execute("SELECT COUNT(*) FROM claims").fetchone()[0]
+
+    report = consolidate(conn)  # retry succeeds
+    assert report["status"] == "ok"
+    assert fake_llm["blueprint"] == blueprints_before          # no re-extraction
+    assert len(store.events_since(conn, 0, types=["CANONICALIZED"])) == canon_events
+    assert conn.execute("SELECT COUNT(*) FROM claims").fetchone()[0] == claims_before
+    assert store.unconsolidated_episodes(conn) == []
+
+
 def test_episodes_are_immutable(conn):
     import sqlite3
     encode(conn, S1, source="test")
