@@ -18,9 +18,14 @@ def main(argv=None):
     p_rep.add_argument("--limit", type=int, default=None)
 
     sub.add_parser("stats", help="store counts + last consolidation run")
-    sub.add_parser("consolidate", help="nightly sleep phase (Phase 2)")
+
+    p_con = sub.add_parser("consolidate", help="nightly sleep phase")
+    p_con.add_argument("--max-episodes", type=int, default=50)
+    p_con.add_argument("--all", action="store_true",
+                       help="loop until no unconsolidated episodes remain")
+
     sub.add_parser("digest", help="morning digest (Phase 6)")
-    sub.add_parser("rebuild", help="rebuild semantic store from event log (Phase 2)")
+    sub.add_parser("rebuild", help="rebuild semantic store from event log")
 
     args = ap.parse_args(argv)
 
@@ -33,7 +38,7 @@ def main(argv=None):
             text = args.text
         else:
             text = sys.stdin.read()
-        receipt = encode(store.connect(), text, title=args.title)
+        receipt = encode(store.connect(), text, title=args.title, source="cli")
         print(json.dumps(receipt, indent=2, ensure_ascii=False))
 
     elif args.cmd == "replay":
@@ -43,6 +48,21 @@ def main(argv=None):
     elif args.cmd == "stats":
         from core import store
         print(json.dumps(store.stats(store.connect()), indent=2))
+
+    elif args.cmd == "consolidate":
+        from core import store
+        from core.consolidate import consolidate
+        conn = store.connect()
+        while True:
+            report = consolidate(conn, max_episodes=args.max_episodes)
+            print(json.dumps(report, indent=2))
+            if not args.all or report["status"] == "noop":
+                break
+
+    elif args.cmd == "rebuild":
+        from core import store
+        from core.consolidate import rebuild
+        print(json.dumps(rebuild(store.connect()), indent=2))
 
     else:
         print(f"`{args.cmd}` lands in a later phase (see PLAN.md §7)")

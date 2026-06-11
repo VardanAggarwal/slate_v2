@@ -30,6 +30,8 @@ def test_replay_counts_and_idempotency(tmp_path):
 
     s1 = replay(old_db=str(old_db), db_path=new_db, verbose=False)
     assert s1["replayed"] == 2          # empty raw_text skipped by the query
+    assert s1["old_sources_total"] == 3
+    assert s1["old_sources_nonempty"] == 2
     assert s1["episodes"] == 2
 
     s2 = replay(old_db=str(old_db), db_path=new_db, verbose=False)

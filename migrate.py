@@ -16,6 +16,7 @@ def replay(old_db: str | None = None, limit: int | None = None,
     old = sqlite3.connect(old_db or config.SLATE_V1_DB)
     old.row_factory = sqlite3.Row
 
+    total = old.execute("SELECT COUNT(*) FROM sources").fetchone()[0]
     rows = old.execute(
         """SELECT id, title, created_at, raw_text FROM sources
            WHERE raw_text IS NOT NULL AND TRIM(raw_text) != ''
@@ -39,7 +40,8 @@ def replay(old_db: str | None = None, limit: int | None = None,
                   f"sents={receipt['n_sentences']:3d} prior_matches={n_prior}")
 
     summary = {"replayed": done, "skipped": skipped,
-               "old_sources": len(rows), "episodes": store.count_episodes(conn)}
+               "old_sources_total": total, "old_sources_nonempty": len(rows),
+               "episodes": store.count_episodes(conn)}
     if verbose:
         print(f"[replay] done: {summary}")
     return summary

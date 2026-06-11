@@ -24,26 +24,40 @@ def get_embedder():
     return _embedder
 
 
-# ── NLI stance classifier (optional, local, CPU) ──────────────────────────────
+# ── Stance classifier (PLAN.md §9.1: local NLI first, one Haiku call fallback) ─
 _nli = None
 
 
 def _get_nli():
     global _nli
-    if _nli is None and config.NLI_ENABLED:
+    if _nli is None:
         from sentence_transformers import CrossEncoder
         _nli = CrossEncoder(config.NLI_MODEL)
     return _nli
 
 
 def classify_stance(premise: str, hypothesis: str) -> str:
-    """Return 'contradiction' | 'entailment' | 'neutral'. Neutral when NLI is off."""
-    nli = _get_nli()
-    if nli is None:
-        return "neutral"
-    scores = nli.predict([(premise, hypothesis)])[0]
-    labels = ["contradiction", "entailment", "neutral"]  # nli-deberta-v3 label order
-    return labels[int(scores.argmax())]
+    """Return 'contradiction' | 'entailment' | 'neutral' per STANCE_PROVIDER."""
+    if config.STANCE_PROVIDER == "nli":
+        try:
+            scores = _get_nli().predict([(premise, hypothesis)])[0]
+            labels = ["contradiction", "entailment", "neutral"]  # nli-deberta-v3 label order
+            return labels[int(scores.argmax())]
+        except Exception:
+            return "neutral"  # model unavailable/offline — don't block the save
+    if config.STANCE_PROVIDER == "haiku":
+        from core import llm
+        try:
+            result = llm.call(
+                f'Premise: "{premise}"\nHypothesis: "{hypothesis}"\n'
+                'Does the hypothesis contradict, entail, or stay neutral to the premise? '
+                'Return ONLY JSON: {"stance": "contradiction"|"entailment"|"neutral"}',
+                tier="mechanical", max_tokens=32)
+            stance = result["json"].get("stance", "neutral")
+            return stance if stance in ("contradiction", "entailment", "neutral") else "neutral"
+        except Exception:
+            return "neutral"
+    return "neutral"
 
 
 # ── Sentence splitter (ported from v1 engine/extract.py) ──────────────────────
@@ -105,15 +119,16 @@ def _build_receipt(conn, sentences: list[str], embeddings) -> dict:
                     "similarity": round(hit["similarity"], 3),
                 })
 
-    top = config.RECEIPT_TOP_N
+    # Full lists, no truncation: the receipt is a consolidation input persisted
+    # on an immutable row. Display truncation (RECEIPT_TOP_N) is the MCP layer's job.
     prior_matches.sort(key=lambda m: -m["similarity"])
     return {
         "n_sentences": len(sentences),
-        "echoes": sorted(echoes, key=lambda e: -e["similarity"])[:top],
-        "contradictions": sorted(contradictions, key=lambda e: -e["similarity"])[:top],
-        "novelties": novelties[:top],
+        "echoes": sorted(echoes, key=lambda e: -e["similarity"]),
+        "contradictions": sorted(contradictions, key=lambda e: -e["similarity"]),
+        "novelties": novelties,
         "n_novelties": len(novelties),
-        "prior_episode_matches": prior_matches[:top],
+        "prior_episode_matches": prior_matches,
     }
 
 
@@ -132,7 +147,10 @@ def encode(conn, text: str, ts: str | None = None, title: str | None = None,
 
     ts = ts or store.now_iso()
     try:
-        ts_unix = datetime.fromisoformat(ts).replace(tzinfo=timezone.utc).timestamp()
+        dt = datetime.fromisoformat(ts)
+        if dt.tzinfo is None:  # naive timestamps are treated as UTC
+            dt = dt.replace(tzinfo=timezone.utc)
+        ts_unix = dt.timestamp()
     except ValueError:
         ts_unix = None
 
@@ -158,9 +176,10 @@ def encode(conn, text: str, ts: str | None = None, title: str | None = None,
             "ts": ts,
             "source": source,
             "n_sentences": len(sentences),
-            "n_echoes": len(receipt["echoes"]),
-            "n_contradictions": len(receipt["contradictions"]),
             "n_novelties": receipt["n_novelties"],
+            "echo_claim_ids": [e["claim_id"] for e in receipt["echoes"]],
+            "contradiction_claim_ids": [c["claim_id"] for c in receipt["contradictions"]],
+            "prior_episode_ids": sorted({m["episode_id"] for m in receipt["prior_episode_matches"]}),
         })
 
     return receipt

@@ -141,6 +141,12 @@ CREATE TABLE IF NOT EXISTS replay_map (
 
 CREATE INDEX IF NOT EXISTS idx_events_type ON events(type);
 CREATE INDEX IF NOT EXISTS idx_episodes_ts ON episodes(ts);
+
+-- PLAN.md §10: episodes are immutable — enforced mechanically, not by convention
+CREATE TRIGGER IF NOT EXISTS episodes_no_update BEFORE UPDATE ON episodes
+BEGIN SELECT RAISE(ABORT, 'episodes are immutable (PLAN.md §10)'); END;
+CREATE TRIGGER IF NOT EXISTS episodes_no_delete BEFORE DELETE ON episodes
+BEGIN SELECT RAISE(ABORT, 'episodes are immutable (PLAN.md §10)'); END;
 """
 
 _VEC_SCHEMA = [
@@ -298,6 +304,175 @@ def mark_replayed(conn: sqlite3.Connection, old_source_id: str, episode_id: str)
         "INSERT INTO replay_map (old_source_id, episode_id, replayed_at) VALUES (?, ?, ?)",
         (old_source_id, episode_id, now_iso()),
     )
+
+
+# ── Semantic store writes ─────────────────────────────────────────────────────
+# Called ONLY by consolidate.py event appliers (PLAN.md §10). Any other caller
+# is re-creating the v1 save-time-mutation architecture — don't.
+
+def _deserialize(blob: bytes):
+    import numpy as np
+    return np.frombuffer(blob, dtype=np.float32)
+
+
+def insert_claim(conn: sqlite3.Connection, claim_id: str, text: str,
+                 embedding, ts: str) -> None:
+    cur = conn.execute(
+        """INSERT INTO claims (id, text, strength, created_at, last_seen)
+           VALUES (?, ?, 1.0, ?, ?) ON CONFLICT(id) DO NOTHING""",
+        (claim_id, text, ts, ts))
+    if cur.rowcount:  # only write the vector for a genuinely new claim
+        conn.execute("INSERT INTO vec_claims (claim_id, embedding) VALUES (?, ?)",
+                     (claim_id, serialize_float32([float(x) for x in embedding])))
+
+
+def add_claim_support(conn: sqlite3.Connection, claim_id: str, episode_id: str,
+                      verbatim: str | None) -> None:
+    conn.execute(
+        """INSERT INTO claim_support (claim_id, episode_id, verbatim_sentence)
+           VALUES (?, ?, ?) ON CONFLICT DO NOTHING""",
+        (claim_id, episode_id, verbatim))
+
+
+def bump_claim_strength(conn: sqlite3.Connection, claim_id: str, ts: str,
+                        delta: float) -> None:
+    conn.execute(
+        "UPDATE claims SET strength = strength + ?, last_seen = ? WHERE id = ?",
+        (delta, ts, claim_id))
+
+
+def get_claim(conn: sqlite3.Connection, claim_id: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM claims WHERE id = ?", (claim_id,)).fetchone()
+
+
+def claim_embedding(conn: sqlite3.Connection, claim_id: str):
+    row = conn.execute("SELECT embedding FROM vec_claims WHERE claim_id = ?",
+                       (claim_id,)).fetchone()
+    return _deserialize(row["embedding"]) if row else None
+
+
+def insert_concept(conn: sqlite3.Connection, concept_id: str, label: str,
+                   canonical: str, ts: str) -> None:
+    conn.execute(
+        """INSERT INTO concepts (id, label, canonical, state, strength, created_at, last_activity)
+           VALUES (?, ?, ?, 'active', 1.0, ?, ?) ON CONFLICT(id) DO NOTHING""",
+        (concept_id, label, canonical, ts, ts))
+
+
+def update_concept(conn: sqlite3.Connection, concept_id: str, **fields) -> None:
+    allowed = {"label", "canonical", "state", "strength", "last_activity"}
+    sets = {k: v for k, v in fields.items() if k in allowed and v is not None}
+    if not sets:
+        return
+    assign = ", ".join(f"{k} = ?" for k in sets)
+    conn.execute(f"UPDATE concepts SET {assign} WHERE id = ?",
+                 (*sets.values(), concept_id))
+
+
+def delete_concept(conn: sqlite3.Connection, concept_id: str) -> None:
+    """Remove a concept from the materialized view (history stays in events)."""
+    conn.execute("DELETE FROM concept_members WHERE concept_id = ?", (concept_id,))
+    conn.execute("DELETE FROM concepts WHERE id = ?", (concept_id,))
+    conn.execute("DELETE FROM vec_concepts WHERE concept_id = ?", (concept_id,))
+
+
+def add_concept_member(conn: sqlite3.Connection, concept_id: str, claim_id: str,
+                       weight: float = 1.0) -> None:
+    conn.execute(
+        """INSERT INTO concept_members (concept_id, claim_id, weight)
+           VALUES (?, ?, ?) ON CONFLICT DO NOTHING""",
+        (concept_id, claim_id, weight))
+
+
+def remove_concept_member(conn: sqlite3.Connection, concept_id: str, claim_id: str) -> None:
+    conn.execute("DELETE FROM concept_members WHERE concept_id = ? AND claim_id = ?",
+                 (concept_id, claim_id))
+
+
+def concept_member_ids(conn: sqlite3.Connection, concept_id: str) -> list[str]:
+    return [r["claim_id"] for r in conn.execute(
+        "SELECT claim_id FROM concept_members WHERE concept_id = ? ORDER BY claim_id",
+        (concept_id,))]
+
+
+def get_concept(conn: sqlite3.Connection, concept_id: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM concepts WHERE id = ?", (concept_id,)).fetchone()
+
+
+def all_concepts(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute("SELECT * FROM concepts ORDER BY id").fetchall()
+
+
+def recompute_concept_embedding(conn: sqlite3.Connection, concept_id: str) -> None:
+    """Concept vector = normalized mean of member claim vectors (deterministic,
+    so event-log rebuild reproduces it exactly)."""
+    import numpy as np
+    members = concept_member_ids(conn, concept_id)
+    vecs = [claim_embedding(conn, c) for c in members]
+    vecs = [v for v in vecs if v is not None]
+    conn.execute("DELETE FROM vec_concepts WHERE concept_id = ?", (concept_id,))
+    if not vecs:
+        return
+    mean = np.mean(vecs, axis=0)
+    norm = np.linalg.norm(mean)
+    if norm > 0:
+        mean = mean / norm
+    conn.execute("INSERT INTO vec_concepts (concept_id, embedding) VALUES (?, ?)",
+                 (concept_id, serialize_float32([float(x) for x in mean])))
+
+
+def knn_concepts(conn: sqlite3.Connection, embedding, k: int = 5) -> list[dict]:
+    rows = conn.execute(
+        "SELECT concept_id, distance FROM vec_concepts WHERE embedding MATCH ? AND k = ?",
+        (serialize_float32([float(x) for x in embedding]), k)).fetchall()
+    out = []
+    for r in rows:
+        c = get_concept(conn, r["concept_id"])
+        if c:
+            out.append({**dict(c), "similarity": _sim(r["distance"])})
+    return out
+
+
+def insert_relation(conn: sqlite3.Connection, from_id: str, to_id: str,
+                    relation: str, weight: float, ts: str,
+                    evidence_episode_id: str | None = None) -> None:
+    conn.execute(
+        """INSERT INTO relations (from_id, to_id, relation, weight, created_at, evidence_episode_id)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(from_id, to_id, relation) DO UPDATE SET weight = excluded.weight""",
+        (from_id, to_id, relation, weight, ts, evidence_episode_id))
+
+
+def truncate_semantic(conn: sqlite3.Connection) -> None:
+    """Wipe the materialized semantic store (claims/concepts/relations + vectors).
+    Episodes, events, runs, and bookkeeping are untouched — this is the first
+    half of `rebuild`, which then re-applies the event log."""
+    for table in ("claim_support", "concept_members", "relations",
+                  "claims", "concepts", "vec_claims", "vec_concepts"):
+        conn.execute(f"DELETE FROM {table}")
+
+
+# ── Consolidation runs + bookkeeping ──────────────────────────────────────────
+def start_run(conn: sqlite3.Connection, run_id: str, n_episodes: int) -> None:
+    conn.execute(
+        """INSERT INTO consolidation_runs (id, started_at, n_episodes, status)
+           VALUES (?, ?, ?, 'running')""",
+        (run_id, now_iso(), n_episodes))
+
+
+def finish_run(conn: sqlite3.Connection, run_id: str, status: str,
+               cost_estimate: float, batch_id: str | None = None) -> None:
+    conn.execute(
+        """UPDATE consolidation_runs SET finished_at = ?, status = ?,
+           cost_estimate = ?, batch_id = ? WHERE id = ?""",
+        (now_iso(), status, cost_estimate, batch_id, run_id))
+
+
+def mark_consolidated(conn: sqlite3.Connection, episode_id: str, run_id: str) -> None:
+    conn.execute(
+        """INSERT INTO episode_consolidations (episode_id, run_id, consolidated_at)
+           VALUES (?, ?, ?) ON CONFLICT DO NOTHING""",
+        (episode_id, run_id, now_iso()))
 
 
 def stats(conn: sqlite3.Connection) -> dict:

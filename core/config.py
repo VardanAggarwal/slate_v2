@@ -26,8 +26,8 @@ SENT_MIN_CHARS    = int(os.getenv("SENT_MIN_CHARS", "40"))
 RECEIPT_TOP_N     = int(os.getenv("RECEIPT_TOP_N", "5"))
 
 # ── Contradiction detection (PLAN.md §9.1: NLI local first, Haiku fallback) ───
-NLI_ENABLED = os.getenv("NLI_ENABLED", "0") == "1"
-NLI_MODEL   = os.getenv("NLI_MODEL", "cross-encoder/nli-deberta-v3-small")
+STANCE_PROVIDER = os.getenv("STANCE_PROVIDER", "nli")  # 'nli' | 'haiku' | 'off'
+NLI_MODEL       = os.getenv("NLI_MODEL", "cross-encoder/nli-deberta-v3-small")
 
 # ── API keys ──────────────────────────────────────────────────────────────────
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
