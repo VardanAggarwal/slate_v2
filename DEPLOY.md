@@ -1,5 +1,15 @@
 # Deploying slate-engine alongside the v1 Slate
 
+> **Final state (2026-06-11, cutover complete):** v2 owns the root of
+> `https://myslate.duckdns.org` (health `/health`, UI `/status`, MCP `/mcp`);
+> `/engine/*` remains as an alias; `myslate2.duckdns.org` 301-redirects to
+> `myslate`. v1 container is **stopped** (not removed) — restart anytime with
+> `cd /home/ubuntu/slate && docker compose up -d`; its `slate.db` stays on
+> disk and read-only-mounted in v2. LLM calls are subscription-first: the
+> image ships Claude Code CLI, `CLAUDE_CODE_OAUTH_TOKEN` in the server `.env`
+> (chain: claude-cli → claude API → gemini). The sections below describe the
+> original side-by-side bring-up for reference.
+
 Target: the existing v1 host (`ubuntu@140.245.216.42`, SSH key
 `~/.ssh/slate_server`). v1 keeps running untouched on 127.0.0.1:8000 /
 `myslate.duckdns.org`; v2 lands on 127.0.0.1:8100 behind its own subdomain.
