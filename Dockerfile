@@ -1,7 +1,11 @@
 FROM python:3.12-slim
 
-# curl for the compose healthcheck
-RUN apt-get update && apt-get install -y --no-install-recommends curl \
+# curl for the compose healthcheck; node + Claude Code CLI for the
+# subscription-billed claude-cli LLM provider (CLAUDE_CODE_OAUTH_TOKEN)
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && npm install -g @anthropic-ai/claude-code \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

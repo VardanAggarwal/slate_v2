@@ -47,6 +47,39 @@ def estimate_cost(model: str, input_tokens: int, output_tokens: int,
 
 
 # ── Sync path ─────────────────────────────────────────────────────────────────
+def _call_claude_cli(prompt: str, model: str, max_tokens: int, system: str | None) -> dict:
+    """Claude Code CLI in print mode — bills the Max/Pro subscription via
+    CLAUDE_CODE_OAUTH_TOKEN instead of API keys. Raises LLMError on any
+    failure (missing CLI, session limit, timeout) so the chain falls through
+    to the API per-call."""
+    import shutil
+    import subprocess
+    if not shutil.which("claude"):
+        raise LLMError("claude CLI not installed")
+    cmd = ["claude", "-p", "--model", model, "--output-format", "json"]
+    if system:
+        cmd += ["--system-prompt", system]
+    try:
+        proc = subprocess.run(cmd, input=prompt, capture_output=True,
+                              text=True, timeout=600)
+    except subprocess.TimeoutExpired:
+        raise LLMError("claude CLI timed out")
+    if proc.returncode != 0:
+        raise LLMError(f"claude CLI exit {proc.returncode}: {proc.stderr[:200]}")
+    data = json.loads(proc.stdout)
+    if data.get("is_error"):
+        raise LLMError(f"claude CLI error: {str(data.get('result'))[:200]}")
+    usage = data.get("usage") or {}
+    return {
+        "text": data.get("result", ""),
+        "provider": "claude-cli",
+        "model": model,
+        "input_tokens": usage.get("input_tokens", 0),
+        "output_tokens": usage.get("output_tokens", 0),
+        "cost": 0.0,  # subscription — no marginal spend
+    }
+
+
 def _call_claude(prompt: str, model: str, max_tokens: int, system: str | None) -> dict:
     import anthropic
     client = anthropic.Anthropic(api_key=config.ANTHROPIC_KEY)
@@ -102,7 +135,10 @@ def call(prompt: str, tier: str = "mechanical", max_tokens: int = 2048,
         # transient (sampling), so retry once before falling through.
         for attempt in range(2):
             try:
-                if provider == "claude" and config.ANTHROPIC_KEY:
+                if provider == "claude-cli" and config.CLAUDE_CODE_OAUTH_TOKEN:
+                    result = _call_claude_cli(prompt, _model_for_tier(tier),
+                                              max_tokens, system)
+                elif provider == "claude" and config.ANTHROPIC_KEY:
                     result = _call_claude(prompt, _model_for_tier(tier), max_tokens, system)
                 elif provider == "gemini" and config.GEMINI_KEY:
                     models = config.GEMINI_MODELS

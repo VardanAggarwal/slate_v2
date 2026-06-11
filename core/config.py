@@ -35,6 +35,11 @@ NLI_MODEL       = os.getenv("NLI_MODEL", "cross-encoder/nli-deberta-v3-small")
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 GEMINI_KEY    = os.getenv("GEMINI_API_KEY", "")
 
+# Claude Code subscription token (`claude setup-token`) — enables the
+# claude-cli provider: nightly LLM calls ride the Max/Pro subscription and
+# fall through to API keys per-call when the session is limited.
+CLAUDE_CODE_OAUTH_TOKEN = os.getenv("CLAUDE_CODE_OAUTH_TOKEN", "")
+
 # ── Model tiering (PLAN.md §2.11) ─────────────────────────────────────────────
 CLAUDE_MODEL_MECHANICAL = os.getenv("CLAUDE_MODEL_MECHANICAL", "claude-haiku-4-5")
 CLAUDE_MODEL_JUDGMENT   = os.getenv("CLAUDE_MODEL_JUDGMENT", "claude-sonnet-4-6")
