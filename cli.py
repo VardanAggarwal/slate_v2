@@ -24,7 +24,13 @@ def main(argv=None):
     p_con.add_argument("--all", action="store_true",
                        help="loop until no unconsolidated episodes remain")
 
-    sub.add_parser("digest", help="morning digest (Phase 6)")
+    p_dig = sub.add_parser("digest", help="morning digest from recent events")
+    p_dig.add_argument("--since-hours", type=int, default=36)
+    p_dig.add_argument("--polish", action="store_true", help="LLM prose pass")
+
+    p_rec = sub.add_parser("reconstruct", help="regenerate a note from its blueprint")
+    p_rec.add_argument("episode_id")
+
     sub.add_parser("rebuild", help="rebuild semantic store from event log")
 
     args = ap.parse_args(argv)
@@ -58,6 +64,18 @@ def main(argv=None):
             print(json.dumps(report, indent=2))
             if not args.all or report["status"] == "noop":
                 break
+
+    elif args.cmd == "digest":
+        from core import store
+        from core.digest import digest
+        print(digest(store.connect(), since_hours=args.since_hours,
+                     polish=args.polish))
+
+    elif args.cmd == "reconstruct":
+        from core import store
+        from core.reconstruct import reconstruct
+        print(json.dumps(reconstruct(store.connect(), args.episode_id),
+                         indent=2, ensure_ascii=False))
 
     elif args.cmd == "rebuild":
         from core import store

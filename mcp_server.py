@@ -251,6 +251,38 @@ def digest(since_hours: int = 36) -> str:
 
 
 @mcp.tool
+def reconstruct_note(episode_id: str) -> dict:
+    """Regenerate a note from its stored blueprint (essence + claims + spine +
+    verbatim style samples) and score fidelity vs the original. Use to show
+    how much of a note Slate's minimal storage can recreate."""
+    from core.reconstruct import reconstruct
+    try:
+        return reconstruct(_conn(), episode_id)
+    except ValueError as e:
+        raise ToolError(str(e))
+
+
+@mcp.tool
+def synthesize(concept_a: str, concept_b: str) -> dict:
+    """Draft a NEW short document from the intersection of two concepts —
+    Slate's 'create new docs from emerging learnings'. Best on bridged pairs
+    (see list_bridges); uses the stored bridge rationale automatically."""
+    from core.reconstruct import synthesize as _syn
+    try:
+        return _syn(_conn(), concept_a, concept_b)
+    except ValueError as e:
+        raise ToolError(str(e))
+
+
+@mcp.tool
+def list_bridges(limit: int = 20) -> list[dict]:
+    """List discovered bridges between concept pairs (newest first) — the
+    non-obvious connections consolidation surfaced. Entry point for synthesize."""
+    from core.reconstruct import bridges
+    return bridges(_conn(), limit=limit)
+
+
+@mcp.tool
 def stats() -> dict:
     """Corpus size (episodes, claims, concepts, relations) and the last
     consolidation run. Use for health checks / "how big is my Slate?"."""
