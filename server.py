@@ -32,6 +32,40 @@ def _require_auth(credentials: HTTPBasicCredentials | None = Depends(_basic)):
                             headers={"WWW-Authenticate": "Basic realm=slate"})
 
 
+def _wellknown_candidates(rest: str) -> list[str]:
+    """RFC 9728/8414 clients fetch OAuth discovery docs at the DOMAIN ROOT
+    with the resource path as a suffix (/.well-known/oauth-protected-resource/mcp/),
+    but FastMCP serves them inside the /mcp mount. Try the path as-is first
+    (the mount serves the suffixed form), then with the /mcp suffix stripped
+    (the authorization-server doc has no suffix inside the mount)."""
+    candidates = [rest]
+    stripped = rest.rstrip("/")
+    if stripped.endswith("/mcp"):
+        candidates.append(stripped[: -len("/mcp")])
+    return candidates
+
+
+_wellknown_client = None
+
+
+@app.get("/.well-known/{rest:path}")
+async def well_known_forward(rest: str):
+    import httpx
+    from fastapi.responses import Response
+    global _wellknown_client
+    if _wellknown_client is None:
+        _wellknown_client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=mcp_app),
+            base_url="http://wellknown.internal", follow_redirects=True)
+    result = None
+    for cand in _wellknown_candidates(rest):
+        result = await _wellknown_client.get(f"/.well-known/{cand}")
+        if result.status_code == 200:
+            break
+    return Response(content=result.content, status_code=result.status_code,
+                    media_type=result.headers.get("content-type"))
+
+
 @app.get("/health")
 def health() -> dict:
     from core import store

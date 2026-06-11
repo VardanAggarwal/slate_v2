@@ -24,6 +24,22 @@ def test_status_open_without_configured_creds(client):
     assert "episodes" in r.text
 
 
+def test_wellknown_candidates_strip_mcp_suffix():
+    from server import _wellknown_candidates
+    assert _wellknown_candidates("oauth-protected-resource/mcp/") == [
+        "oauth-protected-resource/mcp/", "oauth-protected-resource"]
+    assert _wellknown_candidates("oauth-authorization-server/mcp") == [
+        "oauth-authorization-server/mcp", "oauth-authorization-server"]
+    assert _wellknown_candidates("oauth-authorization-server") == [
+        "oauth-authorization-server"]
+
+
+def test_wellknown_forward_returns_cleanly_when_oauth_disabled(client):
+    # No AUTH creds in tests → mounted app has no oauth routes → clean 404
+    r = client.get("/.well-known/oauth-protected-resource/mcp/")
+    assert r.status_code == 404
+
+
 def test_status_requires_auth_when_configured(client, monkeypatch):
     monkeypatch.setattr(config, "AUTH_USER", "u")
     monkeypatch.setattr(config, "AUTH_PASS", "p")
