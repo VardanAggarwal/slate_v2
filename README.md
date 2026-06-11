@@ -84,6 +84,19 @@ cli.py            — encode | replay | consolidate | digest | reconstruct | reb
 migrate.py        — replay old slate.db sources as episodes
 ```
 
+## Deploy-readiness audit (2026-06-11)
+
+Verified locally: NLI stance label order confirmed against the real
+cross-encoder (contradiction detection will work in production); Gemini
+fallback exercised live through `llm.call`; Batch API helpers match the
+installed anthropic SDK (0.109.1); a save during a held write lock waits and
+succeeds (30s busy timeout), and consolidation no longer holds transactions
+across LLM calls (regression-tested). **Not verified: the Docker image** —
+Docker is not installed on this machine; `docker compose up` + `/health`
+must be the first step of the production deploy (watch first-boot model +
+punkt downloads in the slim image; consider baking them into the image or
+mounting a cache volume).
+
 ## Status (2026-06-11) — deferred to production
 
 All phases are implemented and tested locally (40 tests; partial corpus:

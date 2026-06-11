@@ -201,6 +201,25 @@ def test_retry_reuses_blueprint_and_canon_events(conn, fake_llm, monkeypatch):
     assert store.unconsolidated_episodes(conn) == []
 
 
+def test_llm_calls_never_hold_a_write_transaction(conn, fake_llm, monkeypatch):
+    """A save_note arriving mid-consolidation must never wait on a network call:
+    every llm.call must happen with no transaction open on the connection."""
+    import core.llm as llm_mod
+    inner = llm_mod.call
+
+    def guarded(prompt, **kw):
+        assert not conn.in_transaction, \
+            f"llm.call while holding a write txn: {prompt[:60]!r}"
+        return inner(prompt, **kw)
+
+    monkeypatch.setattr("core.llm.call", guarded)
+    encode(conn, S1, source="test")
+    encode(conn, f"{S2} {S3}", source="test")
+    report = consolidate(conn)
+    assert report["status"] == "ok"
+    assert fake_llm["blueprint"] >= 2 and fake_llm["concept"] >= 1  # guard exercised
+
+
 def test_episodes_are_immutable(conn):
     import sqlite3
     encode(conn, S1, source="test")

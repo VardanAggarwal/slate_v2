@@ -279,9 +279,14 @@ def _existing_canon(conn, episode_id: str) -> list[tuple[str, str]]:
 
 
 # ── Step 3: claim canonicalization ────────────────────────────────────────────
-def _canonicalize_episode(conn, run_id: str, episode, bp: dict) -> tuple[list[str], float]:
+def _canonicalize_episode(conn, run_id: str, episode, bp: dict,
+                          bp_payload: dict) -> tuple[list[str], float]:
     """Dedupe each blueprint claim against existing canonical claims.
-    Returns (new_or_supported claim ids in this episode, llm cost)."""
+
+    All reads + LLM judging happen OUTSIDE any transaction (a save_note must
+    never wait on a network call); the BLUEPRINTED event and all CANONICALIZED
+    events then commit in one short transaction — atomic for retry reuse.
+    Returns (claim ids touched by this episode, llm cost)."""
     ts = episode["ts"]
     raw_claims = []
     for cluster in bp.get("clusters", []):
@@ -326,20 +331,22 @@ def _canonicalize_episode(conn, run_id: str, episode, bp: dict) -> tuple[list[st
                            else (c, "new", None))
 
     episode_claims = []
-    for c, action, existing_id in decided:
-        if action == "same":
-            emit(conn, run_id, "CANONICALIZED", {
-                "action": "support", "claim_id": existing_id,
-                "episode_id": episode["id"], "verbatim": c["verbatim"],
-                "cluster": c["cluster"], "ts": ts})
-            episode_claims.append((c["cluster"], existing_id))
-        else:
-            cid = claim_id_for(c["text"])
-            emit(conn, run_id, "CANONICALIZED", {
-                "action": "new", "claim_id": cid, "text": c["text"],
-                "episode_id": episode["id"], "verbatim": c["verbatim"],
-                "cluster": c["cluster"], "ts": ts})
-            episode_claims.append((c["cluster"], cid))
+    with conn:  # short txn: blueprint + canon events commit atomically
+        store.append_event(conn, "BLUEPRINTED", bp_payload, run_id=run_id)
+        for c, action, existing_id in decided:
+            if action == "same":
+                emit(conn, run_id, "CANONICALIZED", {
+                    "action": "support", "claim_id": existing_id,
+                    "episode_id": episode["id"], "verbatim": c["verbatim"],
+                    "cluster": c["cluster"], "ts": ts})
+                episode_claims.append((c["cluster"], existing_id))
+            else:
+                cid = claim_id_for(c["text"])
+                emit(conn, run_id, "CANONICALIZED", {
+                    "action": "new", "claim_id": cid, "text": c["text"],
+                    "episode_id": episode["id"], "verbatim": c["verbatim"],
+                    "cluster": c["cluster"], "ts": ts})
+                episode_claims.append((c["cluster"], cid))
     return episode_claims, cost
 
 
@@ -383,7 +390,7 @@ def _concept_pass_chunk(conn, run_id: str, new_claim_ids: list[str], ts: str) ->
     prompt = PROMPT_CONCEPT.replace(
         "{new_claims}", json.dumps(new_claims, ensure_ascii=False, indent=1)).replace(
         "{concepts}", json.dumps(concepts_ctx, ensure_ascii=False, indent=1) or "[]")
-    result = llm.call(prompt, tier="judgment", max_tokens=8192)
+    result = llm.call(prompt, tier="judgment", max_tokens=8192)  # outside any txn
     decisions = result["json"].get("decisions", [])
 
     valid_claims = {c["id"] for c in new_claims}
@@ -391,6 +398,14 @@ def _concept_pass_chunk(conn, run_id: str, new_claim_ids: list[str], ts: str) ->
         valid_claims.update(m["id"] for m in concept["members"])
     valid_concepts = set(nearby.keys())
 
+    with conn:
+        _apply_concept_decisions(conn, run_id, decisions, valid_claims,
+                                 valid_concepts, ts)
+    return result["cost"]
+
+
+def _apply_concept_decisions(conn, run_id, decisions, valid_claims,
+                             valid_concepts, ts) -> None:
     for d in decisions:
         action = d.get("action", "").upper()
         if action == "CREATE":
@@ -428,7 +443,6 @@ def _concept_pass_chunk(conn, run_id: str, new_claim_ids: list[str], ts: str) ->
                     "concept_id": d["concept_id"],
                     "snapshot": _snapshot(conn, d["concept_id"]),
                     "into": into, "ts": ts})
-    return result["cost"]
 
 
 def _snapshot(conn, concept_id: str) -> dict:
@@ -514,12 +528,13 @@ def _bridges(conn, run_id: str, ts: str) -> float:
             a_label=ca["label"], a_canonical=ca["canonical"], a_claims=sample(a),
             b_label=cb["label"], b_canonical=cb["canonical"], b_claims=sample(b))
         try:
-            result = llm.call(prompt, tier="mechanical", max_tokens=256)
+            result = llm.call(prompt, tier="mechanical", max_tokens=256)  # outside txn
             cost += result["cost"]
             if result["json"].get("bridge"):
-                emit(conn, run_id, "BRIDGED", {
-                    "a": a, "b": b, "score": round(sim, 3),
-                    "rationale": result["json"].get("rationale", ""), "ts": ts})
+                with conn:
+                    emit(conn, run_id, "BRIDGED", {
+                        "a": a, "b": b, "score": round(sim, 3),
+                        "rationale": result["json"].get("rationale", ""), "ts": ts})
         except llm.LLMError:
             break  # bridges are best-effort; never fail the run over them
     return cost
@@ -583,30 +598,30 @@ def consolidate(conn, max_episodes: int = 50) -> dict:
     new_claim_ids: list[str] = []
     per_episode: list[tuple] = []
     try:
+        # Helpers manage their own SHORT transactions; LLM calls never run
+        # inside one, so a concurrent save_note never waits on the network.
         for ep in episodes:
             bp = _existing_blueprint(conn, ep["id"])
             if bp is not None:  # retry of a failed run — reuse, don't re-extract
                 episode_claims = _existing_canon(conn, ep["id"])
             else:
-                bp, bp_cost = blueprint(ep["raw_text"])
+                bp, bp_cost = blueprint(ep["raw_text"])  # LLM, no txn
                 cost += bp_cost
-                with conn:
-                    store.append_event(conn, "BLUEPRINTED",
-                                       {"episode_id": ep["id"], "blueprint": bp,
-                                        "method": bp.get("_method"), "ts": ts},
-                                       run_id=run_id)
-                    episode_claims, canon_cost = _canonicalize_episode(conn, run_id, ep, bp)
+                episode_claims, canon_cost = _canonicalize_episode(
+                    conn, run_id, ep, bp,
+                    {"episode_id": ep["id"], "blueprint": bp,
+                     "method": bp.get("_method"), "ts": ts})
                 cost += canon_cost
             new_claim_ids.extend(cid for _, cid in episode_claims)
             per_episode.append((ep, bp, episode_claims))
 
+        cost += _concept_pass(conn, run_id, new_claim_ids, ts)
         with conn:
-            cost += _concept_pass(conn, run_id, new_claim_ids, ts)
             for ep, bp, episode_claims in per_episode:
                 _relations(conn, run_id, ep, bp, episode_claims)
 
+        cost += _bridges(conn, run_id, ts)
         with conn:
-            cost += _bridges(conn, run_id, ts)
             _decay_strengthen(conn, run_id, episodes, ts)
 
         with conn:
