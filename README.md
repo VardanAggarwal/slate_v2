@@ -84,6 +84,23 @@ cli.py            — encode | replay | consolidate | digest | reconstruct | reb
 migrate.py        — replay old slate.db sources as episodes
 ```
 
+## Status (2026-06-11) — deferred to production
+
+All phases are implemented and tested locally (40 tests; partial corpus:
+156 episodes replayed, first 25 consolidated → 63 concepts, 5 bridges,
+rebuild verified byte-identical, fidelity 6-7/10 on 2013 notes, one real
+synthesized doc). Deliberately deferred to the production deploy:
+
+1. **Full migration**: `cli replay && cli consolidate --all --max-episodes 25`
+   (~$0.03/episode sync; resume-safe — failed/killed runs reuse their logged
+   blueprints). Then verify: claim dedupe fires on the duplicate notes
+   (episodes ~140-156), `cli rebuild` checksum-identical, cost in
+   `consolidation_runs`.
+2. **Claude.ai connect** (Phase 4 acceptance): save a note, get a receipt
+   with a real echo; set AUTH_USER/AUTH_PASS for OAuth.
+3. **Two unattended nightly cron runs** (Phase 5 acceptance) + digest
+   delivery channel choice (PLAN.md §9.2).
+
 ## Invariants (PLAN.md §10)
 
 - Episodes are immutable — enforced by SQLite triggers.
