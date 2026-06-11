@@ -9,13 +9,14 @@ written to and never goes down.
 ## 0. Pre-flight (on the server)
 
 ```bash
-free -h          # v2 runs torch locally (~600-700MB RSS for the container).
-                 # If total RAM < 2GB or free < 1GB, add swap first:
-                 #   sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile
-                 #   sudo mkswap /swapfile && sudo swapon /swapfile
-df -h /          # need ~4GB free: image ~2.5GB (torch) + model cache + db
+free -h          # v2 embeds via HF Inference API (HF_TOKEN) — no torch.
+                 # Container RSS ~200MB; fits the 1GB box alongside v1.
+df -h /          # ~1GB free is plenty (slim image, no model downloads)
 docker ps        # confirm v1 'slate' container is the only thing on :8000
 ```
+
+Surveyed 2026-06-11: 956MB RAM (~500MB free), 25GB disk free, Docker 29 +
+Compose v5, Caddy active, v1 healthy on :8000 — all compatible.
 
 ## 1. Ship the repo
 
@@ -36,15 +37,18 @@ cd /home/ubuntu/slate-engine
 cp .env.example .env && nano .env
 ```
 
-Set in `.env`: `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `AUTH_USER`/`AUTH_PASS`
-(reuse v1's), `SLATE_BASE_URL=https://myslate2.duckdns.org`,
-`STANCE_PROVIDER=nli`. The compose file injects `DB_PATH` and `SLATE_V1_DB`.
+Set in `.env`: `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, **`HF_TOKEN`** (required
+on the server — copy from `/home/ubuntu/slate/.env`; it switches embeddings to
+the HF Inference API), `AUTH_USER`/`AUTH_PASS` (reuse v1's),
+`SLATE_BASE_URL=https://myslate2.duckdns.org`, and **`STANCE_PROVIDER=haiku`**
+(the server image has no torch, so the local NLI cross-encoder isn't
+available; Haiku stance costs ≈$0.003/save). The compose file injects
+`DB_PATH` and `SLATE_V1_DB`.
 
 ## 3. Build + boot (the image's first real test)
 
 ```bash
-docker compose up -d --build
-docker compose logs -f slate-engine   # first boot downloads all-MiniLM into hf-cache
+docker compose up -d --build          # slim image: requirements-server.txt, no torch
 curl -s localhost:8100/health         # {"status":"ok","episodes":0,...}
 ```
 

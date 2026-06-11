@@ -32,7 +32,7 @@ The current implementation gets the *representation* right (fragments, concepts,
 7. **Headless, MCP-first.** FastMCP server (port OAuth 2.1 scaffolding from old repo) is the only interface. Save from Claude.ai / Claude Code / mobile. A web UI, if ever, is just another client.
 8. **Nightly job = plain code on cron**, not an agent. Deterministic pipeline: collect episodes → submit batch → poll → apply events.
 9. **Morning digest is a required feature**, not a nice-to-have (Phase 6). It reads last night's events and tells the user what emerged.
-10. **Embeddings stay local and free** (all-MiniLM-L6-v2 on CPU, same as today). Never move embeddings to an API.
+10. **Embeddings via HF Inference API in production** (all-MiniLM-L6-v2 through `HF_TOKEN`, exactly like v1 prod — the 1GB host runs no torch). Local SentenceTransformer is the dev/test path only; both produce identical 384-dim normalized vectors. *(Corrected 2026-06-11: this previously said "local only, never an API" — that was never the user's intent; v1 production has always embedded via HF.)*
 11. **Model tiering:** Haiku-class for mechanical work (extraction, canonicalization), Sonnet-class for the global merge/split judgment pass. Reuse the existing provider fallback chain (claude → gemini → local).
 
 ## 3. Target project layout
@@ -256,4 +256,4 @@ Host cron (or sidecar loop) → `python -m cli consolidate` (Batch mode). Failur
 - **Only `consolidate.py` writes to the semantic store, and only through `events`.** Any "quick" direct write from the MCP path re-creates the old architecture.
 - Every consolidation decision must be an event before it is a row.
 - `rebuild` from the event log must always reproduce the semantic store exactly.
-- Embeddings local. Search local. LLM calls only at consolidation + on-demand generation + (optionally) one small call at encode.
+- Search local. Embeddings via HF Inference API in prod (local model in dev) — identical vectors either way. LLM calls only at consolidation + on-demand generation + (optionally) one small call at encode.

@@ -1,0 +1,12 @@
+# Production image (HF_TOKEN embeddings — no torch/sentence-transformers).
+# Dev/tests use requirements.txt, which adds the local embedding stack.
+fastapi
+uvicorn[standard]
+fastmcp
+sqlite-vec
+numpy
+anthropic
+google-genai
+nltk
+python-dotenv
+huggingface_hub

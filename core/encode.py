@@ -13,14 +13,40 @@ from datetime import datetime, timezone
 from core import config, store
 
 # ── Embedder singleton (ported from v1 engine/db.py) ──────────────────────────
+# Production embeds via the HF Inference API (HF_TOKEN set) — no torch on the
+# server. Local SentenceTransformer is the dev/test path. Both produce
+# identical 384-dim L2-normalized all-MiniLM-L6-v2 vectors.
 _embedder = None
+
+
+class HFEmbedder:
+    """Thin wrapper around HF Inference API feature-extraction (v1's HFEmbedModel)."""
+
+    def __init__(self, token: str, model: str | None = None):
+        from huggingface_hub import InferenceClient
+        self._client = InferenceClient(api_key=token)
+        self._model = model or f"sentence-transformers/{config.EMBED_MODEL_NAME}"
+
+    def encode(self, sentences, **kwargs):  # accepts/ignores ST kwargs
+        import numpy as np
+        single = isinstance(sentences, str)
+        inputs = [sentences] if single else list(sentences)
+        result = self._client.feature_extraction(inputs, model=self._model,
+                                                 normalize=True)
+        arr = np.array(result)
+        if arr.ndim == 3:  # token-level embeddings returned — mean-pool
+            arr = arr.mean(axis=1)
+        return arr[0] if single else arr
 
 
 def get_embedder():
     global _embedder
     if _embedder is None:
-        from sentence_transformers import SentenceTransformer
-        _embedder = SentenceTransformer(config.EMBED_MODEL_NAME)
+        if config.HF_TOKEN:
+            _embedder = HFEmbedder(config.HF_TOKEN)
+        else:
+            from sentence_transformers import SentenceTransformer
+            _embedder = SentenceTransformer(config.EMBED_MODEL_NAME)
     return _embedder
 
 

@@ -5,12 +5,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Server image embeds via HF Inference API (HF_TOKEN) — no torch. Run with
+# requirements.txt instead only if you need local embeddings in a container.
+COPY requirements-server.txt .
+RUN pip install --no-cache-dir -r requirements-server.txt
 
 # Bake the sentence tokenizer so first boot never depends on nltk's CDN.
-# (The embedding model is NOT baked — it lands in the hf-cache volume on
-# first use, keeping the image smaller and the cache reusable across builds.)
 RUN python -m nltk.downloader punkt_tab
 
 COPY . .

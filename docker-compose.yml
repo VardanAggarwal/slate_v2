@@ -14,7 +14,6 @@ services:
       - "127.0.0.1:8100:8000"
     volumes:
       - ${DATA_ROOT:-/home/ubuntu/slate-engine-data}:/app/data
-      - ${DATA_ROOT:-/home/ubuntu/slate-engine-data}/hf-cache:/root/.cache/huggingface
       - ${V1_DB_PATH:-/home/ubuntu/slate-data/slate.db}:/old/slate.db:ro
     env_file: .env
     environment:

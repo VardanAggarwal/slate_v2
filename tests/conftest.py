@@ -4,9 +4,10 @@ from core import config, store
 
 
 @pytest.fixture(autouse=True)
-def _no_stance_model(monkeypatch):
-    """Keep tests offline: never download the NLI cross-encoder or call Haiku."""
+def _offline(monkeypatch):
+    """Keep tests offline + deterministic: local embedder, no NLI/Haiku stance."""
     monkeypatch.setattr(config, "STANCE_PROVIDER", "off")
+    monkeypatch.setattr(config, "HF_TOKEN", "")
 
 
 @pytest.fixture

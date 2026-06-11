@@ -15,6 +15,23 @@ NOTE_B = (
 )
 
 
+def test_hf_embedder_wraps_inference_api():
+    import numpy as np
+    from core.encode import HFEmbedder
+
+    class FakeClient:
+        def feature_extraction(self, inputs, model=None, normalize=True):
+            return np.ones((len(inputs), 3, 384))  # token-level → needs pooling
+
+    e = HFEmbedder.__new__(HFEmbedder)
+    e._client, e._model = FakeClient(), "m"
+    batch = e.encode(["a", "b"], normalize_embeddings=True, show_progress_bar=False,
+                     batch_size=32)  # ST kwargs must be swallowed
+    assert batch.shape == (2, 384)   # mean-pooled to sentence level
+    single = e.encode("a")
+    assert single.shape == (384,)
+
+
 def test_split_sentences_filters_short():
     sents = split_sentences("Short. " + "This sentence is definitely long enough to pass the filter easily.")
     assert len(sents) == 1

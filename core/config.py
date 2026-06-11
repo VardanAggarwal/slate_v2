@@ -15,7 +15,9 @@ DB_PATH = Path(os.getenv("DB_PATH", ROOT / "data" / "engine.db"))
 # Old v1 database, used only by migrate.py replay.
 SLATE_V1_DB = os.getenv("SLATE_V1_DB", str(Path.home() / "slate" / "data" / "slate.db"))
 
-# ── Embeddings (always local, never an API — PLAN.md §2.10) ───────────────────
+# ── Embeddings (PLAN.md §2.10: HF Inference API in production via HF_TOKEN;
+# local SentenceTransformer only for dev/tests — identical 384-dim vectors) ───
+HF_TOKEN         = os.getenv("HF_TOKEN", "")
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "all-MiniLM-L6-v2")
 EMBED_DIM        = 384
 
