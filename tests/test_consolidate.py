@@ -220,6 +220,52 @@ def test_llm_calls_never_hold_a_write_transaction(conn, fake_llm, monkeypatch):
     assert fake_llm["blueprint"] >= 2 and fake_llm["concept"] >= 1  # guard exercised
 
 
+def test_stubborn_episode_is_skipped_not_fatal(conn, fake_llm, monkeypatch):
+    """A note whose blueprint fails on all providers must not kill the run."""
+    import core.llm as llm_mod
+    inner = llm_mod.call
+
+    def poisoned(prompt, **kw):
+        if prompt.startswith("Extract semantic structure") and S3 in prompt:
+            raise LLMError("malformed JSON from every provider")
+        return inner(prompt, **kw)
+
+    monkeypatch.setattr("core.llm.call", poisoned)
+    # Simulate the slim server image: no sklearn, so no local fallback
+    def no_sklearn(text):
+        raise ImportError("No module named 'sklearn'")
+    monkeypatch.setattr("core.consolidate._blueprint_local", no_sklearn)
+
+    encode(conn, S1, source="test")
+    encode(conn, S3, source="test")  # the poisoned note
+
+    report = consolidate(conn)
+    assert report["status"] == "ok"
+    assert report["episodes"] == 1
+    assert len(report["skipped"]) == 1
+    remaining = store.unconsolidated_episodes(conn)
+    assert len(remaining) == 1       # picked up by the next run
+    assert S3 in remaining[0]["raw_text"]
+
+
+def test_llm_call_retries_malformed_json_once(monkeypatch):
+    import core.llm as llm_mod
+    attempts = {"n": 0}
+
+    def flaky_claude(prompt, model, max_tokens, system):
+        attempts["n"] += 1
+        text = "{bad json" if attempts["n"] == 1 else '{"ok": true}'
+        return {"text": text, "provider": "claude", "model": model,
+                "input_tokens": 1, "output_tokens": 1, "cost": 0.0}
+
+    monkeypatch.setattr(llm_mod, "_call_claude", flaky_claude)
+    monkeypatch.setattr(llm_mod.config, "ANTHROPIC_KEY", "test")
+    monkeypatch.setattr(llm_mod.config, "LLM_FALLBACK_ORDER", ["claude"])
+    result = llm_mod.call("anything")
+    assert result["json"] == {"ok": True}
+    assert attempts["n"] == 2
+
+
 def test_episodes_are_immutable(conn):
     import sqlite3
     encode(conn, S1, source="test")

@@ -244,14 +244,19 @@ def _blueprint_local(text: str) -> dict:
 
 
 def blueprint(text: str) -> tuple[dict, float]:
-    """LLM blueprint with local KMeans fallback. Returns (blueprint, cost)."""
+    """LLM blueprint; local KMeans fallback only where sklearn exists (dev).
+    On the slim server image the LLMError propagates instead — the caller
+    skips the episode and the next nightly run retries it."""
     try:
         result = llm.call(PROMPT_BLUEPRINT + text, tier="mechanical", max_tokens=2048)
         bp = result["json"]
         bp["_method"] = result["provider"]
         return bp, result["cost"]
     except llm.LLMError:
-        return _blueprint_local(text), 0.0
+        try:
+            return _blueprint_local(text), 0.0
+        except ImportError:
+            raise llm.LLMError("blueprint failed and no local sklearn fallback")
 
 
 # ── Retry reuse: a failed run's blueprint + canon events are authoritative ────
@@ -600,12 +605,19 @@ def consolidate(conn, max_episodes: int = 50) -> dict:
     try:
         # Helpers manage their own SHORT transactions; LLM calls never run
         # inside one, so a concurrent save_note never waits on the network.
+        skipped: list[str] = []
         for ep in episodes:
             bp = _existing_blueprint(conn, ep["id"])
             if bp is not None:  # retry of a failed run — reuse, don't re-extract
                 episode_claims = _existing_canon(conn, ep["id"])
             else:
-                bp, bp_cost = blueprint(ep["raw_text"])  # LLM, no txn
+                try:
+                    bp, bp_cost = blueprint(ep["raw_text"])  # LLM, no txn
+                except llm.LLMError:
+                    # One stubborn note must not kill the night: leave it
+                    # unconsolidated; the next run retries it.
+                    skipped.append(ep["id"])
+                    continue
                 cost += bp_cost
                 episode_claims, canon_cost = _canonicalize_episode(
                     conn, run_id, ep, bp,
@@ -625,11 +637,12 @@ def consolidate(conn, max_episodes: int = 50) -> dict:
             _decay_strengthen(conn, run_id, episodes, ts)
 
         with conn:
-            for ep in episodes:
+            for ep, _, _ in per_episode:  # skipped episodes stay unconsolidated
                 store.mark_consolidated(conn, ep["id"], run_id)
             store.finish_run(conn, run_id, "ok", round(cost, 4))
-        return {"status": "ok", "run_id": run_id, "episodes": len(episodes),
-                "claims_touched": len(set(new_claim_ids)), "cost": round(cost, 4)}
+        return {"status": "ok", "run_id": run_id, "episodes": len(per_episode),
+                "skipped": skipped, "claims_touched": len(set(new_claim_ids)),
+                "cost": round(cost, 4)}
     except Exception:
         with conn:
             store.finish_run(conn, run_id, "failed", round(cost, 4))
