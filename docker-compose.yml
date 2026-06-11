@@ -1,19 +1,28 @@
+# Side-by-side with the v1 deployment on the same host:
+#   v1 `slate`        → 127.0.0.1:8000, data in /home/ubuntu/slate-data (untouched)
+#   v2 `slate-engine` → 127.0.0.1:8100, data in /home/ubuntu/slate-engine-data
+# v1's slate.db is mounted READ-ONLY as the replay source (PLAN.md §2.2).
+# For local dev, override the host paths via .env (see DATA_ROOT / V1_DB_PATH).
 services:
-  engine:
-    build: .
+  slate-engine:
+    build:
+      context: .
+      cache_from:
+        - slate_v2-slate-engine:latest
+    container_name: slate-engine
     ports:
-      - "8000:8000"
-    env_file: .env
+      - "127.0.0.1:8100:8000"
     volumes:
-      - ./data:/app/data
+      - ${DATA_ROOT:-/home/ubuntu/slate-engine-data}:/app/data
+      - ${DATA_ROOT:-/home/ubuntu/slate-engine-data}/hf-cache:/root/.cache/huggingface
+      - ${V1_DB_PATH:-/home/ubuntu/slate-data/slate.db}:/old/slate.db:ro
+    env_file: .env
+    environment:
+      - DB_PATH=/app/data/engine.db
+      - SLATE_V1_DB=/old/slate.db
     restart: unless-stopped
-
-  # Nightly consolidation (PLAN.md §7 Phase 5) — sidecar loop alternative to host cron.
-  # Uncomment once consolidate is implemented:
-  # consolidator:
-  #   build: .
-  #   env_file: .env
-  #   volumes:
-  #     - ./data:/app/data
-  #   command: sh -c "while true; do python cli.py consolidate; sleep 86400; done"
-  #   restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
