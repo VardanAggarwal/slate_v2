@@ -3,7 +3,7 @@ import pytest
 from core.consolidate import consolidate, emit
 from core.encode import encode
 from core.reconstruct import bridges, reconstruct, synthesize
-from core import store
+from tests.conftest import UID
 from tests.test_consolidate import S1, S2, fake_llm  # noqa: F401
 
 TS = "2026-06-11T00:00:00+00:00"
@@ -31,15 +31,15 @@ def fake_gen_llm(monkeypatch, fake_llm):
 
 
 def test_reconstruct_requires_blueprint(conn, fake_gen_llm):
-    receipt = encode(conn, S1, source="test")
+    receipt = encode(conn, UID, S1, source="test")
     with pytest.raises(ValueError, match="no blueprint"):
-        reconstruct(conn, receipt["episode_id"])
+        reconstruct(conn, UID, receipt["episode_id"])
 
 
 def test_reconstruct_scores_fidelity_and_compression(conn, fake_gen_llm):
-    receipt = encode(conn, S1, source="test", title="memory")
-    consolidate(conn)
-    result = reconstruct(conn, receipt["episode_id"])
+    receipt = encode(conn, UID, S1, source="test", title="memory")
+    consolidate(conn, UID)
+    result = reconstruct(conn, UID, receipt["episode_id"])
     assert result["fidelity"] == 8
     assert result["reconstruction"]
     assert 0 < result["compression"]["ratio"]
@@ -47,21 +47,21 @@ def test_reconstruct_scores_fidelity_and_compression(conn, fake_gen_llm):
 
 def test_synthesize_uses_bridge_rationale(conn, fake_gen_llm):
     for cid, text, label in (("clm_a", S1, "Memory"), ("clm_b", S2, "Sleep")):
-        emit(conn, "run_t", "CANONICALIZED",
+        emit(conn, UID, "run_t", "CANONICALIZED",
              {"action": "new", "claim_id": cid, "text": text,
               "episode_id": "ep_x", "verbatim": text, "cluster": "main", "ts": TS})
-    emit(conn, "run_t", "CONCEPT_CREATED",
+    emit(conn, UID, "run_t", "CONCEPT_CREATED",
          {"concept_id": "cpt_a", "label": "Memory", "canonical": "m",
           "claim_ids": ["clm_a"], "ts": TS})
-    emit(conn, "run_t", "CONCEPT_CREATED",
+    emit(conn, UID, "run_t", "CONCEPT_CREATED",
          {"concept_id": "cpt_b", "label": "Sleep", "canonical": "s",
           "claim_ids": ["clm_b"], "ts": TS})
-    emit(conn, "run_t", "BRIDGED",
+    emit(conn, UID, "run_t", "BRIDGED",
          {"a": "cpt_a", "b": "cpt_b", "score": 0.6,
           "rationale": "memory depends on sleep", "ts": TS})
     conn.commit()
 
-    assert bridges(conn)[0]["a_label"] == "Memory"
-    result = synthesize(conn, "cpt_a", "cpt_b")
+    assert bridges(conn, UID)[0]["a_label"] == "Memory"
+    result = synthesize(conn, UID, "cpt_a", "cpt_b")
     assert result["rationale"] == "memory depends on sleep"
     assert result["document"]

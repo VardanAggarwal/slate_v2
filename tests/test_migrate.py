@@ -2,6 +2,7 @@ import sqlite3
 
 from core import store
 from migrate import replay
+from tests.conftest import UID
 
 
 def _make_old_db(path):
@@ -28,13 +29,13 @@ def test_replay_counts_and_idempotency(tmp_path):
     new_db = tmp_path / "engine.db"
     _make_old_db(old_db)
 
-    s1 = replay(old_db=str(old_db), db_path=new_db, verbose=False)
+    s1 = replay(UID, old_db=str(old_db), db_path=new_db, verbose=False)
     assert s1["replayed"] == 2          # empty raw_text skipped by the query
     assert s1["old_sources_total"] == 3
     assert s1["old_sources_nonempty"] == 2
     assert s1["episodes"] == 2
 
-    s2 = replay(old_db=str(old_db), db_path=new_db, verbose=False)
+    s2 = replay(UID, old_db=str(old_db), db_path=new_db, verbose=False)
     assert s2["replayed"] == 0
     assert s2["skipped"] == 2
     assert s2["episodes"] == 2          # idempotent
@@ -44,7 +45,7 @@ def test_replay_preserves_original_ts_and_order(tmp_path):
     old_db = tmp_path / "old.db"
     new_db = tmp_path / "engine.db"
     _make_old_db(old_db)
-    replay(old_db=str(old_db), db_path=new_db, verbose=False)
+    replay(UID, old_db=str(old_db), db_path=new_db, verbose=False)
 
     conn = store.connect(new_db)
     eps = conn.execute("SELECT ts, id FROM episodes ORDER BY ts").fetchall()
@@ -57,7 +58,7 @@ def test_replay_receipt_sees_prior_note(tmp_path):
     old_db = tmp_path / "old.db"
     new_db = tmp_path / "engine.db"
     _make_old_db(old_db)
-    replay(old_db=str(old_db), db_path=new_db, verbose=False)
+    replay(UID, old_db=str(old_db), db_path=new_db, verbose=False)
 
     conn = store.connect(new_db)
     import json

@@ -14,18 +14,18 @@ PROMPT_DIGEST = """Rewrite this nightly knowledge-base digest as 3-6 short, warm
 """
 
 
-def _concept_label(conn, concept_id: str, payloads_by_concept: dict) -> str:
-    c = store.get_concept(conn, concept_id)
+def _concept_label(conn, user_id: str, concept_id: str, payloads_by_concept: dict) -> str:
+    c = store.get_concept(conn, user_id, concept_id)
     if c:
         return c["label"] or concept_id
     return payloads_by_concept.get(concept_id, concept_id)  # merged/split away
 
 
-def digest(conn, since_hours: int = 36, polish: bool = False) -> str:
+def digest(conn, user_id: str, since_hours: int = 36, polish: bool = False) -> str:
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=since_hours)).isoformat()
     rows = conn.execute(
-        "SELECT ts, type, payload_json FROM events WHERE ts >= ? ORDER BY seq",
-        (cutoff,)).fetchall()
+        "SELECT ts, type, payload_json FROM events WHERE ts >= ? AND user_id = ? ORDER BY seq",
+        (cutoff, user_id)).fetchall()
     if not rows:
         return "_Nothing consolidated recently — save some notes and the nightly run will have material._"
 
@@ -41,16 +41,16 @@ def digest(conn, since_hours: int = 36, polish: bool = False) -> str:
     lines = []
     for type_, p in events:
         if type_ == "BRIDGED":
-            a = _concept_label(conn, p["a"], labels)
-            b = _concept_label(conn, p["b"], labels)
+            a = _concept_label(conn, user_id, p["a"], labels)
+            b = _concept_label(conn, user_id, p["b"], labels)
             lines.append(f"🌉 New bridge: **{a}** × **{b}** — {p.get('rationale', '')}")
         elif type_ == "RELATED" and p.get("relation") == "contradicts":
-            frm = store.get_claim(conn, p["from_id"])
-            to = store.get_claim(conn, p["to_id"])
+            frm = store.get_claim(conn, user_id, p["from_id"])
+            to = store.get_claim(conn, user_id, p["to_id"])
             if frm and to:
                 lines.append(f"⚡ Contradiction: “{frm['text']}” vs earlier “{to['text']}”")
         elif type_ == "MERGED":
-            w = _concept_label(conn, p["winner_id"], labels)
+            w = _concept_label(conn, user_id, p["winner_id"], labels)
             loser = (p.get("loser_snapshot", {}).get("concept") or {}).get("label", p["loser_id"])
             lines.append(f"🧲 Merged: **{loser}** folded into **{w}**")
         elif type_ == "SPLIT":
@@ -61,7 +61,7 @@ def digest(conn, since_hours: int = 36, polish: bool = False) -> str:
             lines.append(f"🌱 New concept: **{p.get('label', p['concept_id'])}** "
                          f"({len(p.get('claim_ids', []))} claims)")
         elif type_ == "DECAYED" and p.get("state_to") == "dormant":
-            label = _concept_label(conn, p["concept_id"], labels)
+            label = _concept_label(conn, user_id, p["concept_id"], labels)
             lines.append(f"🕰️ Going dormant: **{label}** — "
                          f"last touched {p.get('days_inactive', '?')} days ago")
 
@@ -72,11 +72,11 @@ def digest(conn, since_hours: int = 36, polish: bool = False) -> str:
         elif type_ == "CANONICALIZED" and p.get("action") == "support":
             strengthened[p["claim_id"]] = strengthened.get(p["claim_id"], 0) + 1
     for claim_id, n in sorted(strengthened.items(), key=lambda x: -x[1])[:3]:
-        c = store.get_claim(conn, claim_id)
+        c = store.get_claim(conn, user_id, claim_id)
         if c and n >= 1:
             total = conn.execute(
-                "SELECT COUNT(*) AS n FROM claim_support WHERE claim_id = ?",
-                (claim_id,)).fetchone()["n"]
+                "SELECT COUNT(*) AS n FROM claim_support WHERE claim_id = ? AND user_id = ?",
+                (claim_id, user_id)).fetchone()["n"]
             lines.append(f"🔁 Strengthened: “{c['text']}” ({total} encounter(s))")
 
     if not lines:

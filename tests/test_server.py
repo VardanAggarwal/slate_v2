@@ -45,9 +45,36 @@ def test_status_requires_auth_when_configured(client, monkeypatch):
     monkeypatch.setattr(config, "AUTH_PASS", "p")
     assert client.get("/status").status_code == 401
     assert client.get("/status", auth=("u", "wrong")).status_code == 401
-    ok = client.get("/status", auth=("u", "p"))
+    ok = client.get("/status", auth=("u", "p"))  # bootstraps the first admin
     assert ok.status_code == 200
     assert "Last consolidation" in ok.text
+    assert "signed in as u" in ok.text
+
+
+def test_bootstrap_admin_survives_env_removal(client, monkeypatch):
+    """Once the env login provisions a users row, dropping the env pair must
+    not reopen the page (AUTH.md §2)."""
+    monkeypatch.setattr(config, "AUTH_USER", "u")
+    monkeypatch.setattr(config, "AUTH_PASS", "p")
+    assert client.get("/status", auth=("u", "p")).status_code == 200
+    monkeypatch.setattr(config, "AUTH_USER", "")
+    monkeypatch.setattr(config, "AUTH_PASS", "")
+    assert client.get("/status").status_code == 401
+    assert client.get("/status", auth=("u", "p")).status_code == 200
+
+
+def test_users_table_login_works_without_env_creds(client):
+    from core import store
+    from core.auth import hash_password
+    conn = store.connect()
+    with conn:
+        store.create_user(conn, "alice", hash_password("s3cret"))
+    conn.close()
+    assert client.get("/status").status_code == 401
+    assert client.get("/status", auth=("alice", "wrong")).status_code == 401
+    ok = client.get("/status", auth=("alice", "s3cret"))
+    assert ok.status_code == 200
+    assert "signed in as alice" in ok.text
 
 
 def test_status_has_run_cta(client):
@@ -66,8 +93,9 @@ def test_run_triggers_and_redirects(client, monkeypatch):
     import server
     started = {}
 
-    def fake_run():  # don't run the real (LLM-calling) job in tests
-        started["yes"] = True
+    def fake_run(user_id, run_all):  # don't run the real (LLM-calling) job in tests
+        started["user_id"] = user_id
+        started["run_all"] = run_all
 
     monkeypatch.setattr(server, "_run_nightly", fake_run)
     r = client.post("/run", follow_redirects=False)
@@ -79,4 +107,5 @@ def test_run_triggers_and_redirects(client, monkeypatch):
         if started:
             break
         _t.sleep(0.01)
-    assert started.get("yes")
+    assert started["user_id"] == config.DEFAULT_USER_ID
+    assert started["run_all"] is True  # local-dev fallback user is admin

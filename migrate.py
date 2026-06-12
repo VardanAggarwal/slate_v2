@@ -1,7 +1,8 @@
 """Replay driver: read old slate.db sources.raw_text chronologically, encode() each as an episode preserving original created_at. See PLAN.md §2.2, §7 Phase 1.
 
-Idempotent: each old source id is recorded in replay_map in the same
-transaction as its episode, so re-running skips everything already replayed.
+Idempotent: each old source id is recorded in replay_map (scoped to the target
+user, AUTH.md §5) in the same transaction as its episode, so re-running skips
+everything already replayed.
 """
 import argparse
 import sqlite3
@@ -10,7 +11,7 @@ from core import config, store
 from core.encode import encode
 
 
-def replay(old_db: str | None = None, limit: int | None = None,
+def replay(user_id: str, old_db: str | None = None, limit: int | None = None,
            db_path: str | None = None, verbose: bool = True) -> dict:
     conn = store.connect(db_path)
     old = sqlite3.connect(old_db or config.SLATE_V1_DB)
@@ -27,10 +28,10 @@ def replay(old_db: str | None = None, limit: int | None = None,
 
     done = skipped = 0
     for row in rows:
-        if store.replay_seen(conn, row["id"]):
+        if store.replay_seen(conn, user_id, row["id"]):
             skipped += 1
             continue
-        receipt = encode(conn, row["raw_text"], ts=row["created_at"],
+        receipt = encode(conn, user_id, row["raw_text"], ts=row["created_at"],
                          title=row["title"], source="replay", replay_key=row["id"])
         done += 1
         if verbose:
@@ -41,7 +42,7 @@ def replay(old_db: str | None = None, limit: int | None = None,
 
     summary = {"replayed": done, "skipped": skipped,
                "old_sources_total": total, "old_sources_nonempty": len(rows),
-               "episodes": store.count_episodes(conn)}
+               "episodes": store.count_episodes(conn, user_id)}
     if verbose:
         print(f"[replay] done: {summary}")
     return summary
@@ -51,5 +52,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Replay old slate.db into the new engine")
     ap.add_argument("--old-db", default=None, help="path to v1 slate.db")
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--user", default=config.DEFAULT_USER_ID,
+                    help="target user_id (default: %(default)s)")
     args = ap.parse_args()
-    replay(old_db=args.old_db, limit=args.limit)
+    replay(args.user, old_db=args.old_db, limit=args.limit)

@@ -35,9 +35,9 @@ Return only the document text.
 """
 
 
-def reconstruct(conn, episode_id: str) -> dict:
+def reconstruct(conn, user_id: str, episode_id: str) -> dict:
     """Regenerate a note from its blueprint; report fidelity vs raw_text."""
-    ep = get_episode(conn, episode_id)
+    ep = get_episode(conn, user_id, episode_id)
     if not ep:
         raise ValueError(f"episode not found: {episode_id}")
     if not ep["blueprint"]:
@@ -82,8 +82,8 @@ def reconstruct(conn, episode_id: str) -> dict:
     }
 
 
-def _concept_block(conn, concept_id: str) -> str:
-    c = get_concept(conn, concept_id)
+def _concept_block(conn, user_id: str, concept_id: str) -> str:
+    c = get_concept(conn, user_id, concept_id)
     if not c:
         raise ValueError(f"concept not found: {concept_id}")
     claims = []
@@ -96,37 +96,39 @@ def _concept_block(conn, concept_id: str) -> str:
     return f"{c['label']} — {c['canonical']}\n" + "\n".join(claims)
 
 
-def synthesize(conn, concept_a: str, concept_b: str,
+def synthesize(conn, user_id: str, concept_a: str, concept_b: str,
                rationale: str | None = None) -> dict:
     """Draft a NEW document from two (ideally bridged) concepts."""
     if rationale is None:
         row = conn.execute(
             """SELECT payload_json FROM events WHERE type = 'BRIDGED'
+               AND user_id = ?
                AND ((json_extract(payload_json, '$.a') = ? AND json_extract(payload_json, '$.b') = ?)
                  OR (json_extract(payload_json, '$.a') = ? AND json_extract(payload_json, '$.b') = ?))
                ORDER BY seq DESC LIMIT 1""",
-            (concept_a, concept_b, concept_b, concept_a)).fetchone()
+            (user_id, concept_a, concept_b, concept_b, concept_a)).fetchone()
         rationale = (json.loads(row["payload_json"]).get("rationale", "")
                      if row else "an unstated affinity between the two clusters")
 
     result = llm.call(PROMPT_SYNTHESIZE.format(
         rationale=rationale,
-        a=_concept_block(conn, concept_a),
-        b=_concept_block(conn, concept_b)),
+        a=_concept_block(conn, user_id, concept_a),
+        b=_concept_block(conn, user_id, concept_b)),
         tier="judgment", max_tokens=2048, json_out=False)
     return {"concepts": [concept_a, concept_b], "rationale": rationale,
             "document": result["text"].strip(), "cost": round(result["cost"], 4)}
 
 
-def bridges(conn, limit: int = 20) -> list[dict]:
+def bridges(conn, user_id: str, limit: int = 20) -> list[dict]:
     """List bridge relations with labels — entry point for synthesize()."""
     out = []
     for r in conn.execute(
             """SELECT from_id, to_id, weight, created_at FROM relations
-               WHERE relation = 'bridges' ORDER BY created_at DESC LIMIT ?""",
-            (limit,)):
-        a = store.get_concept(conn, r["from_id"])
-        b = store.get_concept(conn, r["to_id"])
+               WHERE relation = 'bridges' AND user_id = ?
+               ORDER BY created_at DESC LIMIT ?""",
+            (user_id, limit)):
+        a = store.get_concept(conn, user_id, r["from_id"])
+        b = store.get_concept(conn, user_id, r["to_id"])
         if a and b:
             out.append({"a": r["from_id"], "a_label": a["label"],
                         "b": r["to_id"], "b_label": b["label"],

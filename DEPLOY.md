@@ -33,7 +33,7 @@ Compose v5, Caddy active, v1 healthy on :8000 — all compatible.
 Either push `slate_v2` to a private GitHub repo and clone it, or rsync:
 
 ```bash
-rsync -av --exclude .venv --exclude data --exclude .git \
+rsync -av --exclude .venv --exclude data --exclude .git --exclude .env \
   -e "ssh -i ~/.ssh/slate_server" \
   /Users/vardanaggarwal/slate_v2/ ubuntu@140.245.216.42:/home/ubuntu/slate-engine/
 ```

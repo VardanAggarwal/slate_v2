@@ -1,9 +1,15 @@
-"""FastMCP + OAuth 2.1. Tools: save_note, recall, assemble_context, get_note, list_recent_notes, get_concept, timeline, digest. SlateOAuthProvider ported from v1 engine/mcp_server.py. See PLAN.md §5 MCP usage pattern + Phase 4.
+"""FastMCP + OAuth 2.1. Tools: save_note, recall, assemble_context, get_note, list_recent_notes, get_concept, timeline, digest. SlateOAuthProvider ported from v1 engine/mcp_server.py. See PLAN.md §5 MCP usage pattern + Phase 4, AUTH.md §2.
 
 Two-stage retrieval: `recall` returns ~50-token headlines so the model can
 call it speculatively; `assemble_context` / `get_concept` are the escalation.
 Trigger conditions live in the tool descriptions — models under-reach for
 tools, so the descriptions say WHEN to call, not just what they do.
+
+Identity (AUTH.md §2): the login page validates against the users table and
+binds the authenticated user_id to the issued auth code; the token exchange
+stamps it into AccessToken.claims (FastMCP drops .subject in transit — claims
+survive, verified against fastmcp 3.4.2). Every tool resolves user_id from
+the request token via _user_id() and passes it into core explicitly.
 """
 import json
 import secrets
@@ -14,40 +20,144 @@ from fastmcp.exceptions import ToolError
 from core import config, store
 from core.encode import encode
 
-# ── OAuth provider (ported from v1) ───────────────────────────────────────────
+# ── OAuth provider (ported from v1; user binding per AUTH.md §2) ──────────────
 slate_auth = None
 if config.AUTH_USER and config.AUTH_PASS:
+    import time as _time
+
     from fastmcp.server.auth.providers.in_memory import InMemoryOAuthProvider
-    from mcp.server.auth.provider import AuthorizationParams
+    from mcp.server.auth.provider import (AccessToken, AuthorizationParams,
+                                          RefreshToken)
     from mcp.server.auth.routes import ClientRegistrationOptions
     from mcp.shared.auth import OAuthClientInformationFull
 
     class SlateOAuthProvider(InMemoryOAuthProvider):
         """OAuth 2.1 with a login step: /authorize redirects to a login page;
-        valid AUTH_USER/AUTH_PASS issues the auth code."""
+        a valid users-table login issues the auth code, bound to that user.
 
-        def __init__(self, base_url: str, auth_user: str, auth_pass: str):
+        DCR clients, access tokens (with their user-binding claims), and the
+        refresh chain are persisted in the engine DB (oauth_* tables) and
+        reloaded on boot, so connected MCP clients survive restarts — refresh
+        tokens never expire, so even week-old sessions refresh straight back
+        in. Auth codes and pending logins stay in-memory: 5-minute,
+        mid-browser-flow state that a restart may legitimately drop.
+        """
+
+        def __init__(self, base_url: str):
             super().__init__(
                 base_url=base_url,
                 client_registration_options=ClientRegistrationOptions(enabled=True),
             )
-            self.auth_user = auth_user
-            self.auth_pass = auth_pass
             self._pending: dict[str, tuple[OAuthClientInformationFull, AuthorizationParams]] = {}
+            self._code_user: dict[str, str] = {}     # auth code -> user_id
+            self._refresh_user: dict[str, str] = {}  # refresh token -> user_id
+            self._load_persisted()
+
+        def _load_persisted(self) -> None:
+            conn = store.connect()
+            try:
+                with conn:
+                    store.purge_expired_oauth_tokens(conn, int(_time.time()))
+                for r in store.load_oauth_clients(conn):
+                    self.clients[r["client_id"]] = (
+                        OAuthClientInformationFull.model_validate_json(r["client_json"]))
+                for r in store.load_oauth_access_tokens(conn):
+                    self.access_tokens[r["token"]] = (
+                        AccessToken.model_validate_json(r["token_json"]))
+                    if r["refresh_token"]:
+                        self._access_to_refresh_map[r["token"]] = r["refresh_token"]
+                        self._refresh_to_access_map[r["refresh_token"]] = r["token"]
+                for r in store.load_oauth_refresh_tokens(conn):
+                    self.refresh_tokens[r["token"]] = (
+                        RefreshToken.model_validate_json(r["token_json"]))
+                    if r["user_id"]:
+                        self._refresh_user[r["token"]] = r["user_id"]
+            finally:
+                conn.close()
+
+        async def register_client(self, client_info) -> None:
+            await super().register_client(client_info)
+            conn = store.connect()
+            try:
+                with conn:
+                    store.save_oauth_client(conn, client_info.client_id,
+                                            client_info.model_dump_json())
+            finally:
+                conn.close()
 
         async def authorize(self, client, params) -> str:
             auth_id = secrets.token_urlsafe(32)
             self._pending[auth_id] = (client, params)
             return f"{str(self.base_url).rstrip('/')}/login?auth_id={auth_id}"
 
-        async def approve_authorization(self, auth_id: str) -> str:
+        async def approve_authorization(self, auth_id: str, user_id: str) -> str:
             client, params = self._pending.pop(auth_id)
-            return await super().authorize(client, params)
+            redirect = await super().authorize(client, params)
+            code = redirect.split("code=")[1].split("&")[0]
+            self._code_user[code] = user_id
+            return redirect
+
+        def _bind(self, token, user_id: str | None):
+            """Stamp user_id into the issued access token's claims and remember
+            it for the refresh chain."""
+            if not user_id:
+                return token
+            at = self.access_tokens[token.access_token]
+            self.access_tokens[token.access_token] = at.model_copy(
+                update={"subject": user_id, "claims": {"user_id": user_id}})
+            if token.refresh_token:
+                self._refresh_user[token.refresh_token] = user_id
+            return token
+
+        def _persist_tokens(self, token, user_id: str | None) -> None:
+            """Write the freshly issued (post-_bind) pair through to the DB."""
+            conn = store.connect()
+            try:
+                with conn:
+                    at = self.access_tokens[token.access_token]
+                    store.save_oauth_access_token(
+                        conn, token.access_token, user_id, at.model_dump_json(),
+                        token.refresh_token, at.expires_at)
+                    if token.refresh_token:
+                        rt = self.refresh_tokens[token.refresh_token]
+                        store.save_oauth_refresh_token(
+                            conn, token.refresh_token, user_id,
+                            rt.model_dump_json(), rt.expires_at)
+            finally:
+                conn.close()
+
+        def _revoke_internal(self, access_token_str=None, refresh_token_str=None):
+            # capture the paired refresh before super() pops the maps
+            paired = self._access_to_refresh_map.get(access_token_str)
+            super()._revoke_internal(access_token_str=access_token_str,
+                                     refresh_token_str=refresh_token_str)
+            for k in (refresh_token_str, paired):
+                if k:
+                    self._refresh_user.pop(k, None)
+            conn = store.connect()
+            try:
+                with conn:
+                    store.delete_oauth_tokens(conn, access_token=access_token_str,
+                                              refresh_token=refresh_token_str)
+            finally:
+                conn.close()
+
+        async def exchange_authorization_code(self, client, authorization_code):
+            user_id = self._code_user.pop(authorization_code.code, None)
+            token = await super().exchange_authorization_code(client, authorization_code)
+            self._bind(token, user_id)
+            self._persist_tokens(token, user_id)
+            return token
+
+        async def exchange_refresh_token(self, client, refresh_token, scopes):
+            user_id = self._refresh_user.pop(refresh_token.token, None)
+            token = await super().exchange_refresh_token(client, refresh_token, scopes)
+            self._bind(token, user_id)
+            self._persist_tokens(token, user_id)
+            return token
 
     slate_auth = SlateOAuthProvider(
         base_url=config.SLATE_BASE_URL.rstrip("/") + "/mcp",
-        auth_user=config.AUTH_USER,
-        auth_pass=config.AUTH_PASS,
     )
 
 
@@ -72,6 +182,23 @@ mcp = FastMCP(
 
 def _conn():
     return store.connect()
+
+
+def _user_id() -> str:
+    """Resolve the authenticated user for this tool call (AUTH.md §2).
+
+    With OAuth enabled, identity comes ONLY from the token claims bound at
+    login — an unbound token gets a hard error, never a default corpus.
+    Without OAuth (local dev), everything is DEFAULT_USER_ID.
+    """
+    if slate_auth is None:
+        return config.DEFAULT_USER_ID
+    from fastmcp.server.dependencies import get_access_token
+    token = get_access_token()
+    user_id = (token.claims or {}).get("user_id") if token else None
+    if not user_id:
+        raise ToolError("Unauthenticated: no user is bound to this token — re-authorize.")
+    return user_id
 
 
 # ── Login route (only meaningful when OAuth is enabled) ───────────────────────
@@ -99,15 +226,21 @@ button{{width:100%;padding:10px;font-size:16px;cursor:pointer}}
         if request.method == "GET":
             return HTMLResponse(_LOGIN_PAGE.format(auth_id=auth_id, error=""))
         form = await request.form()
-        valid = (secrets.compare_digest(str(form.get("username", "")), slate_auth.auth_user)
-                 and secrets.compare_digest(str(form.get("password", "")), slate_auth.auth_pass))
-        if not valid:
+        from core.auth import authenticate
+        conn = _conn()
+        try:
+            user = authenticate(conn, str(form.get("username", "")),
+                                str(form.get("password", "")))
+        finally:
+            conn.close()
+        if user is None:
             return HTMLResponse(
                 _LOGIN_PAGE.format(auth_id=auth_id,
                                    error='<p class="error">Invalid username or password.</p>'),
                 status_code=401)
-        return RedirectResponse(await slate_auth.approve_authorization(auth_id),
-                                status_code=302)
+        return RedirectResponse(
+            await slate_auth.approve_authorization(auth_id, user["id"]),
+            status_code=302)
 
 
 # ── Receipt → renderable markdown (engineered for Claude to narrate back) ─────
@@ -149,9 +282,10 @@ def save_note(text: str, title: str) -> dict:
         text: the full note body, verbatim in the user's voice.
         title: concise 3-8 word title (generate it from the text).
     """
+    user_id = _user_id()
     conn = _conn()
     try:
-        receipt = encode(conn, text, title=title.strip(), source="mcp")
+        receipt = encode(conn, user_id, text, title=title.strip(), source="mcp")
     except ValueError as e:
         raise ToolError(str(e))
     return {"episode_id": receipt["episode_id"], "title": title.strip(),
@@ -174,7 +308,7 @@ def recall(query: str, k: int = 8) -> list[dict]:
     deserves the full picture.
     """
     from core.recall import recall as _recall
-    return _recall(_conn(), query, k=k)
+    return _recall(_conn(), _user_id(), query, k=k)
 
 
 @mcp.tool
@@ -186,7 +320,7 @@ def assemble_context(topic: str) -> str:
     has history with, or after recall() surfaces a hit worth expanding. Output
     is budgeted (~1-2K tokens, most-relevant-first) for direct injection."""
     from core.recall import assemble_context as _ac
-    return _ac(_conn(), topic)
+    return _ac(_conn(), _user_id(), topic)
 
 
 @mcp.tool
@@ -194,7 +328,7 @@ def get_note(episode_id: str) -> dict:
     """Fetch one note in full: raw text, receipt, blueprint (post-consolidation),
     and the canonical claims it supports. Use after recall/list_recent_notes."""
     from core.recall import get_episode
-    result = get_episode(_conn(), episode_id)
+    result = get_episode(_conn(), _user_id(), episode_id)
     if not result:
         raise ToolError(f"Note not found: {episode_id}")
     return result
@@ -205,7 +339,7 @@ def list_recent_notes(limit: int = 10) -> list[dict]:
     """List the most recently saved notes (id, title, ts, essence).
     Entry point for browsing; follow up with get_note."""
     from core.recall import list_episodes
-    return list_episodes(_conn(), limit=min(limit, 50))
+    return list_episodes(_conn(), _user_id(), limit=min(limit, 50))
 
 
 @mcp.tool
@@ -214,7 +348,7 @@ def get_concept(concept_id: str) -> dict:
     member claims with provenance (episodes + verbatim sentences), and its
     relations including bridges. Use after recall surfaces a concept hit."""
     from core.recall import get_concept as _gc
-    result = _gc(_conn(), concept_id)
+    result = _gc(_conn(), _user_id(), concept_id)
     if not result:
         raise ToolError(f"Concept not found: {concept_id}")
     return result
@@ -228,8 +362,8 @@ def timeline(concept_id: str, limit: int = 50) -> list[dict]:
     conn = _conn()
     rows = conn.execute(
         """SELECT seq, ts, type, payload_json FROM events
-           WHERE payload_json LIKE ? ORDER BY seq LIMIT ?""",
-        (f"%{concept_id}%", limit)).fetchall()
+           WHERE user_id = ? AND payload_json LIKE ? ORDER BY seq LIMIT ?""",
+        (_user_id(), f"%{concept_id}%", limit)).fetchall()
     out = []
     for r in rows:
         p = json.loads(r["payload_json"])
@@ -247,7 +381,7 @@ def digest(since_hours: int = 36) -> str:
     strengthened claims, concepts going dormant. Call when the user asks
     "what's new in my notes?" or each morning. Markdown, ready to relay."""
     from core.digest import digest as _digest
-    return _digest(_conn(), since_hours=since_hours)
+    return _digest(_conn(), _user_id(), since_hours=since_hours)
 
 
 @mcp.tool
@@ -257,7 +391,7 @@ def reconstruct_note(episode_id: str) -> dict:
     how much of a note Slate's minimal storage can recreate."""
     from core.reconstruct import reconstruct
     try:
-        return reconstruct(_conn(), episode_id)
+        return reconstruct(_conn(), _user_id(), episode_id)
     except ValueError as e:
         raise ToolError(str(e))
 
@@ -269,7 +403,7 @@ def synthesize(concept_a: str, concept_b: str) -> dict:
     (see list_bridges); uses the stored bridge rationale automatically."""
     from core.reconstruct import synthesize as _syn
     try:
-        return _syn(_conn(), concept_a, concept_b)
+        return _syn(_conn(), _user_id(), concept_a, concept_b)
     except ValueError as e:
         raise ToolError(str(e))
 
@@ -279,11 +413,11 @@ def list_bridges(limit: int = 20) -> list[dict]:
     """List discovered bridges between concept pairs (newest first) — the
     non-obvious connections consolidation surfaced. Entry point for synthesize."""
     from core.reconstruct import bridges
-    return bridges(_conn(), limit=limit)
+    return bridges(_conn(), _user_id(), limit=limit)
 
 
 @mcp.tool
 def stats() -> dict:
     """Corpus size (episodes, claims, concepts, relations) and the last
     consolidation run. Use for health checks / "how big is my Slate?"."""
-    return store.stats(_conn())
+    return store.stats(_conn(), _user_id())

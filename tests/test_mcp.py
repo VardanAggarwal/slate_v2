@@ -1,5 +1,3 @@
-import json
-
 import pytest
 from fastmcp import Client
 
@@ -7,6 +5,10 @@ from core import config
 from core.consolidate import consolidate
 from core.encode import encode
 from tests.test_consolidate import S1, S2, fake_llm  # noqa: F401
+
+# No OAuth in tests (AUTH_USER unset) → every tool call resolves to the
+# local-dev corpus owner.
+UID = config.DEFAULT_USER_ID
 
 
 @pytest.fixture
@@ -51,9 +53,9 @@ async def test_save_note_rejects_empty(mcp_db, client):
 async def test_recall_and_context_tools(mcp_db, client, fake_llm):
     from core import store
     conn = store.connect()
-    encode(conn, S1, source="test", title="memory note")
-    encode(conn, S2, source="test", title="sleep note")
-    consolidate(conn)
+    encode(conn, UID, S1, source="test", title="memory note")
+    encode(conn, UID, S2, source="test", title="sleep note")
+    consolidate(conn, UID)
 
     hits = await _call(client, "recall", query="retaining knowledge over time")
     assert hits and hits[0]["type"] in ("claim", "concept")
@@ -66,7 +68,7 @@ async def test_recall_and_context_tools(mcp_db, client, fake_llm):
     full = await _call(client, "get_note", episode_id=notes[0]["id"])
     assert full["blueprint"] is not None
 
-    concepts = store.all_concepts(conn)
+    concepts = store.all_concepts(conn, UID)
     cfull = await _call(client, "get_concept", concept_id=concepts[0]["id"])
     assert cfull["members"]
 
@@ -81,7 +83,7 @@ async def test_recall_and_context_tools(mcp_db, client, fake_llm):
 async def test_digest_tool(mcp_db, client, fake_llm):
     from core import store
     conn = store.connect()
-    encode(conn, S1, source="test", title="memory note")
-    consolidate(conn)
+    encode(conn, UID, S1, source="test", title="memory note")
+    consolidate(conn, UID)
     md = await _call(client, "digest")
     assert "🌱" in md  # new concept appears in the digest

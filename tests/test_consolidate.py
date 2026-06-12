@@ -7,6 +7,7 @@ from core.consolidate import (_decay_strengthen, apply_event, consolidate,
                               emit, rebuild)
 from core.encode import encode, split_sentences
 from core.llm import LLMError
+from tests.conftest import UID
 
 S1 = "Spaced repetition is the most reliable way to retain knowledge over many years."
 S2 = "Memory consolidation happens during sleep when the brain replays recent experiences."
@@ -66,9 +67,9 @@ def _dump_semantic(conn):
 
 
 def test_consolidate_dedupes_claims(conn, fake_llm):
-    encode(conn, S1, source="test")
-    encode(conn, f"{S1} {S2}", source="test")  # repeats S1, adds S2
-    report = consolidate(conn)
+    encode(conn, UID, S1, source="test")
+    encode(conn, UID, f"{S1} {S2}", source="test")  # repeats S1, adds S2
+    report = consolidate(conn, UID)
     assert report["status"] == "ok"
     n_claims = conn.execute("SELECT COUNT(*) FROM claims").fetchone()[0]
     n_support = conn.execute("SELECT COUNT(*) FROM claim_support").fetchone()[0]
@@ -82,19 +83,19 @@ def test_consolidate_dedupes_claims(conn, fake_llm):
 
 
 def test_consolidate_creates_concept_and_marks_episodes(conn, fake_llm):
-    encode(conn, S1, source="test")
-    consolidate(conn)
-    concepts = store.all_concepts(conn)
+    encode(conn, UID, S1, source="test")
+    consolidate(conn, UID)
+    concepts = store.all_concepts(conn, UID)
     assert len(concepts) == 1
-    assert store.concept_member_ids(conn, concepts[0]["id"])
-    assert store.unconsolidated_episodes(conn) == []
-    assert consolidate(conn)["status"] == "noop"
+    assert store.concept_member_ids(conn, UID, concepts[0]["id"])
+    assert store.unconsolidated_episodes(conn, UID) == []
+    assert consolidate(conn, UID)["status"] == "noop"
 
 
 def test_rebuild_reproduces_semantic_store(conn, fake_llm):
-    encode(conn, S1, source="test")
-    encode(conn, f"{S2} {S3}", source="test")
-    consolidate(conn)
+    encode(conn, UID, S1, source="test")
+    encode(conn, UID, f"{S2} {S3}", source="test")
+    consolidate(conn, UID)
     before = _dump_semantic(conn)
     assert before["claims"]       # non-trivial store
     rebuild(conn)
@@ -102,12 +103,12 @@ def test_rebuild_reproduces_semantic_store(conn, fake_llm):
 
 
 def test_split_applier(conn, fake_llm):
-    encode(conn, f"{S1} {S2}", source="test")
-    consolidate(conn)
-    parent = store.all_concepts(conn)[0]
-    members = store.concept_member_ids(conn, parent["id"])
+    encode(conn, UID, f"{S1} {S2}", source="test")
+    consolidate(conn, UID)
+    parent = store.all_concepts(conn, UID)[0]
+    members = store.concept_member_ids(conn, UID, parent["id"])
     assert len(members) == 2
-    emit(conn, "run_test", "SPLIT", {
+    emit(conn, UID, "run_test", "SPLIT", {
         "concept_id": parent["id"],
         "snapshot": {"concept": dict(parent), "member_claim_ids": members},
         "into": [
@@ -115,47 +116,48 @@ def test_split_applier(conn, fake_llm):
             {"concept_id": "cpt_childB", "label": "B", "canonical": "b", "claim_ids": [members[1]]},
         ], "ts": "2026-06-11T00:00:00+00:00"})
     conn.commit()
-    assert store.get_concept(conn, parent["id"]) is None
-    assert store.concept_member_ids(conn, "cpt_childA") == [members[0]]
-    assert store.concept_member_ids(conn, "cpt_childB") == [members[1]]
+    assert store.get_concept(conn, UID, parent["id"]) is None
+    assert store.concept_member_ids(conn, UID, "cpt_childA") == [members[0]]
+    assert store.concept_member_ids(conn, UID, "cpt_childB") == [members[1]]
 
 
 def test_merge_applier_keeps_history(conn, fake_llm):
     ts = "2026-06-11T00:00:00+00:00"
     for cid, text in (("c1", S1), ("c2", S2)):
-        emit(conn, "run_test", "CANONICALIZED",
+        emit(conn, UID, "run_test", "CANONICALIZED",
              {"action": "new", "claim_id": cid, "text": text,
               "episode_id": "ep_x", "verbatim": text, "cluster": "main", "ts": ts})
-    emit(conn, "run_test", "CONCEPT_CREATED",
+    emit(conn, UID, "run_test", "CONCEPT_CREATED",
          {"concept_id": "cpt_w", "label": "winner", "canonical": "w",
           "claim_ids": ["c1"], "ts": ts})
-    emit(conn, "run_test", "CONCEPT_CREATED",
+    emit(conn, UID, "run_test", "CONCEPT_CREATED",
          {"concept_id": "cpt_l", "label": "loser", "canonical": "l",
           "claim_ids": ["c2"], "ts": ts})
-    emit(conn, "run_test", "MERGED", {
+    emit(conn, UID, "run_test", "MERGED", {
         "winner_id": "cpt_w", "loser_id": "cpt_l", "label": None, "canonical": None,
-        "winner_snapshot": {"concept": dict(store.get_concept(conn, "cpt_w")),
+        "winner_snapshot": {"concept": dict(store.get_concept(conn, UID, "cpt_w")),
                             "member_claim_ids": ["c1"]},
-        "loser_snapshot": {"concept": dict(store.get_concept(conn, "cpt_l")),
+        "loser_snapshot": {"concept": dict(store.get_concept(conn, UID, "cpt_l")),
                            "member_claim_ids": ["c2"]}, "ts": ts})
     conn.commit()
-    assert store.get_concept(conn, "cpt_l") is None
-    assert set(store.concept_member_ids(conn, "cpt_w")) == {"c1", "c2"}
-    merged_events = store.events_since(conn, 0, types=["MERGED"])
+    assert store.get_concept(conn, UID, "cpt_l") is None
+    assert set(store.concept_member_ids(conn, UID, "cpt_w")) == {"c1", "c2"}
+    merged_events = store.events_since(conn, UID, 0, types=["MERGED"])
     payload = json.loads(merged_events[0]["payload_json"])
     assert payload["loser_snapshot"]["concept"]["label"] == "loser"  # history preserved
 
 
 def test_decay_transitions_state(conn, fake_llm):
-    encode(conn, S1, source="test")
-    consolidate(conn)
-    concept = store.all_concepts(conn)[0]
+    encode(conn, UID, S1, source="test")
+    consolidate(conn, UID)
+    concept = store.all_concepts(conn, UID)[0]
     with conn:
-        store.update_concept(conn, concept["id"], last_activity="2025-01-01T00:00:00+00:00")
+        store.update_concept(conn, UID, concept["id"],
+                             last_activity="2025-01-01T00:00:00+00:00")
     with conn:
-        _decay_strengthen(conn, "run_test", [], "2026-06-11T00:00:00+00:00")
-    assert store.get_concept(conn, concept["id"])["state"] == "dormant"
-    assert store.events_since(conn, 0, types=["DECAYED"])
+        _decay_strengthen(conn, UID, "run_test", [], "2026-06-11T00:00:00+00:00")
+    assert store.get_concept(conn, UID, concept["id"])["state"] == "dormant"
+    assert store.events_since(conn, UID, 0, types=["DECAYED"])
 
 
 def test_failed_run_leaves_episodes_unconsolidated(conn, monkeypatch):
@@ -163,17 +165,16 @@ def test_failed_run_leaves_episodes_unconsolidated(conn, monkeypatch):
         raise LLMError("forced failure")
     monkeypatch.setattr("core.llm.call", always_fail)
 
-    encode(conn, S1, source="test")
+    encode(conn, UID, S1, source="test")
     with pytest.raises(LLMError):
-        consolidate(conn)  # blueprint falls back local; concept pass raises
-    assert len(store.unconsolidated_episodes(conn)) == 1
+        consolidate(conn, UID)  # blueprint falls back local; concept pass raises
+    assert len(store.unconsolidated_episodes(conn, UID)) == 1
     run = conn.execute("SELECT status FROM consolidation_runs").fetchone()
     assert run["status"] == "failed"
 
 
 def test_retry_reuses_blueprint_and_canon_events(conn, fake_llm, monkeypatch):
-    encode(conn, S1, source="test")
-    original_concept_pass = "core.consolidate._concept_pass_chunk"
+    encode(conn, UID, S1, source="test")
     import core.consolidate as consolidate_mod
 
     real_chunk = consolidate_mod._concept_pass_chunk
@@ -187,18 +188,18 @@ def test_retry_reuses_blueprint_and_canon_events(conn, fake_llm, monkeypatch):
 
     monkeypatch.setattr(consolidate_mod, "_concept_pass_chunk", flaky_chunk)
     with pytest.raises(LLMError):
-        consolidate(conn)
+        consolidate(conn, UID)
 
     blueprints_before = fake_llm["blueprint"]
-    canon_events = len(store.events_since(conn, 0, types=["CANONICALIZED"]))
+    canon_events = len(store.events_since(conn, UID, 0, types=["CANONICALIZED"]))
     claims_before = conn.execute("SELECT COUNT(*) FROM claims").fetchone()[0]
 
-    report = consolidate(conn)  # retry succeeds
+    report = consolidate(conn, UID)  # retry succeeds
     assert report["status"] == "ok"
     assert fake_llm["blueprint"] == blueprints_before          # no re-extraction
-    assert len(store.events_since(conn, 0, types=["CANONICALIZED"])) == canon_events
+    assert len(store.events_since(conn, UID, 0, types=["CANONICALIZED"])) == canon_events
     assert conn.execute("SELECT COUNT(*) FROM claims").fetchone()[0] == claims_before
-    assert store.unconsolidated_episodes(conn) == []
+    assert store.unconsolidated_episodes(conn, UID) == []
 
 
 def test_llm_calls_never_hold_a_write_transaction(conn, fake_llm, monkeypatch):
@@ -213,9 +214,9 @@ def test_llm_calls_never_hold_a_write_transaction(conn, fake_llm, monkeypatch):
         return inner(prompt, **kw)
 
     monkeypatch.setattr("core.llm.call", guarded)
-    encode(conn, S1, source="test")
-    encode(conn, f"{S2} {S3}", source="test")
-    report = consolidate(conn)
+    encode(conn, UID, S1, source="test")
+    encode(conn, UID, f"{S2} {S3}", source="test")
+    report = consolidate(conn, UID)
     assert report["status"] == "ok"
     assert fake_llm["blueprint"] >= 2 and fake_llm["concept"] >= 1  # guard exercised
 
@@ -236,16 +237,29 @@ def test_stubborn_episode_is_skipped_not_fatal(conn, fake_llm, monkeypatch):
         raise ImportError("No module named 'sklearn'")
     monkeypatch.setattr("core.consolidate._blueprint_local", no_sklearn)
 
-    encode(conn, S1, source="test")
-    encode(conn, S3, source="test")  # the poisoned note
+    encode(conn, UID, S1, source="test")
+    encode(conn, UID, S3, source="test")  # the poisoned note
 
-    report = consolidate(conn)
+    report = consolidate(conn, UID)
     assert report["status"] == "ok"
     assert report["episodes"] == 1
     assert len(report["skipped"]) == 1
-    remaining = store.unconsolidated_episodes(conn)
+    remaining = store.unconsolidated_episodes(conn, UID)
     assert len(remaining) == 1       # picked up by the next run
     assert S3 in remaining[0]["raw_text"]
+
+
+def test_consolidate_all_users_covers_each_corpus(conn, fake_llm):
+    from core.consolidate import consolidate_all_users
+    from tests.conftest import UID_B
+    encode(conn, UID, S1, source="test")
+    encode(conn, UID_B, S3, source="test")
+    reports = consolidate_all_users(conn)
+    by_user = {r["user_id"]: r for r in reports}
+    assert by_user[UID]["status"] == "ok" and by_user[UID]["episodes"] == 1
+    assert by_user[UID_B]["status"] == "ok" and by_user[UID_B]["episodes"] == 1
+    assert store.unconsolidated_episodes(conn, UID) == []
+    assert store.unconsolidated_episodes(conn, UID_B) == []
 
 
 def test_llm_call_retries_malformed_json_once(monkeypatch):
@@ -268,7 +282,7 @@ def test_llm_call_retries_malformed_json_once(monkeypatch):
 
 def test_episodes_are_immutable(conn):
     import sqlite3
-    encode(conn, S1, source="test")
+    encode(conn, UID, S1, source="test")
     ep_id = conn.execute("SELECT id FROM episodes").fetchone()["id"]
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute("UPDATE episodes SET title = 'x' WHERE id = ?", (ep_id,))

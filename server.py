@@ -1,11 +1,12 @@
 """Thin FastAPI app mounting /mcp + /health + a minimal /status page.
 
 /status is the only UI and is deliberately just a client of the same data
-the API serves (PLAN.md §8b) — one server-rendered page, Basic-Auth'd with
-the same credentials as the MCP OAuth login.
+the API serves (PLAN.md §8b) — one server-rendered page, Basic-Auth'd against
+the same users table as the MCP OAuth login (AUTH.md §2). The page shows the
+logged-in user's corpus only; /run consolidates that user's episodes (admins
+run every user, mirroring the nightly cron).
 """
 import html
-import secrets
 import threading
 import time
 
@@ -23,45 +24,63 @@ app.mount("/mcp", mcp_app)
 _basic = HTTPBasic(auto_error=False)
 
 
-def _require_auth(credentials: HTTPBasicCredentials | None = Depends(_basic)):
-    if not (config.AUTH_USER and config.AUTH_PASS):
-        return  # local dev: no creds configured, page open
-    ok = (credentials is not None
-          and secrets.compare_digest(credentials.username, config.AUTH_USER)
-          and secrets.compare_digest(credentials.password, config.AUTH_PASS))
-    if not ok:
-        raise HTTPException(status_code=401, detail="Unauthorized",
-                            headers={"WWW-Authenticate": "Basic realm=slate"})
+def _current_user(credentials: HTTPBasicCredentials | None = Depends(_basic)) -> dict:
+    """Resolve the Basic-Auth user against the users table (AUTH.md §2).
+
+    Auth is enforced once either env creds are configured or any user row
+    exists — removing the env pair after provisioning must not open the page.
+    """
+    from core import store
+    from core.auth import authenticate
+    conn = store.connect()
+    try:
+        required = bool(config.AUTH_USER and config.AUTH_PASS) or store.count_users(conn) > 0
+        if not required:  # local dev: nothing configured, page open
+            return {"user_id": config.DEFAULT_USER_ID, "username": "local",
+                    "is_admin": True}
+        user = (authenticate(conn, credentials.username, credentials.password)
+                if credentials is not None else None)
+        if user is None:
+            raise HTTPException(status_code=401, detail="Unauthorized",
+                                headers={"WWW-Authenticate": "Basic realm=slate"})
+        return {"user_id": user["id"], "username": user["username"],
+                "is_admin": bool(user["is_admin"])}
+    finally:
+        conn.close()
 
 
 # --- Manual nightly trigger -------------------------------------------------
 # The same work cron runs at 02:30/07:45 (DEPLOY.md §7): consolidate --all then
-# digest --polish. This lets the operator kick it off from /status on demand.
-# Runs in a background thread (a full consolidation can take minutes and cost
-# money) with a lock so two clicks can't run it twice concurrently.
+# digest --polish, per user (AUTH.md §4). This lets the operator kick it off
+# from /status on demand: admins run every user's corpus, others only their
+# own. Runs in a background thread (a full consolidation can take minutes and
+# cost money) with a lock so two clicks can't run it twice concurrently.
 _job_lock = threading.Lock()
 _job = {"running": False, "started_at": None, "finished_at": None,
         "message": "", "ok": None}
 
 
-def _run_nightly() -> None:
+def _run_nightly(user_id: str, run_all: bool) -> None:
     from core import store
     from core.consolidate import consolidate
     from core.digest import digest
     conn = store.connect()
     try:
         total = 0
-        # Mirror `cli consolidate --all`, but also stop if a round makes no
-        # progress (e.g. every remaining episode keeps being skipped) so a
-        # stubborn note can't spin this thread forever.
-        while True:
-            report = consolidate(conn, max_episodes=25)
-            done = report.get("episodes", 0)
-            total += done
-            if report["status"] == "noop" or done == 0:
-                break
-        digest(conn, since_hours=48, polish=True)
-        msg = f"consolidated {total} episode(s), digest refreshed"
+        user_ids = store.users_with_unconsolidated(conn) if run_all else [user_id]
+        for uid in user_ids:
+            # Mirror `cli consolidate --all`, but also stop if a round makes no
+            # progress (e.g. every remaining episode keeps being skipped) so a
+            # stubborn note can't spin this thread forever.
+            while True:
+                report = consolidate(conn, uid, max_episodes=25)
+                done = report.get("episodes", 0)
+                total += done
+                if report["status"] == "noop" or done == 0:
+                    break
+        digest(conn, user_id, since_hours=48, polish=True)
+        scope = f"{len(user_ids)} user(s)" if run_all else "your corpus"
+        msg = f"consolidated {total} episode(s) across {scope}, digest refreshed"
         ok = True
     except Exception as e:  # never leave the flag stuck on a crash
         msg = f"failed: {e}"
@@ -76,14 +95,16 @@ def _run_nightly() -> None:
                     finished_at=time.strftime("%Y-%m-%d %H:%M"))
 
 
-@app.post("/run", dependencies=[Depends(_require_auth)])
-def run_nightly():
+@app.post("/run")
+def run_nightly(user: dict = Depends(_current_user)):
     with _job_lock:
         if not _job["running"]:
             _job.update(running=True, ok=None, message="",
                         started_at=time.strftime("%Y-%m-%d %H:%M"),
                         finished_at=None)
-            threading.Thread(target=_run_nightly, daemon=True).start()
+            threading.Thread(target=_run_nightly,
+                             args=(user["user_id"], user["is_admin"]),
+                             daemon=True).start()
     # PRG: redirect back so a refresh doesn't re-POST. Relative target keeps
     # the /engine/* alias working (the proxy strips the prefix).
     return RedirectResponse(url="status", status_code=303)
@@ -126,9 +147,10 @@ async def well_known_forward(rest: str):
 @app.get("/health")
 def health() -> dict:
     from core import store
-    counts = store.stats(store.connect())
-    return {"status": "ok", "episodes": counts["episodes"],
-            "concepts": counts["concepts"]}
+    conn = store.connect()
+    return {"status": "ok",
+            "episodes": conn.execute("SELECT COUNT(*) AS n FROM episodes").fetchone()["n"],
+            "concepts": conn.execute("SELECT COUNT(*) AS n FROM concepts").fetchone()["n"]}
 
 
 _PAGE = """<!doctype html>
@@ -149,9 +171,11 @@ button{{background:#2c5;color:#062;border:0;border-radius:8px;padding:9px 16px;
     font-size:13px;font-weight:600;cursor:pointer}}
 button:disabled{{background:#333;color:#888;cursor:default}}
 .job{{font-size:13px;color:#bbb;margin:10px 0}}
+.who{{font-size:12px;color:#888}}
 footer{{margin-top:30px;font-size:11px;color:#666}}
 </style></head><body>
 <h1>🧠 slate-engine</h1>
+<p class="who">{who}</p>
 <div class="cards">{cards}</div>
 <h2>Nightly jobs</h2>
 <form method="post" action="run">
@@ -166,14 +190,16 @@ footer{{margin-top:30px;font-size:11px;color:#666}}
 </body></html>"""
 
 
-@app.get("/status", response_class=HTMLResponse, dependencies=[Depends(_require_auth)])
-def status_page() -> str:
+@app.get("/status", response_class=HTMLResponse)
+def status_page(user: dict = Depends(_current_user)) -> str:
     from core import store
     from core.digest import digest as render_digest
+    uid = user["user_id"]
     conn = store.connect()
-    s = store.stats(conn)
+    s = store.stats(conn, uid)
     bridges = conn.execute(
-        "SELECT COUNT(*) AS n FROM relations WHERE relation='bridges'").fetchone()["n"]
+        "SELECT COUNT(*) AS n FROM relations WHERE relation='bridges' AND user_id = ?",
+        (uid,)).fetchone()["n"]
 
     cards = "".join(
         f'<div class="card"><b>{s[k]}</b><span>{k.replace("_", " ")}</span></div>'
@@ -206,7 +232,10 @@ def status_page() -> str:
         job_html = "no manual run this session"
         run_disabled = ""
 
-    return _PAGE.format(cards=cards, run=run_html, job=job_html,
+    who = f"signed in as {html.escape(user['username'])}"
+    if user["is_admin"]:
+        who += " · admin (Run executes every user's corpus)"
+    return _PAGE.format(who=who, cards=cards, run=run_html, job=job_html,
                         run_disabled=run_disabled,
-                        digest=html.escape(render_digest(conn, since_hours=48)),
+                        digest=html.escape(render_digest(conn, uid, since_hours=48)),
                         base=html.escape(config.SLATE_BASE_URL))

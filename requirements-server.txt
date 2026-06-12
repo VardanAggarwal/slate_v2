@@ -10,3 +10,4 @@ google-genai
 nltk
 python-dotenv
 huggingface_hub
+bcrypt

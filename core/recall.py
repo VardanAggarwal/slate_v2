@@ -2,6 +2,9 @@
 
 Also hosts the read/browse API (§5): get_episode, list_episodes, get_concept,
 get_claim, assemble_context — plain SQL, no LLM, no network.
+
+Every function takes an explicit user_id and every query filters on it
+(AUTH.md §1/§3) — graph hops must never cross into another user's corpus.
 """
 import json
 from datetime import datetime, timezone
@@ -35,7 +38,7 @@ def _days_since(iso_ts: str | None) -> int:
 
 
 # ── Spreading activation ──────────────────────────────────────────────────────
-def recall(conn, query: str, k: int = 8) -> list[dict]:
+def recall(conn, user_id: str, query: str, k: int = 8) -> list[dict]:
     """Rank claims + concepts for a query. Returns compact headline dicts —
     ~50 tokens each — so callers (MCP `recall`) can call speculatively."""
     emb = get_embedder().encode([query], normalize_embeddings=True,
@@ -44,12 +47,12 @@ def recall(conn, query: str, k: int = 8) -> list[dict]:
     activation: dict[str, float] = {}
     via: dict[str, str] = {}  # node -> how it was reached (for "non-obvious" signal)
 
-    for hit in store.knn_claims(conn, emb, k=SEED_CLAIMS):
+    for hit in store.knn_claims(conn, user_id, emb, k=SEED_CLAIMS):
         if hit["similarity"] > 0:
             activation[hit["claim_id"]] = max(activation.get(hit["claim_id"], 0),
                                               hit["similarity"])
             via[hit["claim_id"]] = "seed"
-    for hit in store.knn_concepts(conn, emb, k=SEED_CONCEPTS):
+    for hit in store.knn_concepts(conn, user_id, emb, k=SEED_CONCEPTS):
         if hit["similarity"] > 0:
             activation[hit["id"]] = max(activation.get(hit["id"], 0), hit["similarity"])
             via[hit["id"]] = "seed"
@@ -69,15 +72,18 @@ def recall(conn, query: str, k: int = 8) -> list[dict]:
         for node, act in frontier.items():
             if node.startswith("clm_"):
                 for r in conn.execute(
-                        "SELECT concept_id FROM concept_members WHERE claim_id = ?", (node,)):
+                        "SELECT concept_id FROM concept_members WHERE claim_id = ? AND user_id = ?",
+                        (node, user_id)):
                     push(r["concept_id"], act * SPREAD_CLAIM_TO_CONCEPT, node)
             elif node.startswith("cpt_"):
                 for r in conn.execute(
-                        "SELECT claim_id FROM concept_members WHERE concept_id = ?", (node,)):
+                        "SELECT claim_id FROM concept_members WHERE concept_id = ? AND user_id = ?",
+                        (node, user_id)):
                     push(r["claim_id"], act * SPREAD_CONCEPT_TO_CLAIM, node)
             for r in conn.execute(
                     """SELECT from_id, to_id, relation, weight FROM relations
-                       WHERE from_id = ? OR to_id = ?""", (node, node)):
+                       WHERE (from_id = ? OR to_id = ?) AND user_id = ?""",
+                    (node, node, user_id)):
                 other = r["to_id"] if r["from_id"] == node else r["from_id"]
                 w = min(1.0, r["weight"] or 1.0)
                 bridge_tag = f"bridge:{node}" if r["relation"] == "bridges" else node
@@ -88,20 +94,20 @@ def recall(conn, query: str, k: int = 8) -> list[dict]:
 
     results = []
     for node, act in activation.items():
-        entry = _score_node(conn, node, act, via.get(node, "seed"))
+        entry = _score_node(conn, user_id, node, act, via.get(node, "seed"))
         if entry:
             results.append(entry)
     results.sort(key=lambda r: -r["score"])
     return results[:k]
 
 
-def _score_node(conn, node: str, activation: float, via: str) -> dict | None:
+def _score_node(conn, user_id: str, node: str, activation: float, via: str) -> dict | None:
     signals = []
     if via != "seed":
         signals.append("2-hop" if not via.startswith("bridge:") else "🌉 via bridge")
 
     if node.startswith("clm_"):
-        c = store.get_claim(conn, node)
+        c = store.get_claim(conn, user_id, node)
         if not c:
             return None
         score = activation * min(2.0, 0.5 + c["strength"] / 2.0)
@@ -111,29 +117,30 @@ def _score_node(conn, node: str, activation: float, via: str) -> dict | None:
         if gap >= TIME_GAP_DAYS:
             signals.append(f"🕰️ last seen {gap}d ago")
         n_support = conn.execute(
-            "SELECT COUNT(*) AS n FROM claim_support WHERE claim_id = ?",
-            (node,)).fetchone()["n"]
+            "SELECT COUNT(*) AS n FROM claim_support WHERE claim_id = ? AND user_id = ?",
+            (node, user_id)).fetchone()["n"]
         return {"type": "claim", "id": node, "text": c["text"],
                 "strength": round(c["strength"], 2), "n_episodes": n_support,
                 "score": round(score, 4), "signals": signals}
 
     if node.startswith("cpt_"):
-        c = store.get_concept(conn, node)
+        c = store.get_concept(conn, user_id, node)
         if not c:
             return None
         state_mult = config.HEALTH_SCORES.get(c["state"], 1.0)
         score = activation * state_mult
         has_bridge = conn.execute(
             """SELECT 1 FROM relations WHERE relation = 'bridges'
-               AND (from_id = ? OR to_id = ?) LIMIT 1""", (node, node)).fetchone()
+               AND (from_id = ? OR to_id = ?) AND user_id = ? LIMIT 1""",
+            (node, node, user_id)).fetchone()
         if has_bridge:
             signals.append("🌉 bridged")
         gap = _days_since(c["last_activity"])
         if gap >= TIME_GAP_DAYS:
             signals.append(f"🕰️ dormant {gap}d")
         n_members = conn.execute(
-            "SELECT COUNT(*) AS n FROM concept_members WHERE concept_id = ?",
-            (node,)).fetchone()["n"]
+            "SELECT COUNT(*) AS n FROM concept_members WHERE concept_id = ? AND user_id = ?",
+            (node, user_id)).fetchone()["n"]
         return {"type": "concept", "id": node, "label": c["label"],
                 "canonical": c["canonical"], "state": c["state"],
                 "n_claims": n_members, "score": round(score, 4), "signals": signals}
@@ -141,18 +148,20 @@ def _score_node(conn, node: str, activation: float, via: str) -> dict | None:
 
 
 # ── Read/browse API (§5) — plain SQL, $0 ──────────────────────────────────────
-def get_episode(conn, episode_id: str) -> dict | None:
-    ep = store.get_episode(conn, episode_id)
+def get_episode(conn, user_id: str, episode_id: str) -> dict | None:
+    ep = store.get_episode(conn, user_id, episode_id)
     if not ep:
         return None
     bp_row = conn.execute(
         """SELECT payload_json FROM events WHERE type = 'BLUEPRINTED'
+           AND user_id = ?
            AND json_extract(payload_json, '$.episode_id') = ?
-           ORDER BY seq DESC LIMIT 1""", (episode_id,)).fetchone()
+           ORDER BY seq DESC LIMIT 1""", (user_id, episode_id)).fetchone()
     claims = [dict(r) for r in conn.execute(
         """SELECT s.claim_id, c.text, s.verbatim_sentence FROM claim_support s
-           JOIN claims c ON c.id = s.claim_id WHERE s.episode_id = ?""",
-        (episode_id,))]
+           JOIN claims c ON c.id = s.claim_id
+           WHERE s.episode_id = ? AND s.user_id = ?""",
+        (episode_id, user_id))]
     return {"id": ep["id"], "ts": ep["ts"], "title": ep["title"],
             "source": ep["source"], "raw_text": ep["raw_text"],
             "receipt": json.loads(ep["receipt_json"] or "{}"),
@@ -161,11 +170,12 @@ def get_episode(conn, episode_id: str) -> dict | None:
             "claims": claims}
 
 
-def list_episodes(conn, limit: int = 20, before: str | None = None) -> list[dict]:
-    q = "SELECT id, ts, title, raw_text FROM episodes"
-    args: list = []
+def list_episodes(conn, user_id: str, limit: int = 20,
+                  before: str | None = None) -> list[dict]:
+    q = "SELECT id, ts, title, raw_text FROM episodes WHERE user_id = ?"
+    args: list = [user_id]
     if before:
-        q += " WHERE ts < ?"
+        q += " AND ts < ?"
         args.append(before)
     q += " ORDER BY ts DESC LIMIT ?"
     args.append(limit)
@@ -173,9 +183,9 @@ def list_episodes(conn, limit: int = 20, before: str | None = None) -> list[dict
     for r in conn.execute(q, args):
         bp = conn.execute(
             """SELECT json_extract(payload_json, '$.blueprint.essence') AS essence
-               FROM events WHERE type = 'BLUEPRINTED'
+               FROM events WHERE type = 'BLUEPRINTED' AND user_id = ?
                AND json_extract(payload_json, '$.episode_id') = ?
-               ORDER BY seq DESC LIMIT 1""", (r["id"],)).fetchone()
+               ORDER BY seq DESC LIMIT 1""", (user_id, r["id"])).fetchone()
         essence = (bp["essence"] if bp and bp["essence"]
                    else r["raw_text"][:120].replace("\n", " "))
         out.append({"id": r["id"], "ts": r["ts"], "title": r["title"],
@@ -183,46 +193,50 @@ def list_episodes(conn, limit: int = 20, before: str | None = None) -> list[dict
     return out
 
 
-def get_concept(conn, concept_id: str) -> dict | None:
-    c = store.get_concept(conn, concept_id)
+def get_concept(conn, user_id: str, concept_id: str) -> dict | None:
+    c = store.get_concept(conn, user_id, concept_id)
     if not c:
         return None
     members = []
     for m in conn.execute(
             """SELECT cm.claim_id, cl.text, cl.strength FROM concept_members cm
                JOIN claims cl ON cl.id = cm.claim_id
-               WHERE cm.concept_id = ? ORDER BY cl.strength DESC""", (concept_id,)):
+               WHERE cm.concept_id = ? AND cm.user_id = ?
+               ORDER BY cl.strength DESC""", (concept_id, user_id)):
         support = [dict(s) for s in conn.execute(
             """SELECT cs.episode_id, e.title, e.ts, cs.verbatim_sentence
                FROM claim_support cs JOIN episodes e ON e.id = cs.episode_id
-               WHERE cs.claim_id = ?""", (m["claim_id"],))]
+               WHERE cs.claim_id = ? AND cs.user_id = ?""",
+            (m["claim_id"], user_id))]
         members.append({"claim_id": m["claim_id"], "text": m["text"],
                         "strength": m["strength"], "support": support})
     relations = [dict(r) for r in conn.execute(
         """SELECT from_id, to_id, relation, weight, evidence_episode_id
-           FROM relations WHERE from_id = ? OR to_id = ?""",
-        (concept_id, concept_id))]
+           FROM relations WHERE (from_id = ? OR to_id = ?) AND user_id = ?""",
+        (concept_id, concept_id, user_id))]
     return {**{k: c[k] for k in c.keys()}, "members": members,
             "relations": relations}
 
 
-def get_claim(conn, claim_id: str) -> dict | None:
-    c = store.get_claim(conn, claim_id)
+def get_claim(conn, user_id: str, claim_id: str) -> dict | None:
+    c = store.get_claim(conn, user_id, claim_id)
     if not c:
         return None
     support = [dict(s) for s in conn.execute(
         """SELECT cs.episode_id, e.title, e.ts, cs.verbatim_sentence
            FROM claim_support cs JOIN episodes e ON e.id = cs.episode_id
-           WHERE cs.claim_id = ? ORDER BY e.ts""", (claim_id,))]
+           WHERE cs.claim_id = ? AND cs.user_id = ? ORDER BY e.ts""",
+        (claim_id, user_id))]
     concepts = [r["concept_id"] for r in conn.execute(
-        "SELECT concept_id FROM concept_members WHERE claim_id = ?", (claim_id,))]
+        "SELECT concept_id FROM concept_members WHERE claim_id = ? AND user_id = ?",
+        (claim_id, user_id))]
     return {**{k: c[k] for k in c.keys()}, "support": support, "concepts": concepts}
 
 
-def assemble_context(conn, topic: str, max_chars: int = 6000) -> str:
+def assemble_context(conn, user_id: str, topic: str, max_chars: int = 6000) -> str:
     """The Claude-first read: recall(topic), group claim hits by concept, return
     compact provenance-rich markdown sized for in-conversation injection."""
-    hits = recall(conn, topic, k=12)
+    hits = recall(conn, user_id, topic, k=12)
     if not hits:
         return f"_Slate has nothing stored about “{topic}” yet._"
 
@@ -233,7 +247,7 @@ def assemble_context(conn, topic: str, max_chars: int = 6000) -> str:
     grouped: dict[str, list[dict]] = {}
     loose: list[dict] = []
     for h in claim_hits:
-        full = get_claim(conn, h["id"])
+        full = get_claim(conn, user_id, h["id"])
         cids = full["concepts"] if full else []
         (grouped.setdefault(cids[0], []) if cids else loose).append(h)
 
@@ -247,7 +261,7 @@ def assemble_context(conn, topic: str, max_chars: int = 6000) -> str:
             lines.append(f"{ch['canonical']}")
         for h in grouped.pop(ch["id"], [])[:4]:
             lines.append(f"- {h['text']} _(seen in {h['n_episodes']} note(s))_")
-        full = get_concept(conn, ch["id"])
+        full = get_concept(conn, user_id, ch["id"])
         for m in (full["members"] if full else [])[:3]:
             src = m["support"][0] if m["support"] else None
             prov = f" — {src['title'] or 'untitled'}, {src['ts'][:10]}" if src else ""

@@ -2,6 +2,7 @@ import json
 
 from core import store
 from core.encode import encode, split_sentences
+from tests.conftest import UID
 
 NOTE_A = (
     "Spaced repetition is the most reliable way to retain knowledge over years. "
@@ -38,11 +39,12 @@ def test_split_sentences_filters_short():
 
 
 def test_encode_writes_episode_and_sentences(conn):
-    receipt = encode(conn, NOTE_A, title="memory note", source="test")
-    ep = store.get_episode(conn, receipt["episode_id"])
+    receipt = encode(conn, UID, NOTE_A, title="memory note", source="test")
+    ep = store.get_episode(conn, UID, receipt["episode_id"])
     assert ep is not None
     assert ep["raw_text"] == NOTE_A
     assert ep["title"] == "memory note"
+    assert ep["user_id"] == UID
     n_sents = conn.execute("SELECT COUNT(*) AS n FROM episode_sentences").fetchone()["n"]
     assert n_sents == receipt["n_sentences"] > 0
     n_vecs = conn.execute("SELECT COUNT(*) AS n FROM vec_sentences").fetchone()["n"]
@@ -53,23 +55,23 @@ def test_encode_writes_episode_and_sentences(conn):
 
 
 def test_first_note_is_all_novelty(conn):
-    receipt = encode(conn, NOTE_A, source="test")
+    receipt = encode(conn, UID, NOTE_A, source="test")
     assert receipt["n_novelties"] > 0
     assert receipt["echoes"] == []
     assert receipt["prior_episode_matches"] == []
 
 
 def test_second_similar_note_matches_prior_episode(conn):
-    encode(conn, NOTE_A, source="test")
-    receipt = encode(conn, NOTE_B, source="test")
+    encode(conn, UID, NOTE_A, source="test")
+    receipt = encode(conn, UID, NOTE_B, source="test")
     matches = receipt["prior_episode_matches"]
     assert matches, "similar sentence should match the prior episode"
     assert matches[0]["similarity"] >= 0.72
 
 
 def test_encode_emits_encoded_event(conn):
-    encode(conn, NOTE_A, source="test")
-    rows = store.events_since(conn, 0, types=["ENCODED"])
+    encode(conn, UID, NOTE_A, source="test")
+    rows = store.events_since(conn, UID, 0, types=["ENCODED"])
     assert len(rows) == 1
     payload = json.loads(rows[0]["payload_json"])
     assert payload["n_sentences"] > 0
@@ -78,4 +80,4 @@ def test_encode_emits_encoded_event(conn):
 def test_encode_rejects_empty_text(conn):
     import pytest
     with pytest.raises(ValueError):
-        encode(conn, "   ")
+        encode(conn, UID, "   ")

@@ -74,3 +74,8 @@ HEALTH_STALE_DAYS  = int(os.getenv("HEALTH_STALE_DAYS", "60"))
 AUTH_USER      = os.getenv("AUTH_USER", "")
 AUTH_PASS      = os.getenv("AUTH_PASS", "")
 SLATE_BASE_URL = os.getenv("SLATE_BASE_URL", "http://localhost:8000")
+
+# Corpus owner used when no auth is configured at all (local dev / CLI on a
+# fresh box). With OAuth enabled, identity always comes from the token —
+# never from this (AUTH.md §2).
+DEFAULT_USER_ID = os.getenv("DEFAULT_USER_ID", "local")
