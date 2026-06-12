@@ -52,6 +52,7 @@ def _call_claude_cli(prompt: str, model: str, max_tokens: int, system: str | Non
     CLAUDE_CODE_OAUTH_TOKEN instead of API keys. Raises LLMError on any
     failure (missing CLI, session limit, timeout) so the chain falls through
     to the API per-call."""
+    import os
     import shutil
     import subprocess
     if not shutil.which("claude"):
@@ -59,13 +60,24 @@ def _call_claude_cli(prompt: str, model: str, max_tokens: int, system: str | Non
     cmd = ["claude", "-p", "--model", model, "--output-format", "json"]
     if system:
         cmd += ["--system-prompt", system]
+    # The CLI prefers ANTHROPIC_API_KEY over the subscription OAuth token, so
+    # an inherited key makes this rung silently bill the API — the very thing
+    # the chain's next step is for. Strip it: this rung is subscription-only.
+    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
     try:
         proc = subprocess.run(cmd, input=prompt, capture_output=True,
-                              text=True, timeout=600)
+                              text=True, timeout=600, env=env)
     except subprocess.TimeoutExpired:
         raise LLMError("claude CLI timed out")
     if proc.returncode != 0:
-        raise LLMError(f"claude CLI exit {proc.returncode}: {proc.stderr[:200]}")
+        # newer CLIs exit 1 with the error JSON on stdout and an empty stderr
+        detail = (proc.stderr or "").strip()
+        if not detail:
+            try:
+                detail = str(json.loads(proc.stdout).get("result", ""))[:200]
+            except (json.JSONDecodeError, AttributeError):
+                detail = proc.stdout[:200]
+        raise LLMError(f"claude CLI exit {proc.returncode}: {detail}")
     data = json.loads(proc.stdout)
     if data.get("is_error"):
         raise LLMError(f"claude CLI error: {str(data.get('result'))[:200]}")

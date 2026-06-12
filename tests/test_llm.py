@@ -38,6 +38,53 @@ def test_claude_cli_provider_parses_print_mode_json(monkeypatch):
     assert out["input_tokens"] == 10
 
 
+def test_claude_cli_error_detail_from_stdout(monkeypatch):
+    """Newer CLIs exit 1 with the error JSON on stdout and empty stderr — the
+    raised LLMError must surface that result text, not an empty string."""
+    import json
+    import core.llm as llm_mod
+    import pytest
+
+    class FakeProc:
+        returncode = 1
+        stderr = ""
+        stdout = json.dumps({"is_error": True,
+                             "result": "You've hit your session limit · resets 8:10am (UTC)"})
+
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude")
+    monkeypatch.setattr("subprocess.run", lambda *a, **kw: FakeProc())
+    with pytest.raises(llm_mod.LLMError, match="session limit"):
+        llm_mod._call_claude_cli("p", "claude-haiku-4-5", 100, None)
+
+
+def test_claude_cli_strips_api_key_from_env(monkeypatch):
+    """The CLI prefers ANTHROPIC_API_KEY over the subscription token — if it
+    leaks into the subprocess, the 'subscription' rung silently bills the API
+    (and inherits its usage caps). The rung must be subscription-only."""
+    import json
+    import core.llm as llm_mod
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-leaked")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "subscription-token")
+    seen = {}
+
+    class FakeProc:
+        returncode = 0
+        stderr = ""
+        stdout = json.dumps({"result": "{}", "is_error": False, "usage": {}})
+
+    def fake_run(cmd, **kw):
+        seen["env"] = kw.get("env")
+        return FakeProc()
+
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude")
+    monkeypatch.setattr("subprocess.run", fake_run)
+    llm_mod._call_claude_cli("p", "claude-haiku-4-5", 100, None)
+    assert seen["env"] is not None, "env must be passed explicitly"
+    assert "ANTHROPIC_API_KEY" not in seen["env"]
+    assert seen["env"].get("CLAUDE_CODE_OAUTH_TOKEN") == "subscription-token"
+
+
 def test_chain_falls_from_cli_to_api(monkeypatch):
     import core.llm as llm_mod
 

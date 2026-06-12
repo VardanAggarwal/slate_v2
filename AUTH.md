@@ -31,6 +31,11 @@
 >   server cannot silently run against an unmigrated file. The DEPLOY.md §7
 >   cron lines work unchanged — `cli consolidate --all` / `digest` now default
 >   to looping every user.
+> - **Keep `AUTH_USER`/`AUTH_PASS` set in production.** The pair is the
+>   OAuth-enabled switch (`mcp_server.py` only constructs the provider when
+>   both are set) — unsetting it disables auth on `/mcp` entirely. After
+>   bootstrap only its *credential* role is dead: logins validate solely
+>   against the users table.
 > - New dep: `bcrypt` (both requirements files).
 
 ## Decisions (locked)

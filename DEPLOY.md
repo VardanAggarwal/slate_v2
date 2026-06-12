@@ -1,5 +1,18 @@
 # Deploying slate-engine alongside the v1 Slate
 
+> **2026-06-12 — multi-user deployed:** AUTH.md implemented end-to-end on this
+> host. The legacy corpus was migrated to first user `slate` (admin) via
+> `migrate_multiuser.py`; backups on the server:
+> `engine.pre-multiuser.bak` + `engine.db.pre-deploy` in
+> `/home/ubuntu/slate-engine-data`. OAuth tokens now persist in the engine DB
+> (verified in prod: same bearer survives `docker compose restart`). The
+> deploy also restored `SLATE_BASE_URL=https://myslate.duckdns.org` to the
+> server `.env` — it had been lost in the 2026-06-12 .env clobber, leaving
+> OAuth discovery advertising localhost. Keep `AUTH_USER`/`AUTH_PASS` set:
+> the pair enables OAuth on /mcp (credentials themselves now live in the
+> users table). Cron unchanged (`consolidate --all` / `digest` are per-user
+> by default).
+>
 > **Final state (2026-06-11, cutover complete):** v2 owns the root of
 > `https://myslate.duckdns.org` (health `/health`, UI `/status`, MCP `/mcp`);
 > `/engine/*` remains as an alias; `myslate2.duckdns.org` 301-redirects to
