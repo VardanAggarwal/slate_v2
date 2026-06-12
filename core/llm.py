@@ -130,34 +130,42 @@ def call(prompt: str, tier: str = "mechanical", max_tokens: int = 2048,
     the nightly run records a failed status and retries next night.
     """
     last_err: Exception | None = None
+    attempts = max(1, config.LLM_MAX_ATTEMPTS)
     for provider in config.LLM_FALLBACK_ORDER:
-        # Two attempts per provider: a malformed-JSON response is usually
-        # transient (sampling), so retry once before falling through.
-        for attempt in range(2):
+        configured = (
+            (provider == "claude-cli" and config.CLAUDE_CODE_OAUTH_TOKEN)
+            or (provider == "claude" and config.ANTHROPIC_KEY)
+            or (provider == "gemini" and config.GEMINI_KEY))
+        if not configured:
+            continue  # provider not set up; next provider
+        # Up to `attempts` tries with exponential backoff: a transient 503 /
+        # 429 / overload (or a malformed-JSON sampling blip) usually clears in
+        # seconds, so wait before falling through to the next provider.
+        for attempt in range(attempts):
             try:
-                if provider == "claude-cli" and config.CLAUDE_CODE_OAUTH_TOKEN:
+                if provider == "claude-cli":
                     result = _call_claude_cli(prompt, _model_for_tier(tier),
                                               max_tokens, system)
-                elif provider == "claude" and config.ANTHROPIC_KEY:
+                elif provider == "claude":
                     result = _call_claude(prompt, _model_for_tier(tier), max_tokens, system)
-                elif provider == "gemini" and config.GEMINI_KEY:
-                    models = config.GEMINI_MODELS
+                else:  # gemini
                     result = None
-                    for m in models:
+                    g_err: Exception | None = None
+                    for m in config.GEMINI_MODELS:
                         try:
                             result = _call_gemini(prompt, m, max_tokens, system)
                             break
                         except Exception as e:  # try next gemini model
-                            last_err = e
-                    if result is None:
-                        break  # no gemini model worked; next provider
-                else:
-                    break  # provider not configured; next provider
+                            g_err = e
+                    if result is None:  # all gemini models failed — retryable
+                        raise g_err or LLMError("no gemini model configured")
                 if json_out:
                     result["json"] = parse_json(result["text"])
                 return result
             except Exception as e:
                 last_err = e
+                if attempt < attempts - 1:
+                    time.sleep(config.LLM_BACKOFF_BASE * (2 ** attempt))
     raise LLMError(f"all providers failed: {last_err}")
 
 

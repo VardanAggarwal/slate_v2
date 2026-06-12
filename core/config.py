@@ -53,6 +53,13 @@ def _csv(var: str, default: list[str]) -> list[str]:
 LLM_FALLBACK_ORDER = _csv("LLM_FALLBACK_ORDER", ["claude", "gemini", "local"])
 GEMINI_MODELS      = _csv("GEMINI_MODELS", ["gemini-2.5-flash", "gemini-2.5-flash-lite"])
 
+# ── LLM retry/backoff (absorb transient 503/429/overload within a run) ────────
+# Each configured provider gets up to LLM_MAX_ATTEMPTS tries with exponential
+# backoff (LLM_BACKOFF_BASE * 2**attempt seconds) before falling through to the
+# next provider. Keeps a single nightly run alive across a brief provider spike.
+LLM_MAX_ATTEMPTS = int(os.getenv("LLM_MAX_ATTEMPTS", "3"))
+LLM_BACKOFF_BASE = float(os.getenv("LLM_BACKOFF_BASE", "2.0"))  # seconds
+
 # ── Concept health (ported from v1 health.py state model) ─────────────────────
 HEALTH_SCORES = {
     "grounded": 1.3,

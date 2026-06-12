@@ -53,9 +53,67 @@ def test_chain_falls_from_cli_to_api(monkeypatch):
     monkeypatch.setattr(llm_mod.config, "CLAUDE_CODE_OAUTH_TOKEN", "tok")
     monkeypatch.setattr(llm_mod.config, "ANTHROPIC_KEY", "key")
     monkeypatch.setattr(llm_mod.config, "LLM_FALLBACK_ORDER", ["claude-cli", "claude"])
+    monkeypatch.setattr(llm_mod.time, "sleep", lambda *_: None)  # no real backoff
     result = llm_mod.call("anything")
     assert result["provider"] == "claude"  # fell through per-call
     assert result["json"] == {"ok": True}
+
+
+def test_retries_within_provider_then_succeeds(monkeypatch):
+    import core.llm as llm_mod
+
+    calls = {"n": 0}
+
+    def cli_flaky(prompt, model, max_tokens, system):
+        calls["n"] += 1
+        if calls["n"] < 3:  # fail first two attempts, succeed on the third
+            raise llm_mod.LLMError("503 overloaded")
+        return {"text": '{"ok": true}', "provider": "claude-cli", "model": model,
+                "input_tokens": 1, "output_tokens": 1, "cost": 0.0}
+
+    sleeps = []
+    monkeypatch.setattr(llm_mod, "_call_claude_cli", cli_flaky)
+    monkeypatch.setattr(llm_mod.time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(llm_mod.config, "CLAUDE_CODE_OAUTH_TOKEN", "tok")
+    monkeypatch.setattr(llm_mod.config, "LLM_FALLBACK_ORDER", ["claude-cli"])
+    monkeypatch.setattr(llm_mod.config, "LLM_MAX_ATTEMPTS", 3)
+    monkeypatch.setattr(llm_mod.config, "LLM_BACKOFF_BASE", 2.0)
+
+    result = llm_mod.call("anything")
+    assert result["provider"] == "claude-cli"
+    assert calls["n"] == 3                  # retried twice before success
+    assert sleeps == [2.0, 4.0]             # exponential backoff between tries
+
+
+def test_unconfigured_provider_is_skipped(monkeypatch):
+    import core.llm as llm_mod
+
+    def api_ok(prompt, model, max_tokens, system):
+        return {"text": '{"ok": true}', "provider": "claude", "model": model,
+                "input_tokens": 1, "output_tokens": 1, "cost": 0.0}
+
+    monkeypatch.setattr(llm_mod, "_call_claude", api_ok)
+    # cli first in order but no token → must be skipped, not attempted
+    monkeypatch.setattr(llm_mod, "_call_claude_cli",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("cli ran")))
+    monkeypatch.setattr(llm_mod.config, "CLAUDE_CODE_OAUTH_TOKEN", "")
+    monkeypatch.setattr(llm_mod.config, "ANTHROPIC_KEY", "key")
+    monkeypatch.setattr(llm_mod.config, "LLM_FALLBACK_ORDER", ["claude-cli", "claude"])
+    result = llm_mod.call("anything")
+    assert result["provider"] == "claude"
+
+
+def test_all_providers_fail_raises(monkeypatch):
+    import core.llm as llm_mod
+
+    monkeypatch.setattr(llm_mod, "_call_claude_cli",
+                        lambda *a, **k: (_ for _ in ()).throw(llm_mod.LLMError("down")))
+    monkeypatch.setattr(llm_mod.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(llm_mod.config, "CLAUDE_CODE_OAUTH_TOKEN", "tok")
+    monkeypatch.setattr(llm_mod.config, "LLM_FALLBACK_ORDER", ["claude-cli"])
+    monkeypatch.setattr(llm_mod.config, "LLM_MAX_ATTEMPTS", 2)
+    with pytest.raises(llm_mod.LLMError):
+        llm_mod.call("anything")
 
 
 def test_estimate_cost_haiku_batch_half_price():

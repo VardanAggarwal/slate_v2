@@ -6,9 +6,11 @@ the same credentials as the MCP OAuth login.
 """
 import html
 import secrets
+import threading
+import time
 
 from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 from core import config
@@ -30,6 +32,61 @@ def _require_auth(credentials: HTTPBasicCredentials | None = Depends(_basic)):
     if not ok:
         raise HTTPException(status_code=401, detail="Unauthorized",
                             headers={"WWW-Authenticate": "Basic realm=slate"})
+
+
+# --- Manual nightly trigger -------------------------------------------------
+# The same work cron runs at 02:30/07:45 (DEPLOY.md §7): consolidate --all then
+# digest --polish. This lets the operator kick it off from /status on demand.
+# Runs in a background thread (a full consolidation can take minutes and cost
+# money) with a lock so two clicks can't run it twice concurrently.
+_job_lock = threading.Lock()
+_job = {"running": False, "started_at": None, "finished_at": None,
+        "message": "", "ok": None}
+
+
+def _run_nightly() -> None:
+    from core import store
+    from core.consolidate import consolidate
+    from core.digest import digest
+    conn = store.connect()
+    try:
+        total = 0
+        # Mirror `cli consolidate --all`, but also stop if a round makes no
+        # progress (e.g. every remaining episode keeps being skipped) so a
+        # stubborn note can't spin this thread forever.
+        while True:
+            report = consolidate(conn, max_episodes=25)
+            done = report.get("episodes", 0)
+            total += done
+            if report["status"] == "noop" or done == 0:
+                break
+        digest(conn, since_hours=48, polish=True)
+        msg = f"consolidated {total} episode(s), digest refreshed"
+        ok = True
+    except Exception as e:  # never leave the flag stuck on a crash
+        msg = f"failed: {e}"
+        ok = False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    with _job_lock:
+        _job.update(running=False, message=msg, ok=ok,
+                    finished_at=time.strftime("%Y-%m-%d %H:%M"))
+
+
+@app.post("/run", dependencies=[Depends(_require_auth)])
+def run_nightly():
+    with _job_lock:
+        if not _job["running"]:
+            _job.update(running=True, ok=None, message="",
+                        started_at=time.strftime("%Y-%m-%d %H:%M"),
+                        finished_at=None)
+            threading.Thread(target=_run_nightly, daemon=True).start()
+    # PRG: redirect back so a refresh doesn't re-POST. Relative target keeps
+    # the /engine/* alias working (the proxy strips the prefix).
+    return RedirectResponse(url="status", status_code=303)
 
 
 def _wellknown_candidates(rest: str) -> list[str]:
@@ -88,10 +145,19 @@ h1{{font-size:20px}} h2{{font-size:15px;color:#8ab;margin-top:28px}}
 .run{{font-size:13px;color:#bbb}} .ok{{color:#7c5}} .failed{{color:#e66}}
 pre{{background:#1c1c1e;border-radius:10px;padding:14px;white-space:pre-wrap;
     font-size:13px;line-height:1.5}}
+button{{background:#2c5;color:#062;border:0;border-radius:8px;padding:9px 16px;
+    font-size:13px;font-weight:600;cursor:pointer}}
+button:disabled{{background:#333;color:#888;cursor:default}}
+.job{{font-size:13px;color:#bbb;margin:10px 0}}
 footer{{margin-top:30px;font-size:11px;color:#666}}
 </style></head><body>
 <h1>🧠 slate-engine</h1>
 <div class="cards">{cards}</div>
+<h2>Nightly jobs</h2>
+<form method="post" action="run">
+  <button type="submit"{run_disabled}>Run nightly jobs now</button>
+</form>
+<p class="job">{job}</p>
 <h2>Last consolidation</h2>
 <p class="run">{run}</p>
 <h2>Recent digest (48h)</h2>
@@ -124,6 +190,23 @@ def status_page() -> str:
     else:
         run_html = "no runs yet"
 
-    return _PAGE.format(cards=cards, run=run_html,
+    with _job_lock:
+        job = dict(_job)
+    if job["running"]:
+        job_html = (f'<span class="ok">⏳ running…</span> · '
+                    f'started {html.escape(str(job["started_at"]))}')
+        run_disabled = " disabled"
+    elif job["finished_at"]:
+        css = "ok" if job["ok"] else "failed"
+        job_html = (f'last manual run: <span class="{css}">'
+                    f'{html.escape(job["message"])}</span> · '
+                    f'{html.escape(str(job["finished_at"]))}')
+        run_disabled = ""
+    else:
+        job_html = "no manual run this session"
+        run_disabled = ""
+
+    return _PAGE.format(cards=cards, run=run_html, job=job_html,
+                        run_disabled=run_disabled,
                         digest=html.escape(render_digest(conn, since_hours=48)),
                         base=html.escape(config.SLATE_BASE_URL))
