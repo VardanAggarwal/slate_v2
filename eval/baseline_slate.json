@@ -1,0 +1,222 @@
+{
+  "system": "slate",
+  "user_id": "usr_01KTXAYR20J4R6F7PT3DP10W3W",
+  "budget_tokens": 2000,
+  "n": 14,
+  "sr_at_b": 0.4286,
+  "n_hard": 5,
+  "sr_tail": 0.4,
+  "mean_context_tokens": 704.5,
+  "total_cost": 0.1033,
+  "per_query": [
+    {
+      "id": "g01",
+      "query": "Why did I conclude advertisements are bad for the economy?",
+      "hard": false,
+      "pass": true,
+      "covered": [
+        true,
+        true,
+        true
+      ],
+      "answer": "Based on the context, you concluded advertisements are bad for the economy for several reasons:\n\n1. **Cost inflation**: Advertising adds layered costs passed to consumers \u2014 a product with intrinsic value x ends up selling at x+ny (where n is advertisement layers and y is advertising cost).\n2. **Distorted incentives**: Revenue flows to advertising instead of manufacturing and production, shifting focus away from creating quality products.\n3. **Consumer decision-making**: Customers base purchasing decisions primarily on advertisements rather than product quality.\n4. **Wealth concentration**: The advertising industry creates extreme wealth for a few individuals (e.g., platform founders) while depressing production-sector incomes and skilled labor supply.",
+      "context_tokens": 296,
+      "notes": "All three key facts are addressed: bubble/cost-without-value (fact 1), the x+ny pricing formula (fact 2), and distorted incentives favoring ads over product quality (fact 3).",
+      "cost": 0.005226
+    },
+    {
+      "id": "g02",
+      "query": "What's my take on mercenaries vs missionaries in product teams?",
+      "hard": false,
+      "pass": false,
+      "covered": [
+        true,
+        false,
+        true
+      ],
+      "answer": "Based on your notes, your take is:\n\n**Teams should be missionaries, not mercenaries.** This distinction fundamentally determines team motivation and decision quality.\n\nSpecifically:\n- Teams empowered with **business objectives** (rather than just feature lists) become missionaries with higher motivation and better decisions\n- **Excluding designers and developers** from product decisions reduces them to order-executing mercenaries\n- **Engineers should be involved in decisions**, not treated as mercenaries\n\nSupporting conditions for missionary teams include:\n- **Flexible roadmaps** that incorporate team input on constraints and dependencies (rigid roadmaps create friction and tech debt)\n- **Involving engineers early** to validate feasibility and unblock constraints, which builds trust and unlocks discretionary effort\n- Allocating time for fixes and validation to prevent burnout\n\nThe underlying philosophy is that PMs should act as **enablers**, not commanders \u2014 recognizing that genuine effort from team members must be earned by providing resources, seeking feedback, and creating psychological safety.",
+      "context_tokens": 1001,
+      "notes": "Answer captures the mercenary/missionary distinction and team involvement well, but never mentions Marty Cagan or Inspired as the source of the idea.",
+      "cost": 0.008226
+    },
+    {
+      "id": "g03",
+      "query": "What did I get wrong about network effects that most founders also miss?",
+      "hard": true,
+      "pass": true,
+      "covered": [
+        true,
+        true,
+        true
+      ],
+      "answer": "Based on the context, here are the key things you (and most founders) get wrong about network effects:\n\n1. **Oscillating without committing**: Entrepreneurs oscillate between supply and demand options without committing to one side.\n\n2. **Chasing scale before standalone value**: Platforms must bootstrap one side by delivering standalone value first rather than chasing scale. Happy individual users are the prerequisite for any network effect \u2014 not the other way around.\n\n3. **Paying influencers to recruit users**: Paying small influencers is wasteful because influencers who can be paid lack genuinely engaged audiences who will actually join. Successful platforms attracted famous/influential people through compelling value alone, not distribution deals. Fame itself organically attracts followers.\n\nThe core missed insight seems to be that **you must create happy individual users first** before any network effect can take hold, rather than trying to engineer growth through incentives or influencer recruitment.",
+      "context_tokens": 1028,
+      "notes": "All three key facts are clearly addressed: standalone value before network exists, happy users as prerequisite, and paid influencers being wasteful/ineffective.",
+      "cost": 0.007989
+    },
+    {
+      "id": "g04",
+      "query": "How do I think Seed Savers Club actually adds value for farmers if it can't aggregate produce or guarantee better prices?",
+      "hard": false,
+      "pass": true,
+      "covered": [
+        true,
+        true,
+        true
+      ],
+      "answer": "Based on the context, Seed Savers Club adds value through several mechanisms that don't depend on aggregation or price guarantees:\n\n1. **Community certification and differentiated identity** \u2014 Verified organic status enables premium pricing above local mandi rates, even without aggregation.\n\n2. **Community support system** \u2014 It removes farmer desperation by proving 100% organic farming is possible, preventing the fallback to chemicals after crop loss.\n\n3. **Peer learning and knowledge sharing** \u2014 The model operates through community-building and peer learning, helping farmers develop skills to transition and maintain organic practices.\n\n4. **Farmer empowerment and independence** \u2014 Organic farming is a means, not the end; the core mission is empowering farmers rather than controlling their market access.\n\n5. **Enabling direct-to-consumer connections** \u2014 Differentiated identity allows farmers to pursue direct sales, eliminating middleman costs when quality justifies premium pricing.\n\n6. **Reducing input costs** \u2014 By providing access to organic alternatives (that farmers can buy or create on-farm) and promoting low-investment natural farming techniques, the club improves profitability through cost reduction rather than solely through price increases.\n\nIn essence, the value proposition is about **reducing costs, building identity, and empowering farmers** rather than acting as a market intermediary.",
+      "context_tokens": 1187,
+      "notes": "All three key facts are covered: cost reduction via organic alternatives (#1), differentiated identity (#2), and direct-to-consumer/buyer connections for differentiated produce (#3).",
+      "cost": 0.010149
+    },
+    {
+      "id": "g05",
+      "query": "Why do I argue modern employment is a form of slavery, and what's the alternative?",
+      "hard": true,
+      "pass": false,
+      "covered": [
+        true,
+        true,
+        false
+      ],
+      "answer": "## Why Modern Employment Is a Form of Slavery\n\nBased on your context, you argue that modern employment resembles slavery for several interconnected reasons:\n\n1. **Resource monopoly**: A privileged few have monopolized resources, leaving others with no free alternative but to enter employment servitude\n2. **Artificial crises**: Crises were deliberately created that left people with only \"slavery or death\" as options\n3. **Dependency through perks**: Company benefits keep workers materially comfortable but dependent\n4. **Economic coercion in the gig economy**: Despite legal \"voluntariness,\" gig contracts mirror factory conditions through low pay, uncompensated injury risk, no guaranteed work, and arbitrary denial of work\n5. **System hijacking**: Society's original division-of-labor principle was hijacked by non-contributors who extract value without working\n6. **Entrepreneurship is no escape**: Even entrepreneurship requires participation in the same parasitic system\n\nThe key distinction you draw is that employment **for survival** constitutes servitude, as it violates the social contract of mutual value exchange.\n\n## The Alternative\n\nYour context points to employment being acceptable **only for skill acquisition**, not as a forced survival mechanism. True freedom would require dismantling resource monopoly so people have genuine alternatives rather than coerced participation.\n\nBeyond that specific alternative, your context does not elaborate further on a concrete systemic solution.",
+      "context_tokens": 605,
+      "notes": "The answer covers resource monopoly and parasitic/symbiotic framing but never states that everyone should have access to natural resources by birth as a foundational right.",
+      "cost": 0.008724
+    },
+    {
+      "id": "g06",
+      "query": "What do I believe is the next paradigm shift in AI?",
+      "hard": false,
+      "pass": false,
+      "covered": [
+        false,
+        false,
+        false
+      ],
+      "answer": "Based on the provided context, I don't know. The context touches on AI's impact on engineering, data governance concerns, and some claims about AI platforms and memory, but does not explicitly state what you believe the next paradigm shift in AI will be.",
+      "context_tokens": 529,
+      "notes": "The candidate answer explicitly states it does not know and provides no information about memory as a paradigm shift, switching costs/moats, or hippocampus-like processing.",
+      "cost": 0.004056
+    },
+    {
+      "id": "g07",
+      "query": "What's my concern about the rise of fintech / BNPL lending?",
+      "hard": false,
+      "pass": true,
+      "covered": [
+        true,
+        true
+      ],
+      "answer": "Based on the context, your concern about the rise of fintech/BNPL lending is that **consumer debt stress will worsen as economic conditions deteriorate**. Specifically:\n\n- Fintech startups and BNPL/NBFC lending have significantly expanded access to credit\n- However, incomes are decreasing and inflation is rising\n- This makes **loan repayment increasingly difficult**, as borrowers take on more debt precisely when their ability to repay is weakening",
+      "context_tokens": 602,
+      "notes": "Answer captures both that fintech/BNPL lending has broadly expanded (implying everyone is becoming a lender) and that falling incomes plus rising inflation make repayment harder.",
+      "cost": 0.00549
+    },
+    {
+      "id": "g08",
+      "query": "Why do I think debugging is the real test of AI coding, not building compilers or browsers?",
+      "hard": false,
+      "pass": false,
+      "covered": [
+        true,
+        true,
+        false
+      ],
+      "answer": "Based on the context, you think debugging is the real test of AI coding because **real-world debugging demands true developer skill** in ways that building isolated projects does not. Specifically:\n\n- **Real systems have intertwined code without context**, making them fundamentally harder to navigate than greenfield builds\n- **Third-party dependencies multiply chaos tenfold**, introducing complexity that can't be controlled or anticipated\n- These conditions are where **developers demonstrate true skill** \u2014 and by extension, where AI must prove itself\n\nThe implication is that building something like a compiler or browser can be done in a relatively clean, well-defined environment, whereas production debugging confronts the messy, entangled reality of actual software systems.",
+      "context_tokens": 544,
+      "notes": "The answer covers intertwined code without context and 3rd-party dependency chaos, but never mentions the compiler/browser projects being a fad or that models are trained on open-source tech.",
+      "cost": 0.005988
+    },
+    {
+      "id": "g09",
+      "query": "What did I conclude about PageIndex versus what Slate is trying to do?",
+      "hard": true,
+      "pass": false,
+      "covered": [
+        true,
+        true,
+        false
+      ],
+      "answer": "Based on the context, you concluded that **PageIndex solves hierarchical organization** (functioning as a decision-tree reasoning database), but **fails to handle salience** \u2014 the dynamic, emergent connections that open new exploratory threads beyond fixed hierarchies.\n\nThe core distinction is:\n- **PageIndex** = decision-tree structure that organizes through hierarchy, but complicates traversal and limits the emergence of dynamic connections\n- **Slate** (implicitly) = aimed at capturing **salience** \u2014 those fluid, emergent links that a fixed hierarchy cannot surface\n\nIn short, PageIndex addresses *where things live* in a structure, while Slate is trying to address *what matters and connects dynamically* \u2014 a problem decision trees fundamentally cannot solve.",
+      "context_tokens": 459,
+      "notes": "Key fact 3 about deterministic retrieval being good but bad at extracting insights from large DBs is not explicitly mentioned.",
+      "cost": 0.005736
+    },
+    {
+      "id": "g10",
+      "query": "Why don't I want to leave a legacy?",
+      "hard": false,
+      "pass": false,
+      "covered": [
+        false,
+        false,
+        true
+      ],
+      "answer": "Based on the context, you don't want to leave a legacy for these reasons:\n\n1. **Legacy-seeking is a delusion** \u2014 it is considered identical to belief in an afterlife, making it a form of self-deception.\n2. **Human legacies have predominantly caused environmental harm** \u2014 leaving a legacy is therefore not a neutral or positive act.\n3. **Death and disappearance are life's only true purpose** \u2014 suggesting that striving for continuation beyond one's life contradicts this fundamental view.",
+      "context_tokens": 644,
+      "notes": "The candidate answer only captures the philosophical point about legacy being a folly like afterlife; it misses imposter syndrome and rebellion against patriarchal legacy entirely.",
+      "cost": 0.005439
+    },
+    {
+      "id": "g11",
+      "query": "Why have I grown from atheist to anti-theist about religion?",
+      "hard": true,
+      "pass": true,
+      "covered": [
+        true,
+        true,
+        true
+      ],
+      "answer": "Based on the context, your shift from atheist to anti-theist stems from several interconnected concerns:\n\n1. **Religious justification enables harm**: Religious belief has historically enabled systematic abuse and violence, making it not merely false but actively dangerous.\n\n2. **Religion as a psychological crutch**: Religion externalizes agency \u2014 creating belief in an external agent controlling life outcomes \u2014 which provides comfort but fosters dependency, reduces personal responsibility, and ultimately deteriorates people's capacity to cope with reality.\n\n3. **It masks dysfunction**: What appears supportive on the surface conceals underlying psychological addiction and dysfunction, sweeping problems under the rug rather than resolving them.\n\n4. **It misdirects from action**: Religion pulls people away from genuine achievement and action, promoting withdrawal and asceticism instead.\n\n5. **Fake foundations**: Religion is built on false assumptions and rituals that obscure rather than serve genuine personal integrity.\n\nIn short, you moved beyond simply disbelieving in gods to actively opposing religion because you see it as psychologically harmful \u2014 impairing autonomy, moral integrity, and real-world agency \u2014 not just intellectually mistaken.",
+      "context_tokens": 619,
+      "notes": "All three key facts are addressed: external agency (point 2), hiding from reality/crippling growth (points 2 and 3), and the crutch/addiction analogy (points 2 and 3).",
+      "cost": 0.008112
+    },
+    {
+      "id": "g12",
+      "query": "What's my argument that gig work is coercive labour, and how could it be done better?",
+      "hard": true,
+      "pass": false,
+      "covered": [
+        true,
+        true,
+        false
+      ],
+      "answer": "## Your Argument That Gig Work Is Coercive Labour\n\nYour core argument is that **gig contracts are legally voluntary but economically coercive**, mirroring the original conditions of factory labour. The specific mechanisms of coercion you identify are:\n\n- **No guaranteed work**: Workers commit their hours, but platforms guarantee no minimum work in return\n- **Wage circumvention**: Low per-km pay combined with vehicle costs effectively bypasses minimum wage protections\n- **Uncompensated risk**: Occupational injury and death risk is significant yet uncompensated\n- **No union protections** and the possibility of arbitrary denial of work\n\nThis connects to your broader argument that **resource monopoly by the privileged few forces others into employment servitude** \u2014 workers lack a free alternative, making the \"voluntary\" nature of the contract illusory.\n\n## How It Could Be Done Better\n\nBased on your context, your implied improvements would include:\n\n- **Guaranteed minimum work** commitments from platforms when workers commit hours\n- **Proper compensation** for occupational injury and death risk\n- **Pay structures** that respect minimum wage after costs\n- **Union protections** for gig workers\n\nYour broader principle is that **employment should only occur for skill acquisition, not forced survival** \u2014 suggesting gig work would be legitimate only when workers genuinely have free alternatives.",
+      "context_tokens": 617,
+      "notes": "Answer covers legal-voluntary/economically-coercive framing and lists wage circumvention, no union protections, and arbitrary deactivation, but never mentions the concrete better models (Domino's salaried riders, Shadowfax minimum-guarantee).",
+      "cost": 0.009102
+    },
+    {
+      "id": "g13",
+      "query": "What does sustainable agriculture mean to me and why am I bullish on natural farming?",
+      "hard": false,
+      "pass": false,
+      "covered": [
+        true,
+        false,
+        true
+      ],
+      "answer": "## What Sustainable Agriculture Means & Why I'm Bullish on Natural Farming\n\n### What Sustainable Agriculture Means\n\nSustainable agriculture must **endure long-term** despite significant environmental variation. It balances **three interconnected dimensions**:\n\n- **Economic** sustainability\n- **Environmental** sustainability\n- **Social** sustainability\n\n### Why I'm Bullish on Natural Farming\n\n**Economic Resilience:**\n- Zero Budget Natural Farming eliminates external inputs, achieving economic sustainability at its core\n- Farmers using low-investment techniques can achieve **superior returns on investment**\n- Crop diversification (multi-cropping) reduces risk and increases revenue\n- Low-risk value chains enhance resilience to climate change, preventing total loss from single adverse events\n\n**Systemic Transformation Potential:**\n- Success requires millions of farmers diversifying into sustainable practices, creating broad **social and environmental impact**\n- Natural farming integrates crop diversification, soil improvement, water conservation, and ecological development\n\n**Overcoming Adoption Barriers:**\n- Community support systems remove desperation by proving 100% organic farming is achievable\n- Multiple organic alternatives exist that farmers can buy or create on-farm\n- Organizations can evolve from promoting organic farming toward empowering a broader community of **progressive farmers**\n\nThe vision is ultimately about transforming the agricultural landscape at scale, moving beyond organic farming as a label toward genuine farmer empowerment and resilience.",
+      "context_tokens": 986,
+      "notes": "Key fact 2 (sustainability via risk reduction) is not clearly stated; risk is briefly mentioned but not framed as the core driver of sustainability; key facts 1 and 3 are addressed.",
+      "cost": 0.009903
+    },
+    {
+      "id": "g14",
+      "query": "What's my framework for why systems fail and how to make them resilient?",
+      "hard": false,
+      "pass": true,
+      "covered": [
+        true,
+        true,
+        true
+      ],
+      "answer": "## Framework for System Failure and Resilience\n\n### Why Systems Fail\n\nSystems fail through several interconnected dynamics:\n\n1. **Scaled demand corrupts performance** \u2014 Systems become corrupted and fail to perform under scaled demand, with traffic infrastructure in major cities as a prime example.\n\n2. **External factors drive demand** \u2014 External factors influence and drive demand on systems in ways they may not be designed to handle.\n\n3. **Innovator withdrawal triggers collapse** \u2014 When innovators refuse cooperation, the system collapses into survival-based competition and mutual destruction, paradoxically eliminating the most capable individuals rather than rewarding them.\n\n4. **Operational debt accumulates** \u2014 Broken internal systems and continuous daily failures force ongoing maintenance that competes directly with growth, creating a debt burden that compounds over time.\n\n5. **Fast distribution of broken products** accelerates system collapse.\n\n### How to Build Resilience\n\nResilience comes from **elasticity**, not rigidity:\n\n- Systems must **synchronize with their surrounding conditions** to survive\n- Rather than resisting change, systems need **feedback loops** to handle extreme changes\n- **Absorbing shocks and evolving from them** is what creates true resilience\n\n### Core Insight\n\nThe central distinction is between *rigid resistance* (which breaks) and *elastic adaptation* (which survives) \u2014 resilient systems stay synchronized with their environment through continuous feedback and evolution.",
+      "context_tokens": 746,
+      "notes": "All three key facts are clearly stated: sync with surroundings, feedback loops preventing breakage under extreme change, and elasticity/shock absorption as the basis of resilience.",
+      "cost": 0.009144
+    }
+  ]
+}

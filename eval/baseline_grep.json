@@ -1,0 +1,222 @@
+{
+  "system": "grep",
+  "user_id": "usr_01KTXAYR20J4R6F7PT3DP10W3W",
+  "budget_tokens": 2000,
+  "n": 14,
+  "sr_at_b": 1.0,
+  "n_hard": 5,
+  "sr_tail": 1.0,
+  "mean_context_tokens": 2000.6,
+  "total_cost": 0.1447,
+  "per_query": [
+    {
+      "id": "g01",
+      "query": "Why did I conclude advertisements are bad for the economy?",
+      "hard": false,
+      "pass": true,
+      "covered": [
+        true,
+        true,
+        true
+      ],
+      "answer": "Based on the context, advertisements are bad for the economy for the following reasons:\n\n1. **They create an economic bubble**: Advertisement costs are added at every stage of a product's journey, inflating the final price beyond its intrinsic value (x+ny), without adding any real value to the product.\n\n2. **They reduce product quality**: Sellers prioritize spending on advertising over product research, employee salaries, and product quality, resulting in poor products in attractive packaging.\n\n3. **They worsen income inequality**: A huge amount of market money flows to the advertising industry, enriching a few (like Mark Zuckerberg) while reducing income for those involved in actual production, widening the wealth gap.\n\n4. **They distort the job market**: Young people are lured toward advertising-related careers, creating an oversupply of unskilled workers while production industries struggle to find skilled employees, ultimately stunting economic and societal growth.\n\n5. **They shift consumer decision-making away from product value**, rewarding great advertisements over great products, undermining a healthy market based on genuine value.",
+      "context_tokens": 2000,
+      "notes": "All three key facts are clearly addressed: economic bubble without value (fact 1), x+ny pricing formula explicitly mentioned (fact 2), and prioritizing ads over product quality/research (fact 3).",
+      "cost": 0.010743
+    },
+    {
+      "id": "g02",
+      "query": "What's my take on mercenaries vs missionaries in product teams?",
+      "hard": false,
+      "pass": true,
+      "covered": [
+        true,
+        true,
+        true
+      ],
+      "answer": "Based on the context, the author's take is that when product decisions are made **without involving designers and developers**, those team members are reduced to acting like **mercenaries** \u2014 simply executing orders for pay. The goal is to make them **missionaries** \u2014 people working toward larger business objectives rather than just delivering specific features on a roadmap.\n\nThe author draws on **Marty Cagan's concept from *Inspired* (2nd Edition)** and advocates for involving developers and designers early in the product discovery process. Key practices recommended include:\n\n- Keeping the team in the loop on ideas being considered\n- Communicating business objectives so the team shares leadership's vision\n- Exposing them to users and user insights\n- Brainstorming and validating ideas with them informally\n- Being open about results (successes and failures)\n\nThe author acknowledges it is **tough to convince leadership to make major process changes all at once**, but believes **small, incremental steps** are effective in gradually shifting the overall process and ideology toward a more collaborative, missionary-minded approach.",
+      "context_tokens": 2000,
+      "notes": "All three key facts are explicitly and accurately covered in the candidate answer.",
+      "cost": 0.010185
+    },
+    {
+      "id": "g03",
+      "query": "What did I get wrong about network effects that most founders also miss?",
+      "hard": true,
+      "pass": true,
+      "covered": [
+        true,
+        true,
+        true
+      ],
+      "answer": "Based on the context, here are the key things most founders (including yourself) get wrong about network effects:\n\n1. **Ignoring small pools of users** \u2013 Founders know network effects require millions of users, so they dismiss the small audience they already have, going back and forth on the chicken-and-egg problem without resolving it.\n\n2. **Not offering individual value first** \u2013 Founders focus on the network's value rather than offering value to individual users *before* the network is large. Successful companies like Facebook, Instagram, and Amazon offered standalone value to individuals first.\n\n3. **Trying to acquire people with existing networks** \u2013 Founders expect influencers or well-connected users to bring their networks along, but no one will bring you their network. Famous people can *attract* others to join, but they won't actively recruit on your behalf.\n\n4. **Paying influencers to bring their network** \u2013 Influencers who can be afforded typically don't have engaged-enough audiences to generate value, making this a waste of money and time.\n\n5. **Solving for distribution before solving for individuals** \u2013 Chasing volume without first perfecting the experience for a small set of users means you won't know what to offer people, and scaling too fast can crash your operations.\n\n6. **Blaming customers instead of the product** \u2013 When unable to satisfy a small audience, founders assume a larger network will fix the problem. It won't \u2014 unhappy customers don't lead to network effects.",
+      "context_tokens": 2000,
+      "notes": "All three key facts are explicitly and clearly addressed in the candidate answer.",
+      "cost": 0.012072
+    },
+    {
+      "id": "g04",
+      "query": "How do I think Seed Savers Club actually adds value for farmers if it can't aggregate produce or guarantee better prices?",
+      "hard": false,
+      "pass": true,
+      "covered": [
+        true,
+        true,
+        true
+      ],
+      "answer": "Based on the context, Seed Savers Club adds value for farmers in the following ways even without aggregation or guaranteed better prices:\n\n1. **Removing desperation**: By providing a support system with organic alternatives for every problem (pest attacks, diseases), the community prevents farmers from resorting to chemicals out of desperation, enabling 100% organic production.\n\n2. **Multiple organic solutions**: Farmers gain access to various low-cost organic alternatives \u2014 both market-available and farm-created \u2014 that can be as efficient or more efficient than chemicals, especially when used preventively, helping reduce cost of production.\n\n3. **Shared knowledge**: The community enables farmers to share learnings and solve each other's problems, with a key takeaway being that \"100% organic is actually possible.\"\n\n4. **Differentiated identity**: Even without aggregating produce, Seed Savers Club can help farmers maintain a differentiated identity for their produce and connect them with buyers who specifically seek that differentiation, enabling better prices than the local mandi.\n\nIn summary, the value lies primarily on the **production side** (reducing costs, enabling fully organic output) and on **market identity** (helping farmers command premium prices through differentiation), rather than through physical aggregation or logistics.",
+      "context_tokens": 2001,
+      "notes": "All three key facts are clearly stated: organic alternatives enabling 100% organic production and cost reduction, differentiated identity, and connecting farmers with buyers seeking that differentiation.",
+      "cost": 0.011493
+    },
+    {
+      "id": "g05",
+      "query": "Why do I argue modern employment is a form of slavery, and what's the alternative?",
+      "hard": true,
+      "pass": true,
+      "covered": [
+        true,
+        true,
+        true
+      ],
+      "answer": "Based on the context, modern employment is argued to be a form of slavery because **natural resources are controlled by a privileged few**, leaving the landless and unprivileged no choice but to serve others' interests to earn a living \u2014 mirroring how early slaves were forced into servitude when their access to natural resources was taken away.\n\nAdditional parallels drawn include:\n- Employee bonds, restricted freedom, and controlled working hours\n- Even entrepreneurship is not a true escape, as entrepreneurs remain trapped in the broader economic/financial system and cannot freely access natural resources\n\n**The alternative proposed is a symbiotic system**, characterized by:\n- **Mutual and voluntary participation**, where people exchange values and both parties benefit\n- **Universal access to natural resources by birth**, so people are not forced into dependency on the system for basic necessities\n- Employment only occurring when there is something to be learned, with individuals always retaining the option to work independently\n- Freelancing is cited as a close (but imperfect) example of this model\n\nThe core distinction made is between a **parasitic system** (one party develops at the cost of another) versus a **symbiotic system** (both parties develop through mutual exchange of values).",
+      "context_tokens": 2000,
+      "notes": "All three key facts are clearly and explicitly addressed in the candidate answer.",
+      "cost": 0.010839
+    },
+    {
+      "id": "g06",
+      "query": "What do I believe is the next paradigm shift in AI?",
+      "hard": false,
+      "pass": true,
+      "covered": [
+        true,
+        true,
+        true
+      ],
+      "answer": "Based on the context, you believe the next paradigm shift in AI will come from **memory**. Specifically, memory will create a moat for AI platforms by increasing switching costs through hyper-personalization, and you suggest that current memory structures may not be sufficient \u2014 proposing instead that a more complex, **hierarchical or graph-based** memory system (similar to how the hippocampus works) may be needed, potentially using **principal component extraction** to maintain relevance at scale.",
+      "context_tokens": 2002,
+      "notes": "All three key facts are clearly addressed: memory as paradigm shift, switching costs/moat for monetisation, and insufficiency of current memory vs hippocampus-like processing.",
+      "cost": 0.008268
+    },
+    {
+      "id": "g07",
+      "query": "What's my concern about the rise of fintech / BNPL lending?",
+      "hard": false,
+      "pass": true,
+      "covered": [
+        true,
+        true
+      ],
+      "answer": "Based on the context provided, your concern about the rise of fintech/BNPL lending is that **in an economy where incomes are going down and inflation is increasing, it would become tougher and tougher for people to pay back** their loans. You are also concerned about the **huge increase in BNPL or NBFC based lenders**, noting that every fintech startup has become a lender.",
+      "context_tokens": 2001,
+      "notes": "Both key facts are explicitly addressed in the candidate answer.",
+      "cost": 0.008415
+    },
+    {
+      "id": "g08",
+      "query": "Why do I think debugging is the real test of AI coding, not building compilers or browsers?",
+      "hard": false,
+      "pass": true,
+      "covered": [
+        true,
+        true,
+        true
+      ],
+      "answer": "Based on the context, the reasoning is that when things fail in complex, intertwined systems \u2014 especially with third-party dependencies \u2014 figuring out what broke is the true challenge. Building a C compiler or browser is considered a \"fad\" since both are open source technologies the underlying models were likely already trained on. The **real battle test** is: when things fail, how fast can AI (and \"vibe coders\") figure out what broke. Debugging without context, in messy real-world codebases, is where the genuine difficulty lies.",
+      "context_tokens": 2002,
+      "notes": "All three key facts are clearly addressed: debugging without context in messy codebases, third-party dependencies adding chaos, and the compiler/browser efforts being dismissed as fads due to open-source training data.",
+      "cost": 0.009027
+    },
+    {
+      "id": "g09",
+      "query": "What did I conclude about PageIndex versus what Slate is trying to do?",
+      "hard": true,
+      "pass": true,
+      "covered": [
+        true,
+        true,
+        true
+      ],
+      "answer": "Based on the context, the conclusion is that **PageIndex solves for hierarchy** (scaling RAG with large document bases) but **not salience** \u2014 it uses decision trees which limit dynamic connections and the emergence of salience, making it good for **deterministic retrieval** but not for **extracting insights** from a huge database or **connecting random dots**.\n\nSlate, by contrast, is trying to go beyond hierarchy by also solving for **salience** \u2014 decomposing documents into concepts, allowing those concepts to dynamically connect and cluster, and enabling new encompassing concepts to emerge over time. The approach involves splitting documents into **background + salience**, where background evolves within a hierarchical structure while salience opens new threads.",
+      "context_tokens": 2001,
+      "notes": "All three key facts are clearly addressed: PageIndex as opposite/decision-tree DB, decision trees solving hierarchy but not salience/dynamic connections, and good at deterministic retrieval but bad at extracting insights.",
+      "cost": 0.009723
+    },
+    {
+      "id": "g10",
+      "query": "Why don't I want to leave a legacy?",
+      "hard": false,
+      "pass": true,
+      "covered": [
+        true,
+        true,
+        true
+      ],
+      "answer": "Based on the context, there are several reasons given for not wanting to leave a legacy:\n\n1. **Imposter syndrome** \u2013 it doesn't feel like there is anything worth leaving behind.\n2. **Feeling unworthy of existence** \u2013 a sense of not having the right to exist without creating substantial value.\n3. **Rebellion against patriarchy** \u2013 rejecting the obsession men have with legacy, such as having children to carry on their name and genes.\n4. **Environmental consciousness** \u2013 recognizing that humanity's mark on earth has largely been damaging it.\n5. **Philosophical acceptance of death** \u2013 the belief that the end goal of life is to die and disappear, and that chasing a legacy is as foolish as believing in an afterlife \u2014 both being lies told to avoid facing the reality of death and disappearance.",
+      "context_tokens": 2001,
+      "notes": "All three key facts are clearly addressed: imposter syndrome (#1), rebellion against patriarchal legacy (#2), and legacy as folly akin to afterlife with death/disappearance as life's end (#3).",
+      "cost": 0.010227
+    },
+    {
+      "id": "g11",
+      "query": "Why have I grown from atheist to anti-theist about religion?",
+      "hard": true,
+      "pass": true,
+      "covered": [
+        true,
+        true,
+        true
+      ],
+      "answer": "Based on the context, the author grew from atheist to anti-theist because of two main reasons:\n\n1. **At a macro level**, historically people have committed heinous acts in the name of religion, including abuse of vulnerable people, riots, and wars, and in contemporary history religion has been one of the biggest dividers in society, getting progressively worse.\n\n2. **At a deeper level**, even with religious people they respect, the author sees that religion establishes an **external agency** that takes over individuals' sense of control over their own lives. This causes people to hide from parts of their reality, corrupts their moral code based on half-truths, limits their growth, and ultimately acts like a **crippling addiction** \u2014 similar to using a crutch when one's legs are still functional. The more one relies on this external agency, the less capable they become of dealing with tough situations independently. Seeing people they respect actively cripple themselves in this way is described as \"extremely painful.\"",
+      "context_tokens": 2001,
+      "notes": "All three key facts are explicitly covered: external agency taking control, hiding from reality and crippling growth, and the crutch/addiction analogy.",
+      "cost": 0.010506
+    },
+    {
+      "id": "g12",
+      "query": "What's my argument that gig work is coercive labour, and how could it be done better?",
+      "hard": true,
+      "pass": true,
+      "covered": [
+        true,
+        true,
+        true
+      ],
+      "answer": "## Your Argument: Gig Work as Coercive Labour\n\nYou argue that **gig contracts are \"legally voluntary but economically coercive\"** \u2014 drawing a parallel to early factory labour. Key points:\n\n- **Economic coercion**: Riders must pay for vehicle rent, maintenance, and fuel, meaning platform pay rates (e.g., 10Rs/km) effectively skirt minimum wage\n- **Risk without protection**: Even a single delivery carries non-zero risk of death or injury, with no safety net\n- **Arbitrary deprivation of work**: Platforms can simply stop assigning work to a rider \u2014 functioning as arbitrary firing \u2014 while riders must commit their hours to the platform\n- **Excessive hours with no rest**: Workers do 14\u201316 hour days, all week, just to earn enough\n- **No ability to organise**: Riders cannot unionise or strike, as platforms can retaliate by withholding work assignments\n\n---\n\n## How It Could Be Done Better\n\nYou offer two concrete counter-models:\n\n- **Domino's model**: Salaried riders with employment protections\n- **Shadowfax model**: Dedicated rider services with a **minimum guarantee of work**\n\nYour core point is that **a more stable, fairer system is demonstrably possible** \u2014 Zomato's model is a choice, not a necessity.",
+      "context_tokens": 2000,
+      "notes": "All three key facts are clearly and accurately covered, including the exact framing of coercion, all four specific issues, and both counter-models.",
+      "cost": 0.012024
+    },
+    {
+      "id": "g13",
+      "query": "What does sustainable agriculture mean to me and why am I bullish on natural farming?",
+      "hard": false,
+      "pass": true,
+      "covered": [
+        true,
+        true,
+        true
+      ],
+      "answer": "## Sustainable Agriculture and Why Natural Farming is the Future\n\n### What Sustainable Agriculture Means\n\nSustainable agriculture means **agricultural practices that farmers can continue doing as they battle through the changing ecosystem around them**. It encompasses three aspects:\n\n- **Economical**: Lower cost of cultivation reduces risk; absolute sustainability comes when cultivation requires no external inputs, so crop failure only costs the farmer's time and labour\n- **Environmental**: Diversifying crops and creating micro-climates to protect farms from adverse weather effects\n- **Social**: Reducing dependency on others and increasing farmland resilience to preserve a farmer's land and social identity\n\nThe fundamental principle is that **reducing inherent risk in agriculture** is the easiest path to sustainability, as even a small negative event can currently cause a farmer to lose everything.\n\n---\n\n### Why Natural Farming is the Sustainable Future\n\nNatural farming (particularly ZBNF) addresses all three sustainability dimensions:\n\n- **Reduces cost of cultivation** considerably while maintaining produce quantity on par with chemical farming\n- Promotes **crop diversification, improved soil fertility, water conservation**, and emergent micro-climates\n- **Reduces dependency** on external inputs, with inputs developed on the farm itself\n- Makes farmers **less susceptible to price variations** due to lower cultivation costs and crop diversification\n- Opens **new direct marketing channels** to health-conscious consumers, reducing market-side risks",
+      "context_tokens": 2000,
+      "notes": "All three key facts are explicitly addressed: the three aspects (economical, environmental, social), risk reduction as the core of sustainability, and ZBNF reducing cultivation costs while maintaining comparable yields.",
+      "cost": 0.011745
+    },
+    {
+      "id": "g14",
+      "query": "What's my framework for why systems fail and how to make them resilient?",
+      "hard": false,
+      "pass": true,
+      "covered": [
+        true,
+        true,
+        true
+      ],
+      "answer": "Based on the context, your framework is:\n\n- **Systems fail** when demand scales beyond capacity, external shocks occur without proper feedback loops, or extreme changes overwhelm the system's ability to adapt.\n\n- **Resilience comes from elasticity** \u2014 a system's ability to absorb multiple shocks and **evolve with each one**, rather than merely resist change. Systems have an inherent tendency toward rigidity, which makes them vulnerable to extreme disruptions.\n\n- **The core principle** is that a resilient (anti-fragile) system stays in sync with its surroundings through feedback loops, and building **elasticity** \u2014 not just robustness \u2014 should be the primary focus when designing or iterating on any system.",
+      "context_tokens": 2000,
+      "notes": "All three key facts are clearly addressed: sync with surroundings via feedback loops, extreme change without feedback loops causing failure, and elasticity/absorbing shocks as the definition of resilience/anti-fragility.",
+      "cost": 0.009477
+    }
+  ]
+}
