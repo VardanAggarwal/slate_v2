@@ -57,21 +57,49 @@ Real-corpus behavioural probes (LLM/human-judged, no asserts) live in
 
 ---
 
-## 1. WRITE pipeline — owns *content presence*
+## 1. WRITE pipeline — owns *content presence* — ✅ BUILT (2026-06-22)
 
 Input: raw note text + ts. Output: immutable episode (raw) + a set of routed fragments
-(working). Today: `encode.py:162` sentence-splits and applies binary echo/novelty thresholds.
+(working). W1 is synchronous (`core/encode.py`); W2–W8 are the async, event-sourced remainder
+(`core/write.py:refine_episode`, materialized by `apply_fragmented`, replayable by `rebuild`).
+
+**As-built — three refinements past the table below:**
+
+- **Fragment vector = MEDOID sentence (W3/W7 at the vector level).** A fragment's routing/storage
+  vector is its lowest-within-span-residual sentence, selected via `measure(span, exclude_self)` —
+  NOT the re-embedded joined span. Reuses the W1 sentence vectors, so **refine makes zero embedding
+  calls**; selection, not generation (PRD-faithful). `rebuild` recomputes it deterministically from
+  the episode's sentences. A folded (large) fragment is coherent by construction, so its medoid
+  stands for the whole span; surprising sentences already left as their own fine fragments at W2/W3.
+- **W4+W5 routing is BATCHED.** One `measure(all fragments, memory)` gemm vs the fixed corpus
+  replaces the old per-fragment `measure(growing-Y)` loop (which re-`vstack`-ed the whole pool each
+  step). Intra-note dedup (W4) is now a cheap causal sibling check (k×k gram); the `memory ∪
+  siblings` union-z is recomputed only for a fragment an earlier kept sibling actually out-competes
+  — preserving W4's semantics exactly where they fire, without the full-corpus rescan.
+- **W6 routes on a PER-CLUSTER threshold.** Fragments carry a `cluster` (W8 schema add), assigned by
+  anchor-inheritance (NOVEL opens a region; AMBIGUOUS inherits its anchor's). `decide()`'s per-region
+  `z_echo`/`prox_margin` now resolves — previously DEAD because every fragment was `cluster=None`.
+  This is the knob **C12** fits; consolidation re-clusters later.
+
+Real-corpus check (166 notes, `docs/write-workflow-eval.md` §v3.1): 972 stored / 60 PREDICTED-dropped
+/ 22 intra-echoes / 74 regions, 18s, no network. `tests/test_write.py` 19/19.
+
+> **⛔ Blocker for P3 (calibration loop):** fragments are an **orphan branch** — `recall`/
+> `assemble_context` read claims/concepts and `consolidate` blueprints from `raw_text`; **neither
+> reads fragments.** So `z_echo`/the per-cluster knob have no path to SR@B and C12 cannot be fitted
+> until RETRIEVE reads the fragment layer. Today's SR@B (42.9%) is the v2 claims pipeline, untouched
+> by Write. Wiring fragments into retrieval is the real prerequisite — slot it ahead of P3.
 
 | # | Step (PRD function) | X vs Y (predictor) | Build | Replaces | Test |
 |---|---|---|---|---|---|
 | W1 | **Persist raw** | — | keep `store.insert_episode` (`store.py:398`) | unchanged | invariant: episode + sentences immutable (trigger `207`), receipt attached |
 | W2 | **Segment** — cut where content stops being predictable | each candidate fragment vs the running prefix | sequential-scan wrapper | sentence-split (`encode.py:90`) | synthetic: 3 planted topic shifts → cuts within ±1 sentence of each; SR@B not worse than sentence-split |
 | W3 | **Variable-resolution encoding** — not just *where* to cut but *how finely*: fine where surprise is high, folded where low | fragment residual vs the running prefix (magnitude → granularity) | sequential-scan wrapper (resolution knob off the same novelty signal) | uniform sentence granularity (`encode.py:90`) | synthetic: high-surprise region keeps fine fragments, low-surprise region folds; SR@B@B not regressed vs uniform |
-| W4 | **Intra-note dedup** — collapse within-note echoes before they hit the store | fragment vs *earlier fragments of the same note* | `measure()` direct (Y = prior fragments of this note, not M) | — | synthetic note with planted internal repeat → echo fragment routed PREDICTED, not stored twice |
-| W5 | **Match** — anchor each fragment to memory | fragment vs M | `measure()` direct | — | synthetic: near-dup fragment → correct `anchor_id`, low residual; off-topic → `cold_start`/no anchor |
+| W4 | **Intra-note dedup** — collapse within-note echoes before they hit the store | fragment vs `M ∪ earlier kept siblings` | causal sibling check (k×k gram) after the batched M pass; union-z recomputed only when a kept sibling out-competes the memory anchor | — | synthetic note with planted internal repeat → echo fragment routed PREDICTED, not stored twice (`test_route_intra_note_dedup`) |
+| W5 | **Match** — anchor each fragment to memory | all fragments vs M | **batched** `measure()` (single gemm vs the fixed corpus) | — | synthetic: near-dup fragment → correct `anchor_id`, low residual; off-topic → `cold_start`/no anchor |
 | W6 | **Label** — route store / reinforce / resolve, and hold-strength | `decide()` over measurements | wire `decide()` + `resolve_direction()` (LLM only on AMBIGUOUS) | binary stance (`encode.py:129`) | route-confusion matrix on labeled fixtures; **only** AMBIGUOUS calls the LLM (assert call count) |
-| W7 | **Centre** — representative core + most-novel point | members vs their own centroid | `measure()` on the fragment set | — | synthetic note → medoid is the lowest-residual member; novel point is the highest-z |
-| W8 | **Persist working** — z, route, weight, anchor_id per fragment | — | schema add + ENCODED-event payload v2 (null-default old events) | — | round-trip persist→rebuild reproduces routes; old-event backfill test |
+| W7 | **Centre** — representative core + most-novel point | note: fragment vs note's fragments; fragment: sentence vs span's sentences (medoid) | `measure()` rank — lowest residual = centre/medoid (SELECTION, reused as the fragment's vector); highest z = novel peak | — | synthetic note → medoid is the lowest-residual member; novel point is the highest-z; `test_fragment_medoid_selects_a_real_sentence` |
+| W8 | **Persist working** — z, route, weight, anchor_id, **cluster** per fragment | — | `fragments` table + `vec_fragments` + the `FRAGMENTED` event (JSON, embeddings recomputed at apply); content-addressed ids → idempotent/replayable | — | round-trip persist→rebuild reproduces routes + vectors (`test_rebuild_reproduces_fragments`); idempotency + concurrent-claim guard |
 
 **Stage gate (W):** content-presence diagnostic ≥ baseline AND end-to-end SR@B@B not
 regressed vs sentence-split. (Presence alone can't pass — finer fragments game presence but
@@ -195,19 +223,23 @@ A step is "done" only when its row's test passes *and* its stage gate (SR@B) hol
 ## 6. Execution order (dependency-ordered; each phase has an exit gate)
 
 ```
-P0  Eval harness (SR@B) ............ EXIT: can score SR@B + ΔSR@B on frozen set, ~30 gold queries
-P1  Wrappers + test_predict.py ..... EXIT: §0 wrappers green on synthetic corpora
-P2  Wire predictor into WRITE ...... EXIT: W-gate (presence ↑, SR@B@B not regressed)
-P3  Calibration loop (W↔C) ......... EXIT: fitted calibration beats Z_ECHO=-3.5 default
+P0  Eval harness (SR@B) ............ ✅ DONE  (eval/harness.py; frozen gold.jsonl, 20 queries; baselines captured)
+P1  Wrappers + test_predict.py ..... ✅ DONE  (§0 wrappers green; route-matrix tested)
+P2  Wire predictor into WRITE ...... ✅ DONE  (W1–W8 built; medoid + batched + per-cluster; test_write 19/19)
+P2.5 Wire fragments into RETRIEVE .. ⛔ NEW PREREQUISITE — recall/consolidate don't read fragments (orphan
+                                     branch), so P3 has no objective. Must precede P3.
+P3  Calibration loop (W↔C) ......... ⏸ BLOCKED on P2.5; C12 fits per-cluster z_echo vs SR@B (knob now live)
 P4  RETRIEVE — spike then build ..... EXIT: R0 spike passes; R-gate (sufficiency ↑, Slate≥RAG@B)
 P5  CONSOLIDATE safety + signals .... EXIT: C-gate (ΔSR@B≥0, forgetting=0, rollback works)
 P6  Frontier (cross-cutting §4) ..... EXIT: redaction/isolation/write-during-consolidate tests green
 ```
 
-**Critical path:** P0→P1→P2→P3 are tightly coupled — go in order. P4 carries the biggest
-unproven risk (embedding asymmetry) — the R0 spike is a hard gate, do not build R1+ until it
-passes. P5 is the heaviest schema/safety lift (versioning, pruning, rollback). P6 is independent
-and can interleave once P5's rollback exists (redaction reuses re-derivation).
+**Critical path:** P0→P1→P2 are ✅. **P3 (calibration) is the original next step but is gated on a
+newly-surfaced prerequisite, P2.5:** the WRITE fragment layer is an orphan branch — `recall`/
+`assemble_context` read claims/concepts and `consolidate` blueprints from `raw_text`, so turning
+`z_echo` moves nothing measurable. Retrieval must read fragments (overlaps P4/R2) before the
+calibration loop has an objective. P4 still carries the biggest unproven risk (embedding asymmetry —
+R0 spike gates it). P5 is the heaviest schema/safety lift. P6 is independent.
 
 ## 7. Review — predictor + 3 wrappers (2026-06-21, before P2)
 

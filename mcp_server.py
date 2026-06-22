@@ -288,6 +288,14 @@ def save_note(text: str, title: str) -> dict:
         receipt = encode(conn, user_id, text, title=title.strip(), source="mcp")
     except ValueError as e:
         raise ToolError(str(e))
+    finally:
+        conn.close()
+    # W1 (raw + receipt) is committed and returned now; the predictor-driven
+    # fragmentation/routing (W2–W8) runs in the background — it re-embeds and may
+    # call the resolver, so it must not block the save. A failure here just leaves
+    # the episode for the nightly refine_pending sweep.
+    from core.write import trigger_refine_async
+    trigger_refine_async(user_id, receipt["episode_id"])
     return {"episode_id": receipt["episode_id"], "title": title.strip(),
             "n_sentences": receipt["n_sentences"],
             "narrate": receipt_markdown(receipt)}

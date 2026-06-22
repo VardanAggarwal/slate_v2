@@ -13,6 +13,7 @@ Multi-user invariants (AUTH.md):
   with user_id — see consolidate.claim_id_for) because vec0 PRIMARY KEYs are
   unique across partitions, not per-partition.
 """
+import hashlib
 import json
 import os
 import sqlite3
@@ -121,6 +122,54 @@ CREATE TABLE IF NOT EXISTS concept_members (
     PRIMARY KEY (concept_id, claim_id)
 );
 
+-- WRITE-SIDE WORKING MEMORY (derived; rebuildable from episodes + FRAGMENTED events)
+-- The predictor's output: the async Write refine pass (core/write.py, W2–W8)
+-- segments a note into variable-resolution fragments, routes each against memory
+-- (PRD: predicted/novel/ambiguous), and persists the NOVEL/AMBIGUOUS ones here.
+-- This is working memory: it may be wrong and is fully re-derivable, so — like
+-- claims/concepts — it is truncated and replayed by rebuild(). Written ONLY via
+-- the FRAGMENTED event applier (write.apply_fragmented); ids are deterministic
+-- (frg_<md5 of user+episode+span>) so retries and rebuild are idempotent.
+CREATE TABLE IF NOT EXISTS fragments (
+    id            TEXT PRIMARY KEY,        -- frg_<md5>
+    user_id       TEXT NOT NULL,
+    episode_id    TEXT NOT NULL,           -- provenance: the immutable raw episode
+    text          TEXT NOT NULL,           -- the fragment text (joined sentence span)
+    sent_start    INTEGER,                 -- inclusive episode_sentences.idx range …
+    sent_end      INTEGER,                 -- … this fragment spans
+    medoid_idx    INTEGER,                 -- the fragment's representative sentence (episode_sentences.idx):
+                                           -- its vector IS this sentence's vector in vec_sentences, so NO
+                                           -- duplicate fragment vector is stored — fragment_pool/knn_fragments
+                                           -- REFERENCE vec_sentences via (episode_id, medoid_idx). NULL only
+                                           -- on the legacy/bare-applier path (no sentences) → no referable vector.
+    route         TEXT,                    -- 'NOVEL' | 'AMBIGUOUS' (PREDICTED is never stored)
+    z             REAL,                    -- surprise: residual z-score vs memory's spread
+    residual      REAL,
+    weight        REAL,                    -- within-note residual share (relative salience)
+    anchor_id     TEXT,                    -- prior fragment it sits on (AMBIGUOUS); NULL for NOVEL
+    direction     TEXT,                    -- 'contradict'|'refine'|'reinforce' (resolver, AMBIGUOUS only)
+    cluster       TEXT,                    -- region/cluster this fragment belongs to: the SCOPE the
+                                           -- per-cluster calibration (z_echo/prox_margin) resolves on.
+                                           -- Bootstrapped at write by anchor-inheritance; re-clustered
+                                           -- by consolidation. NULL → global threshold (cold/sparse).
+    is_centre     INTEGER DEFAULT 0,       -- note medoid (lowest-residual stored fragment)
+    is_novel_peak INTEGER DEFAULT 0,       -- note's most-novel point (highest z)
+    strength      REAL DEFAULT 1.0,        -- bumped when a later fragment is PREDICTED by it
+    reinforced    INTEGER DEFAULT 0,       -- count of confirmed predictions (PRD: reinforcement)
+    created_at    TEXT,
+    last_seen     TEXT
+);
+
+-- Bookkeeping: which episodes the Write refine pass has processed (parallel to
+-- episode_consolidations). NOT truncated by rebuild — it is the "done" marker;
+-- the fragment rows themselves are rebuilt from FRAGMENTED events.
+CREATE TABLE IF NOT EXISTS episode_fragmentations (
+    episode_id    TEXT PRIMARY KEY,
+    user_id       TEXT NOT NULL,
+    fragmented_at TEXT NOT NULL,
+    n_fragments   INTEGER
+);
+
 CREATE TABLE IF NOT EXISTS relations (
     from_id             TEXT NOT NULL,      -- claim or concept id
     to_id               TEXT NOT NULL,
@@ -138,8 +187,8 @@ CREATE TABLE IF NOT EXISTS events (
     user_id      TEXT NOT NULL,
     ts           TEXT NOT NULL,
     run_id       TEXT,
-    type         TEXT NOT NULL,             -- ENCODED|CANONICALIZED|CONCEPT_CREATED|MERGED|
-                                            -- SPLIT|BRIDGED|RELATED|DECAYED|STRENGTHENED
+    type         TEXT NOT NULL,             -- ENCODED|FRAGMENTED|CANONICALIZED|CONCEPT_CREATED|
+                                            -- MERGED|SPLIT|BRIDGED|RELATED|DECAYED|STRENGTHENED
     payload_json TEXT NOT NULL
 );
 
@@ -202,6 +251,7 @@ CREATE INDEX IF NOT EXISTS idx_episodes_ts ON episodes(ts);
 CREATE INDEX IF NOT EXISTS idx_episodes_user ON episodes(user_id, ts);
 CREATE INDEX IF NOT EXISTS idx_claims_user ON claims(user_id);
 CREATE INDEX IF NOT EXISTS idx_concepts_user ON concepts(user_id);
+CREATE INDEX IF NOT EXISTS idx_fragments_user ON fragments(user_id, episode_id);
 
 -- PLAN.md §10: episodes are immutable — enforced mechanically, not by convention
 CREATE TRIGGER IF NOT EXISTS episodes_no_update BEFORE UPDATE ON episodes
@@ -217,6 +267,9 @@ _VEC_SCHEMA = [
     f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_sentences USING vec0(user_id TEXT PARTITION KEY, sent_key TEXT PRIMARY KEY, embedding FLOAT[{config.EMBED_DIM}])",
     f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_claims USING vec0(user_id TEXT PARTITION KEY, claim_id TEXT PRIMARY KEY, embedding FLOAT[{config.EMBED_DIM}])",
     f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_concepts USING vec0(user_id TEXT PARTITION KEY, concept_id TEXT PRIMARY KEY, embedding FLOAT[{config.EMBED_DIM}])",
+    # NOTE: there is deliberately NO vec_fragments table. A fragment's vector is its
+    # medoid sentence's vector, already in vec_sentences; fragment_pool/knn_fragments
+    # reference it via (episode_id, medoid_idx) instead of storing a second copy.
 ]
 
 _FTS_SCHEMA = "CREATE VIRTUAL TABLE IF NOT EXISTS episodes_fts USING fts5(episode_id UNINDEXED, user_id UNINDEXED, title, raw_text)"
@@ -252,9 +305,28 @@ def connect(db_path: str | Path | None = None) -> sqlite3.Connection:
     for stmt in _VEC_SCHEMA:
         conn.execute(stmt)
     conn.execute(_FTS_SCHEMA)
+    _migrate_add_columns(conn)
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     conn.commit()
     return conn
+
+
+# Idempotent additive column migrations for tables that predate a column. The
+# schema is otherwise CREATE-IF-NOT-EXISTS, which never adds a column to an
+# existing table — so a new column on an existing table is added here.
+_ADD_COLUMNS = {"fragments": {"cluster": "TEXT", "medoid_idx": "INTEGER"}}
+
+
+def _migrate_add_columns(conn: sqlite3.Connection) -> None:
+    # Reclaim the now-unused duplicate-vector index from pre-reference DBs. The
+    # fragment vector is referenced from vec_sentences (via medoid_idx); a rebuild
+    # repopulates fragments.medoid_idx. Harmless no-op once gone.
+    conn.execute("DROP TABLE IF EXISTS vec_fragments")
+    for table, cols in _ADD_COLUMNS.items():
+        have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for col, decl in cols.items():
+            if col not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 
 
 # ── Users (AUTH.md §2/§6) ─────────────────────────────────────────────────────
@@ -480,6 +552,20 @@ def count_episodes(conn: sqlite3.Connection, user_id: str) -> int:
                         (user_id,)).fetchone()["n"]
 
 
+def episode_sentences_with_vectors(conn: sqlite3.Connection, user_id: str,
+                                   episode_id: str) -> list[dict]:
+    """An episode's sentences in order, each with its W1-persisted embedding —
+    so the Write refine pass segments/routes over the vectors already stored, with
+    no re-embed. Returns [{idx, text, embedding(np)}] ordered by idx."""
+    rows = conn.execute(
+        """SELECT s.idx, s.text, v.embedding FROM episode_sentences s
+           JOIN vec_sentences v ON v.sent_key = s.episode_id || ':' || s.idx
+           WHERE s.episode_id = ? AND s.user_id = ? ORDER BY s.idx""",
+        (episode_id, user_id)).fetchall()
+    return [{"idx": r["idx"], "text": r["text"],
+             "embedding": _deserialize(r["embedding"])} for r in rows]
+
+
 def unconsolidated_episodes(conn: sqlite3.Connection, user_id: str) -> list[sqlite3.Row]:
     return conn.execute(
         """SELECT e.* FROM episodes e
@@ -670,12 +756,131 @@ def insert_relation(conn: sqlite3.Connection, user_id: str, from_id: str, to_id:
 
 
 def truncate_semantic(conn: sqlite3.Connection) -> None:
-    """Wipe the materialized semantic store (claims/concepts/relations + vectors)
-    for ALL users. Episodes, events, runs, and bookkeeping are untouched — this
-    is the first half of `rebuild`, which then re-applies the event log."""
+    """Wipe the materialized semantic store (claims/concepts/relations + the
+    Write-side fragments, plus their vectors) for ALL users. Episodes, events,
+    runs, and bookkeeping (episode_consolidations / episode_fragmentations) are
+    untouched — this is the first half of `rebuild`, which then re-applies the
+    event log (FRAGMENTED events rebuild the fragments)."""
     for table in ("claim_support", "concept_members", "relations",
-                  "claims", "concepts", "vec_claims", "vec_concepts"):
+                  "claims", "concepts", "vec_claims", "vec_concepts",
+                  "fragments"):
         conn.execute(f"DELETE FROM {table}")
+
+
+# ── Write-side working memory: fragments (called ONLY by write.apply_fragmented;
+#    PLAN.md §10 — derived store written via events, never at the API boundary) ──
+def fragment_id_for(user_id: str, episode_id: str, sent_start: int, sent_end: int) -> str:
+    """Deterministic fragment id: same (user, episode, span) → same id, so a
+    refine retry or a full event-log rebuild re-inserts the same row (ON CONFLICT
+    DO NOTHING) rather than minting a duplicate. Mirrors consolidate.claim_id_for."""
+    raw = f"{user_id}\x00{episode_id}\x00{sent_start}-{sent_end}".encode("utf-8")
+    return "frg_" + hashlib.md5(raw).hexdigest()[:24]
+
+
+def insert_fragment(conn: sqlite3.Connection, user_id: str, frag_id: str,
+                    episode_id: str, text: str, sent_start: int, sent_end: int,
+                    route: str, z: float | None, residual: float | None,
+                    weight: float | None, anchor_id: str | None,
+                    direction: str | None, is_centre: bool, is_novel_peak: bool,
+                    ts: str, strength: float = 1.0, cluster: str | None = None,
+                    medoid_idx: int | None = None) -> None:
+    """Insert one routed fragment. Idempotent on the deterministic id. NO fragment
+    vector is stored — the routing/retrieval vector is the medoid SENTENCE's vector,
+    already in vec_sentences and referenced via (episode_id, medoid_idx). `strength`
+    is the initial hold — a contradiction is born held STRONGER than a refine (PRD W6:
+    "store, held strongest, flag"). `cluster` is the region the per-cluster calibration
+    resolves on (NULL → global threshold)."""
+    conn.execute(
+        """INSERT INTO fragments
+             (id, user_id, episode_id, text, sent_start, sent_end, medoid_idx, route,
+              z, residual, weight, anchor_id, direction, cluster, is_centre,
+              is_novel_peak, strength, reinforced, created_at, last_seen)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+           ON CONFLICT(id) DO NOTHING""",
+        (frag_id, user_id, episode_id, text, sent_start, sent_end, medoid_idx, route,
+         z, residual, weight, anchor_id, direction, cluster, int(is_centre),
+         int(is_novel_peak), strength, ts, ts))
+
+
+def bump_fragment_strength(conn: sqlite3.Connection, user_id: str, frag_id: str,
+                           ts: str, delta: float) -> None:
+    """Reinforce a fragment a later one was PREDICTED by (PRD: a confirmed
+    prediction strengthens what predicted it, stores nothing new). No-op if the
+    anchor isn't a fragment row (e.g. it was itself PREDICTED and never stored)."""
+    conn.execute(
+        """UPDATE fragments SET strength = strength + ?, reinforced = reinforced + 1,
+           last_seen = ? WHERE id = ? AND user_id = ?""",
+        (delta, ts, frag_id, user_id))
+
+
+def fragment_pool(conn: sqlite3.Connection, user_id: str) -> list[dict]:
+    """All of a user's fragments as measure() corpus rows {id,text,embedding,
+    cluster}. This is the memory M the Write match pass routes against. `cluster`
+    is the region a fragment was assigned (anchor-inheritance at write, re-clustered
+    by consolidation); NULL → measure falls back to its local-neighbour spread and
+    decide() resolves the GLOBAL threshold (cold/sparse regions)."""
+    rows = conn.execute(
+        """SELECT f.id, f.text, f.cluster, v.embedding FROM fragments f
+           JOIN vec_fragments v ON v.frag_id = f.id
+           WHERE f.user_id = ?""", (user_id,)).fetchall()
+    return [{"id": r["id"], "text": r["text"],
+             "embedding": _deserialize(r["embedding"]), "cluster": r["cluster"]}
+            for r in rows]
+
+
+def knn_fragments(conn: sqlite3.Connection, user_id: str, embedding, k: int = 5) -> list[dict]:
+    """Nearest stored fragments to an embedding, within one user's partition."""
+    rows = conn.execute(
+        "SELECT frag_id, distance FROM vec_fragments WHERE embedding MATCH ? AND k = ? AND user_id = ?",
+        (serialize_float32([float(x) for x in embedding]), k, user_id)).fetchall()
+    out = []
+    for r in rows:
+        f = conn.execute("SELECT text, route, strength FROM fragments WHERE id = ? AND user_id = ?",
+                         (r["frag_id"], user_id)).fetchone()
+        if f:
+            out.append({"frag_id": r["frag_id"], "text": f["text"], "route": f["route"],
+                        "strength": f["strength"], "similarity": _sim(r["distance"])})
+    return out
+
+
+def fragment_count(conn: sqlite3.Connection, user_id: str) -> int:
+    return conn.execute("SELECT COUNT(*) AS n FROM fragments WHERE user_id = ?",
+                        (user_id,)).fetchone()["n"]
+
+
+def unfragmented_episodes(conn: sqlite3.Connection, user_id: str) -> list[sqlite3.Row]:
+    """Episodes the Write refine pass hasn't processed yet (the retry queue —
+    parallel to unconsolidated_episodes). Oldest first."""
+    return conn.execute(
+        """SELECT e.* FROM episodes e
+           LEFT JOIN episode_fragmentations f ON f.episode_id = e.id
+           WHERE f.episode_id IS NULL AND e.user_id = ? ORDER BY e.ts""",
+        (user_id,)).fetchall()
+
+
+def users_with_unfragmented(conn: sqlite3.Connection) -> list[str]:
+    return [r["user_id"] for r in conn.execute(
+        """SELECT DISTINCT e.user_id FROM episodes e
+           LEFT JOIN episode_fragmentations f ON f.episode_id = e.id
+           WHERE f.episode_id IS NULL ORDER BY e.user_id""")]
+
+
+def mark_fragmented(conn: sqlite3.Connection, user_id: str, episode_id: str,
+                    n_fragments: int) -> bool:
+    """Atomically CLAIM this episode for fragmentation. Returns True iff this
+    caller won the claim (inserted the marker), False if it already existed.
+
+    This is the race guard: refine_episode runs it as the FIRST statement of its
+    commit transaction, so when a background trigger and a refine_pending sweep
+    process the same episode concurrently, SQLite serialises the two writes and
+    only the winner gets True — the loser sees the committed marker, returns
+    False, and skips append_event/apply_fragmented, so no duplicate FRAGMENTED
+    event is logged and the (non-idempotent) reinforce bump runs exactly once."""
+    cur = conn.execute(
+        """INSERT INTO episode_fragmentations (episode_id, user_id, fragmented_at, n_fragments)
+           VALUES (?, ?, ?, ?) ON CONFLICT(episode_id) DO NOTHING""",
+        (episode_id, user_id, now_iso(), n_fragments))
+    return cur.rowcount > 0
 
 
 # ── Consolidation runs + bookkeeping ──────────────────────────────────────────

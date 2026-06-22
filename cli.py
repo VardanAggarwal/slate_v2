@@ -47,6 +47,11 @@ def main(argv=None):
                        help="loop until no unconsolidated episodes remain")
     add_user_arg(p_con, default=None)  # default: every user with pending episodes
 
+    p_ref = sub.add_parser("refine", help="Write-side refine pass (W2–W8): "
+                                          "fragment + route unfragmented episodes")
+    p_ref.add_argument("--max-episodes", type=int, default=200)
+    add_user_arg(p_ref, default=None)  # default: every user with pending episodes
+
     p_dig = sub.add_parser("digest", help="morning digest from recent events")
     p_dig.add_argument("--since-hours", type=int, default=36)
     p_dig.add_argument("--polish", action="store_true", help="LLM prose pass")
@@ -80,10 +85,14 @@ def main(argv=None):
             text = args.text
         else:
             text = sys.stdin.read()
+        from core import write
         conn = store.connect()
-        receipt = encode(conn, _resolve_user(conn, args.user), text,
-                         title=args.title, source="cli")
-        print(json.dumps(receipt, indent=2, ensure_ascii=False))
+        user_id = _resolve_user(conn, args.user)
+        receipt = encode(conn, user_id, text, title=args.title, source="cli")
+        # CLI is not latency-sensitive: run W2–W8 inline so a single encode yields
+        # the full pipeline (the MCP path defers this to a background thread).
+        refined = write.refine_episode(conn, user_id, receipt["episode_id"])
+        print(json.dumps({**receipt, "refine": refined}, indent=2, ensure_ascii=False))
 
     elif args.cmd == "replay":
         from core import store
@@ -102,10 +111,21 @@ def main(argv=None):
             out = {uid: store.stats(conn, uid) for uid in store.all_user_ids(conn)}
             print(json.dumps(out, indent=2))
 
+    elif args.cmd == "refine":
+        from core import store, write
+        conn = store.connect()
+        target = _resolve_user(conn, args.user) if args.user else None
+        print(json.dumps(write.refine_pending(conn, target,
+                                              max_episodes=args.max_episodes),
+                         indent=2, ensure_ascii=False))
+
     elif args.cmd == "consolidate":
-        from core import store
+        from core import store, write
         from core.consolidate import consolidate, consolidate_all_users
         conn = store.connect()
+        # Write-side catch-up before the sleep phase (cron's `consolidate --all`
+        # line thus also drains the refine queue — no separate cron entry needed).
+        write.refine_pending(conn, _resolve_user(conn, args.user) if args.user else None)
         if args.user:
             user_id = _resolve_user(conn, args.user)
             while True:

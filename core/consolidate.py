@@ -192,6 +192,13 @@ def apply_event(conn, user_id: str, type_: str, payload: dict) -> None:
     elif type_ == "DECAYED":
         store.update_concept(conn, user_id, p["concept_id"], state=p["state_to"])
 
+    elif type_ == "FRAGMENTED":
+        # Write-side working memory. Decided by the async refine pass (core/write);
+        # the applier here is what lets rebuild() re-derive fragments from the log
+        # (embeddings recomputed from the fragment text, like CANONICALIZED claims).
+        from core import write
+        write.apply_fragmented(conn, user_id, p)
+
     # ENCODED / BLUEPRINTED: episodic-side or log-only — nothing to materialize.
 
 

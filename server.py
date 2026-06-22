@@ -61,11 +61,15 @@ _job = {"running": False, "started_at": None, "finished_at": None,
 
 
 def _run_nightly(user_id: str, run_all: bool) -> None:
-    from core import store
+    from core import store, write
     from core.consolidate import consolidate
     from core.digest import digest
     conn = store.connect()
     try:
+        # Write-side catch-up first (W2–W8): refine any episodes the async trigger
+        # never reached or that HF/LLM failures left unfragmented, before they are
+        # consolidated. A note's refine failure leaves it for the next sweep.
+        write.refine_pending(conn, None if run_all else user_id)
         total = 0
         user_ids = store.users_with_unconsolidated(conn) if run_all else [user_id]
         for uid in user_ids:
