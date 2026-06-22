@@ -19,13 +19,36 @@ from core.encode import get_embedder, split_sentences
 SUPPORT_BUMP = 0.5   # claim re-encountered via a new episode at canonicalization
 ECHO_BUMP = 0.25     # claim echoed in an encode-time receipt
 
-# Canonicalization similarity bands
+# Canonicalization similarity bands — COLD-START FALLBACK ONLY (C2). The populated
+# path now routes through the predictor spine (measure/decide, spread-relative);
+# these absolute-cosine cuts are used only when a new claim's neighbourhood is too
+# small to estimate a region spread (< WARMUP_MIN_CORPUS), the same "trust the
+# prior/absolute rule when cold" stance as C11.
 CANON_AUTO_SAME = 0.92   # >= : same claim, no LLM needed
 CANON_LLM_BAND = 0.75    # [band, auto) : ask the LLM; below: new claim
 
-# Bridge candidate band (centroid cosine): close enough to relate,
-# far enough that the connection is non-obvious
-BRIDGE_LOW, BRIDGE_HIGH = 0.45, 0.80
+# C2 dedup calibration: the predictor route over a new claim vs its neighbourhood
+# of existing canonical claims. PREDICTED→same (echo of an existing claim),
+# AMBIGUOUS→uncertain (LLM splits paraphrase from a genuinely distinct/contra
+# claim), NOVEL→new. Spread-relative + scopeable, fitted at C12 and pushed down —
+# never a baked similarity constant.
+#
+# DEDUP_Z_ECHO is calibrated to the claim-dedup z scale, which differs sharply
+# from the fragment-write scale: a claim's neighbourhood at canonicalization is a
+# very TIGHT cluster of near-duplicates, so its σ is tiny and z is near-binary —
+# an exact/true duplicate sits at z≈0 while anything genuinely distinct jumps to
+# z≳5 (measured on the live corpus, a clean gap in between). So the auto-"same"
+# cut is a small POSITIVE z (reconstructs about as tightly as the region's own
+# members), not the Write path's strongly-negative Z_ECHO. The wide gap makes the
+# exact value robust anywhere in ~[0.5, 4.5]; the rest escalates to the LLM.
+DEDUP_Z_ECHO = 1.0
+DEDUP_CALIBRATION = {"z_echo": DEDUP_Z_ECHO, "prox_margin": predict.PROX_MARGIN,
+                     "per_cluster": {}}
+
+# Bridge candidate band — C5 now a medoid-vs-region RESIDUAL band (predictor
+# spine), not a centroid cosine: close enough to relate (residual not too high),
+# enough residual that the link is non-obvious (not a near-duplicate concept).
+BRIDGE_RES_LOW, BRIDGE_RES_HIGH = 0.40, 0.85
 BRIDGE_MAX_VERIFY = 5
 
 CANON_CHUNK = 20         # uncertain pairs per LLM call
@@ -371,6 +394,63 @@ def _existing_canon(conn, user_id: str, episode_id: str) -> list[tuple[str, str]
 
 
 # ── Step 3: claim canonicalization ────────────────────────────────────────────
+def _dedup_route(conn, user_id: str, raw_claims: list[dict], embs,
+                 calibration: dict) -> tuple[list[tuple], list[tuple]]:
+    """C2 — route each new claim same / uncertain / new against its neighbourhood
+    of existing canonical claims, via the predictor spine (measure → decide),
+    replacing the raw-cosine CANON_AUTO_SAME/CANON_LLM_BAND cuts.
+
+    For each new claim we gather its STAT_K nearest existing claims (their concept
+    ids become the `cluster` field, so the z is measured against the right region's
+    self-cohesion) and route:
+      PREDICTED → same   (echo: reconstructs at least as tightly as the region)
+      AMBIGUOUS → LLM    (attached but looser — paraphrase vs distinct/contra)
+      NOVEL     → new
+    A neighbourhood too small to estimate a spread falls back to the absolute
+    cosine bands (the cold-start stance of C11). Returns (decided, uncertain),
+    same shape the caller consumed before."""
+    decided, uncertain = [], []
+    for c, emb in zip(raw_claims, embs):
+        hits = store.knn_claims(conn, user_id, emb, k=predict.STAT_K)
+        if not hits:
+            decided.append((c, "new", None))
+            continue
+        corpus = []
+        for h in hits:
+            he = store.claim_embedding(conn, user_id, h["claim_id"])
+            if he is not None:
+                corpus.append({"id": h["claim_id"], "text": h["text"],
+                               "embedding": he,
+                               "cluster": _claim_concept(conn, user_id, h["claim_id"])})
+        best = {"claim_id": hits[0]["claim_id"], "text": hits[0]["text"],
+                "similarity": hits[0]["similarity"]}
+        # A spread-relative z is only meaningful over a populated neighbourhood:
+        # at canonicalization claims carry no concept yet, so the per-cluster
+        # baselines are empty and the region spread comes from `corpus_prior`,
+        # which returns a real residual distribution only above SPAN_K members
+        # (below that it yields a generic default that makes z meaningless). So
+        # route through the spine only with > SPAN_K neighbours; a thinner region
+        # is "cold" and trusts the absolute-cosine rule (the C11 stance).
+        if len(corpus) <= predict.SPAN_K:              # cold region → absolute rule
+            if best["similarity"] >= CANON_AUTO_SAME:
+                decided.append((c, "same", best["claim_id"]))
+            elif best["similarity"] >= CANON_LLM_BAND:
+                uncertain.append((c, best))
+            else:
+                decided.append((c, "new", None))
+            continue
+        m = predict.measure([{"text": c["text"], "embedding": emb}], corpus)[0]
+        route = predict.decide([m], calibration)["fragments"][0]["route"]
+        if route == predict._PREDICTED and m["anchor_id"]:
+            decided.append((c, "same", m["anchor_id"]))
+        elif route == predict._AMBIGUOUS and m["anchor_id"]:
+            uncertain.append((c, {"claim_id": m["anchor_id"],
+                                  "text": m["anchor_text"]}))
+        else:
+            decided.append((c, "new", None))
+    return decided, uncertain
+
+
 def _canonicalize_episode(conn, user_id: str, run_id: str, episode, bp: dict,
                           bp_payload: dict) -> tuple[list[str], float]:
     """Dedupe each blueprint claim against existing canonical claims.
@@ -395,16 +475,8 @@ def _canonicalize_episode(conn, user_id: str, run_id: str, episode, bp: dict,
     embs = get_embedder().encode([c["text"] for c in raw_claims],
                                  normalize_embeddings=True, show_progress_bar=False)
 
-    decided, uncertain = [], []
-    for c, emb in zip(raw_claims, embs):
-        hits = store.knn_claims(conn, user_id, emb, k=3)
-        best = hits[0] if hits else None
-        if best and best["similarity"] >= CANON_AUTO_SAME:
-            decided.append((c, "same", best["claim_id"]))
-        elif best and best["similarity"] >= CANON_LLM_BAND:
-            uncertain.append((c, best))
-        else:
-            decided.append((c, "new", None))
+    decided, uncertain = _dedup_route(conn, user_id, raw_claims, embs,
+                                      DEDUP_CALIBRATION)
 
     cost = 0.0
     for start in range(0, len(uncertain), CANON_CHUNK):
@@ -442,6 +514,49 @@ def _canonicalize_episode(conn, user_id: str, run_id: str, episode, bp: dict,
     return episode_claims, cost
 
 
+# ── C4: concept spread test (split candidacy + medoid re-anchor) ──────────────
+CONCEPT_BIMODAL_MARGIN = 0.15   # within-blob cohesion must beat the cross-blob
+                                # gap by this for a concept to read as bimodal
+
+
+def _spread_is_bimodal(V, margin: float = CONCEPT_BIMODAL_MARGIN) -> bool:
+    """measure()-style spread test: do the member vectors fall into TWO separated
+    blobs? Take the least-similar member pair as poles, assign each member to its
+    nearer pole, and call it bimodal when each side is internally tighter than the
+    cross-side similarity by `margin` (two ideas wearing one concept → SPLIT
+    candidate). Pure numpy (no sklearn — prod-safe), deterministic."""
+    import numpy as np
+    n = V.shape[0]
+    if n < 4:                       # too few members to claim two ideas
+        return False
+    G = V @ V.T
+    i, j = divmod(int(np.argmin(G)), n)     # the two most-dissimilar members
+    side = G[i] >= G[j]                      # nearer to pole i?
+    a, b = V[side], V[~side]
+    if a.shape[0] < 2 or b.shape[0] < 2:
+        return False
+    within = 0.5 * (float((a @ a.T).mean()) + float((b @ b.T).mean()))
+    between = float((a @ b.T).mean())
+    return (within - between) > margin
+
+
+def _concept_geometry(conn, user_id: str, concept_id: str) -> dict:
+    """C4 geometry of a concept: its medoid member text (the re-anchored core) and
+    a coarse shape ('bimodal' → SPLIT candidate, else 'cohesive'). Empty concept →
+    neutral defaults."""
+    import numpy as np
+    rows = _members_with_emb(conn, user_id,
+                             store.concept_member_ids(conn, user_id, concept_id))
+    if not rows:
+        return {"representative": "", "shape": "cohesive"}
+    V = np.vstack([r["embedding"] for r in rows])
+    med = _medoid_vec(V)
+    rep = next((r["text"] for r in rows if np.array_equal(r["embedding"], med)),
+               rows[0]["text"])
+    return {"representative": rep,
+            "shape": "bimodal" if _spread_is_bimodal(V) else "cohesive"}
+
+
 # ── Step 4: concept pass (the judgment call) ──────────────────────────────────
 def _concept_pass(conn, user_id: str, run_id: str, new_claim_ids: list[str],
                   ts: str) -> float:
@@ -453,6 +568,28 @@ def _concept_pass(conn, user_id: str, run_id: str, new_claim_ids: list[str],
         cost += _concept_pass_chunk(conn, user_id, run_id,
                                     unique_ids[start:start + CONCEPT_CHUNK], ts)
     return cost
+
+
+# C3: a claim is a plausible member of a concept when it reconstructs against that
+# concept's members about as well as the members do themselves — i.e. its residual
+# z (measured vs the concept as its own cluster) sits within the region's spread.
+# Spread-relative, replacing the flat `similarity >= 0.40` floor. A concept too
+# thin to estimate a spread (<= SPAN_K members) is "cold" → absolute-cosine rule.
+CONCEPT_MEMBERSHIP_Z = 2.0      # within ~2σ of the concept's own cohesion
+CONCEPT_MEMBERSHIP_SIM = 0.40   # cold-concept cosine fallback (legacy floor)
+
+
+def _membership_z(conn, user_id: str, emb, claim_text: str,
+                  concept_id: str) -> float | None:
+    """C3 — the claim's residual z against `concept_id`'s members as their own
+    cluster (measure() nearest-cluster). None when the concept is too thin for a
+    spread estimate (caller falls back to cosine)."""
+    rows = _members_with_emb(conn, user_id,
+                             store.concept_member_ids(conn, user_id, concept_id))
+    if len(rows) <= predict.SPAN_K:
+        return None
+    corpus = [{**r, "cluster": concept_id} for r in rows]
+    return predict.measure([{"text": claim_text, "embedding": emb}], corpus)[0]["z"]
 
 
 def _concept_pass_chunk(conn, user_id: str, run_id: str, new_claim_ids: list[str],
@@ -470,7 +607,10 @@ def _concept_pass_chunk(conn, user_id: str, run_id: str, new_claim_ids: list[str
         emb = store.claim_embedding(conn, user_id, cid)
         if emb is not None:
             for hit in store.knn_concepts(conn, user_id, emb, k=3):
-                if hit["similarity"] >= 0.40:
+                z = _membership_z(conn, user_id, emb, row["text"], hit["id"])
+                plausible = (z <= CONCEPT_MEMBERSHIP_Z) if z is not None \
+                    else (hit["similarity"] >= CONCEPT_MEMBERSHIP_SIM)
+                if plausible:
                     nearby[hit["id"]] = hit
 
     concepts_ctx = []
@@ -478,8 +618,16 @@ def _concept_pass_chunk(conn, user_id: str, run_id: str, new_claim_ids: list[str
         member_ids = store.concept_member_ids(conn, user_id, c["id"])[:CONCEPT_CONTEXT_MEMBERS]
         members = [{"id": m, "text": (store.get_claim(conn, user_id, m) or {"text": ""})["text"]}
                    for m in member_ids]
+        # C4 spread test: a measure()-based geometric read of the concept, surfaced
+        # to steer the judgment call — `representative` re-anchors the concept to
+        # its medoid core (the most central member, robust to a drifted mean), and
+        # `geometry: bimodal` flags a concept whose members fall into two separated
+        # blobs (a SPLIT candidate). The LLM still decides; geometry only informs.
+        geom = _concept_geometry(conn, user_id, c["id"])
         concepts_ctx.append({"id": c["id"], "label": c["label"],
-                             "canonical": c["canonical"], "members": members})
+                             "canonical": c["canonical"],
+                             "representative": geom["representative"],
+                             "geometry": geom["shape"], "members": members})
 
     prompt = PROMPT_CONCEPT.replace(
         "{new_claims}", json.dumps(new_claims, ensure_ascii=False, indent=1)).replace(
@@ -750,7 +898,22 @@ def _check_integrity(conn, user_id: str, run_id: str, claim_ids: list[str],
 
 
 # ── Step 6: latent bridges (embedding math + small verify calls) ──────────────
+def _medoid_vec(V):
+    """Representative core of a member set (W7): the member nearest all others
+    (max summed cosine). One member → itself."""
+    import numpy as np
+    if V.shape[0] == 1:
+        return V[0]
+    return V[int(np.argmax((V @ V.T).sum(axis=1)))]
+
+
 def _bridges(conn, user_id: str, run_id: str, ts: str) -> float:
+    """C5 — propose bridges between concepts whose MEDOIDS sit in a RESIDUAL band:
+    close enough to relate (the one's core is partly reconstructable from the
+    other's region), far enough that the link is non-obvious (a real residual
+    remains — not a near-duplicate concept). Spread-relative via the predictor
+    spine (`residuals_against`), replacing the centroid-cosine band. The LLM still
+    confirms each candidate (direction/meaning is its job, not the geometry's)."""
     import numpy as np
     concepts = store.all_concepts(conn, user_id)
     if len(concepts) < 2:
@@ -759,28 +922,32 @@ def _bridges(conn, user_id: str, run_id: str, ts: str) -> float:
     existing = {(r["from_id"], r["to_id"]) for r in
                 conn.execute("SELECT from_id, to_id FROM relations WHERE user_id = ?",
                              (user_id,))}
-    vecs = {}
+    members, medoids = {}, {}
     for c in concepts:
-        row = conn.execute(
-            "SELECT embedding FROM vec_concepts WHERE concept_id = ? AND user_id = ?",
-            (c["id"], user_id)).fetchone()
-        if row:
-            vecs[c["id"]] = store._deserialize(row["embedding"])
+        rows = _members_with_emb(conn, user_id,
+                                 store.concept_member_ids(conn, user_id, c["id"]))
+        if rows:
+            V = np.vstack([r["embedding"] for r in rows])
+            members[c["id"]] = V
+            medoids[c["id"]] = _medoid_vec(V)
 
     candidates = []
-    ids = sorted(vecs.keys())
+    ids = sorted(medoids.keys())
     for i, a in enumerate(ids):
         for b in ids[i + 1:]:
             if (a, b) in existing or (b, a) in existing:
                 continue
-            sim = float(np.dot(vecs[a], vecs[b]))
-            if BRIDGE_LOW <= sim <= BRIDGE_HIGH:
-                candidates.append((sim, a, b))
-    candidates.sort(reverse=True)
+            # symmetric: how much of each core the OTHER region can't reconstruct
+            r_ab = float(predict.residuals_against(medoids[a], members[b])[0])
+            r_ba = float(predict.residuals_against(medoids[b], members[a])[0])
+            res = 0.5 * (r_ab + r_ba)
+            if BRIDGE_RES_LOW <= res <= BRIDGE_RES_HIGH:
+                candidates.append((res, a, b))
+    candidates.sort()                       # most-related (lowest residual) first
 
     cost = 0.0
     by_id = {c["id"]: c for c in concepts}
-    for sim, a, b in candidates[:BRIDGE_MAX_VERIFY]:
+    for res, a, b in candidates[:BRIDGE_MAX_VERIFY]:
         ca, cb = by_id[a], by_id[b]
         sample = lambda cid: json.dumps([
             (store.get_claim(conn, user_id, m) or {"text": ""})["text"]
@@ -794,7 +961,7 @@ def _bridges(conn, user_id: str, run_id: str, ts: str) -> float:
             if result["json"].get("bridge"):
                 with conn:
                     emit(conn, user_id, run_id, "BRIDGED", {
-                        "a": a, "b": b, "score": round(sim, 3),
+                        "a": a, "b": b, "score": round(1.0 - res, 3),
                         "rationale": result["json"].get("rationale", ""), "ts": ts})
         except llm.LLMError:
             break  # bridges are best-effort; never fail the run over them

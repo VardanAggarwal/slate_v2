@@ -781,3 +781,114 @@ def test_episodes_are_immutable(conn):
         conn.execute("UPDATE episodes SET title = 'x' WHERE id = ?", (ep_id,))
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute("DELETE FROM episodes WHERE id = ?", (ep_id,))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# C2–C5 — measure()-based consolidation upgrades (synthetic planted geometry).
+# These assert the GEOMETRY the upgrades route on (the plan §3 test column),
+# deterministically and offline; the LLM/route SEMANTICS stay covered by the
+# fake_llm consolidate() tests above.
+# ══════════════════════════════════════════════════════════════════════════════
+import numpy as np  # noqa: E402
+
+import core.consolidate as Cmod  # noqa: E402
+from core import predict  # noqa: E402
+
+
+def _unit(v):
+    return v / np.linalg.norm(v)
+
+
+def _topic(seed):
+    return _unit(np.random.default_rng(seed).standard_normal(384))
+
+
+def _near(direction, seed, noise=0.04):
+    return _unit(direction + noise * np.random.default_rng(seed).standard_normal(384))
+
+
+def _plant_claims(conn, vecs, ts="2026-01-01T00:00:00Z", prefix="c"):
+    """Insert claims with controlled vectors; returns their ids."""
+    ids = []
+    for i, v in enumerate(vecs):
+        cid = f"{prefix}{i}"
+        store.insert_claim(conn, UID, cid, f"{prefix} claim {i}", v, ts)
+        ids.append(cid)
+    return ids
+
+
+# ── C2: dedup routes a planted dup → same, a distinct claim → new ─────────────
+def test_c2_dedup_route_collapses_dup_keeps_distinct(conn):
+    topic = _topic(1)
+    # a populated region (> SPAN_K) so the spread-relative path engages
+    members = [_near(topic, 100 + i) for i in range(10)]
+    ids = _plant_claims(conn, members, prefix="m")
+
+    dup = [{"text": "near dup of m0", "verbatim": None, "cluster": ""}]
+    dup_emb = [_near(topic, 100, noise=0.005)]          # ~ identical to m0
+    decided, uncertain = Cmod._dedup_route(conn, UID, dup, dup_emb,
+                                           Cmod.DEDUP_CALIBRATION)
+    assert decided and decided[0][1] == "same"           # collapsed onto a member
+    assert decided[0][2] in ids
+
+    far = [{"text": "unrelated", "verbatim": None, "cluster": ""}]
+    far_emb = [_topic(999)]                               # orthogonal topic
+    decided2, _ = Cmod._dedup_route(conn, UID, far, far_emb, Cmod.DEDUP_CALIBRATION)
+    assert decided2 and decided2[0][1] == "new"          # genuinely distinct → new
+
+
+# ── C3: nearest-cluster membership — in-topic plausible, off-topic not ────────
+def test_c3_membership_z_separates_in_and_off_topic(conn):
+    topic = _topic(2)
+    members = [_near(topic, 200 + i) for i in range(10)]
+    mids = _plant_claims(conn, members, prefix="t")
+    cid = "cpt_t"
+    store.insert_concept(conn, UID, cid, "topic", "the topic", "2026-01-01T00:00:00Z")
+    for m in mids:
+        store.add_concept_member(conn, UID, cid, m)
+
+    z_in = Cmod._membership_z(conn, UID, _near(topic, 200, 0.04), "in", cid)
+    z_off = Cmod._membership_z(conn, UID, _topic(888), "off", cid)
+    assert z_in is not None and z_off is not None
+    assert z_in <= Cmod.CONCEPT_MEMBERSHIP_Z < z_off     # in-topic fits, off-topic doesn't
+
+
+# ── C4: spread test — bimodal splits, cohesive doesn't; medoid is central ─────
+def test_c4_spread_is_bimodal():
+    a, b = _topic(3), _topic(4)                          # two separated blobs
+    V = np.vstack([_near(a, 300 + i) for i in range(5)] +
+                  [_near(b, 400 + i) for i in range(5)])
+    assert Cmod._spread_is_bimodal(V) is True
+    one = np.vstack([_near(a, 500 + i) for i in range(10)])
+    assert Cmod._spread_is_bimodal(one) is False
+
+
+def test_c4_medoid_is_a_central_member():
+    a = _topic(5)
+    tight = [_near(a, 600 + i, noise=0.03) for i in range(8)]
+    outlier = _unit(a + 0.9 * _topic(6))                 # far drifted member
+    V = np.vstack(tight + [outlier])
+    med = Cmod._medoid_vec(V)
+    # the medoid is one of the tight members, never the outlier
+    assert not np.array_equal(med, V[-1])
+    assert float(med @ outlier) < float(med @ V[0])
+
+
+# ── C5: bridge residual band — related→bridge, near-dup/unrelated→no ──────────
+def test_c5_bridge_residual_band():
+    a = _topic(7)
+    region_a = np.vstack([_near(a, 700 + i) for i in range(6)])
+
+    # near-duplicate concept: medoid ~ inside region_a → residual below band
+    dup_medoid = _near(a, 700, noise=0.01)
+    r_dup = float(predict.residuals_against(dup_medoid, region_a)[0])
+    assert r_dup < Cmod.BRIDGE_RES_LOW
+
+    # unrelated concept: orthogonal medoid → residual above band
+    r_far = float(predict.residuals_against(_topic(770), region_a)[0])
+    assert r_far > Cmod.BRIDGE_RES_HIGH
+
+    # related-but-distinct: partial overlap → residual inside the band
+    related = _unit(0.5 * a + 0.5 * _topic(771))
+    r_rel = float(predict.residuals_against(related, region_a)[0])
+    assert Cmod.BRIDGE_RES_LOW <= r_rel <= Cmod.BRIDGE_RES_HIGH

@@ -1,0 +1,36 @@
+C-GATE small-batch | system=slate B=2000 gold=14 batch=15ep run=run_01KTXJDNW0EM2Z2TDNMYR9SWK4
+
+state S0: {'claims': 2040, 'concepts': 326, 'relations': 396}
+
+[1/5] before SR@B …
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 7520.99it/s]
+  [before] SR@B=42.9%  tail=40%  meanctx=704tok  cost=$0.1005
+
+[2/5] rolling back run_01KTXJDNW0EM2Z2TDNMYR9SWK4 (frees 15 episodes) …
+  freed=15 events_applied=5756 pending=15  state S_minus: {'claims': 1881, 'concepts': 311, 'relations': 365}
+
+[3/5] consolidate(max_episodes=15) — re-derive from raw …
+Loading weights:   0%|          | 0/106 [00:00<?, ?it/s]Loading weights: 100%|██████████| 106/106 [00:00<00:00, 5281.24it/s]
+  {'status': 'ok', 'run_id': 'run_01KVRDB1R004PA1NNWZBYB85SZ', 'episodes': 15, 'skipped': [], 'claims_touched': 150, 'cost': 0.4563}
+  state S1: {'claims': 2004, 'concepts': 334, 'relations': 413}
+
+[4/5] after SR@B …
+  [after] SR@B=50.0%  tail=40%  meanctx=737tok  cost=$0.1047
+
+  ΔSR@B = +7.1%   forgetting_rate = 0.0%
+  regressions (passed→fail): none
+  gains (fail→pass):         ['g13']
+
+[5/5] reversibility: rollback run_01KVRDB1R004PA1NNWZBYB85SZ …
+  state after rollback: {'claims': 1881, 'concepts': 311, 'relations': 365}   == S_minus? True
+
+============================================================
+C-GATE VERDICT (small batch)
+  ΔSR@B >= 0           : PASS (+7.1%)
+  forgetting == 0      : PASS (0.0%)
+  run reversible       : PASS
+  -> GATE PASS
+============================================================
+
+cost=$0.6616  calls=96  providers={'claude': 96}  723s
