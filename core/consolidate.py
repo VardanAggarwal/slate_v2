@@ -860,7 +860,59 @@ def _demote_background(conn, user_id: str, run_id: str, claim_ids: list[str],
         if not store.claim_in_any_concept(conn, user_id, cid):
             continue                                # no theme to fold into
         if store.claim_support_count(conn, user_id, cid) - 1 >= BACKGROUND_MIN_REPEATS:
-            emit(conn, user_id, run_id, "BACKGROUNDED", {"claim_id": cid, "ts": ts})
+            emit(conn, user_id, run_id, "BACKGROUNDED",
+                 {"claim_id": cid, "reason": "recurrent", "ts": ts})
+
+
+# C13 — retrieval-signal consumption. Times a claim's source episode appeared as a
+# retrieval CANDIDATE before a never-fetched claim is demoted. The floor protects
+# the rare-but-correct claim that is merely quiet (PRD's one caution on usage).
+RETRIEVAL_EXPOSURE_MIN = 3
+
+
+def _consume_retrieval_signals(conn, user_id: str, run_id: str, ts: str) -> None:
+    """Fold logged retrieval usage back into salience — the loop closes here (PRD
+    §Consolidation). Bridge: a signal's fragment ids → their source episode → the
+    claims derived from it. A claim whose episodes were candidates ≥
+    RETRIEVAL_EXPOSURE_MIN times yet NEVER fetched is demoted to background (its
+    theme carries it). Idempotent: recomputed from ALL signals; BACKGROUNDED is a
+    SET, guarded so it fires once. Promote / un-demote is deferred — "needed"
+    cannot be known without the gold/SR@B signal, and usage is logged, never the
+    predictor (rare-but-correct must not be suppressed for being quiet)."""
+    from collections import Counter
+    sigs = store.events_since(conn, user_id, 0, types=["RETRIEVAL_SIGNAL"])
+    if not sigs:
+        return
+    ep_of: dict[str, str | None] = {}
+
+    def episode(fid: str):
+        if fid not in ep_of:
+            ep_of[fid] = store.fragment_episode(conn, user_id, fid)
+        return ep_of[fid]
+
+    seed_ep, fetched_ep = Counter(), Counter()
+    for s in sigs:
+        p = json.loads(s["payload_json"])
+        fetched = p.get("fetched", [])
+        for fid in fetched:
+            if (ep := episode(fid)):
+                fetched_ep[ep] += 1
+        for fid in list(fetched) + p.get("dropped", []):   # seed = fetched ∪ dropped
+            if (ep := episode(fid)):
+                seed_ep[ep] += 1
+
+    claim_seed, claim_fetched = Counter(), Counter()
+    for ep, n in seed_ep.items():
+        for cid in store.claims_for_episode(conn, user_id, ep):
+            claim_seed[cid] += n
+            claim_fetched[cid] += fetched_ep.get(ep, 0)
+
+    for cid, seen in claim_seed.items():
+        if seen >= RETRIEVAL_EXPOSURE_MIN and claim_fetched[cid] == 0:
+            claim = store.get_claim(conn, user_id, cid)
+            if claim and not claim["background"]:
+                emit(conn, user_id, run_id, "BACKGROUNDED",
+                     {"claim_id": cid, "reason": "exposed_never_fetched", "ts": ts})
 
 
 # C7 — safe forget. Floor below which the guard returns cold_start anyway; an
@@ -959,8 +1011,10 @@ def consolidate(conn, user_id: str, max_episodes: int = 50) -> dict:
         # C10: flag derived claims that aren't faithful to their raw source.
         _check_integrity(conn, user_id, run_id, new_claim_ids, ts)
         # C9: fold recurrent (now-background) claims into their theme.
+        # C13: fold logged retrieval usage back into salience (close the loop).
         with conn:
             _demote_background(conn, user_id, run_id, new_claim_ids, ts)
+            _consume_retrieval_signals(conn, user_id, run_id, ts)
         cost += _bridges(conn, user_id, run_id, ts)
         with conn:
             _decay_strengthen(conn, user_id, run_id, episodes, ts)

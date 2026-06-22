@@ -179,8 +179,8 @@ relabel-only decay, averaging merges, writes-only.
 | C9 | **Demote to background** — ✅ BUILT (2026-06-22) | repeated low-residual item over time | `_demote_background`: a claim re-encountered across ≥ `BACKGROUND_MIN_REPEATS` further episodes that belongs to a concept → `BACKGROUNDED` event sets a `background` flag (orthogonal to C8 `status`). recall demotes its standalone score (`×BACKGROUND_SCORE_FACTOR`, 🌫️ signal); the theme surfaces instead. Trigger is high recurrence (the opposite of rare) + a theme to fold into, so it never suppresses rare-correct. | — | ✅ 5 cases: folds recurrent member / skips rare / requires a theme / demoted at retrieval / survives rebuild |
 | C10 | **Store-integrity check** — ✅ BUILT (2026-06-22) | derived claim vs its source episode | `_check_integrity` routes each derived claim against its source-episode sentences (stored vectors, no embed call): PREDICTED → grounded/pass; NOVEL → ungrounded FLAG; AMBIGUOUS → resolver, contradicts-source FLAG (geometry can't see flipped polarity). `INTEGRITY_FLAGGED` is log-only (a review signal, NOT a headline metric — PRD). | — | ✅ 4 cases: faithful passes / ungrounded flagged / contradiction flagged (route+stance mocked) / ambiguous-but-faithful passes |
 | C11 | **Gauge saturation + graduate region from cold-start** | region spread stability | `compute_baselines` maturity check | no cold-start handling at all | region with < graduation count → trusts prior; matured region → trusts local |
-| C12 | **Fit calibration + push down** | SR@B over candidate `z_echo`/`prox_margin` | calibration persistence + fit loop | hard-coded `Z_ECHO=-3.5` | fitted calibration beats default on frozen SR@B; pushed to Write/Retrieve |
-| C13 | **Consume retrieval signals** | — | promote/demote/resolve from R8 events | consolidation sees writes only | salient-but-never-retrieved demoted; dropped-but-needed promoted; rare-correct NOT suppressed |
+| C12 | **Fit calibration + push down** — ◐ MECHANISM BUILT (2026-06-22) | SR@B over candidate `z_echo`/`value_floor` | Persistence: `calibration_profiles` table (per user; NOT event-derived/truncated) + `core/calibration.py` (`merged`/`push`); `retrieve.assemble_context` loads the fitted profile over its defaults by default. Fit loop = `eval/fit_stop.py --push` (sweeps `value_floor` vs frozen SR@B, persists the best). | hard-coded constants | ✅ persistence/merge/push/per-user/retrieve-pickup (6 cases offline). **Fit RUN deferred** (SR@B/quota-gated) |
+| C13 | **Consume retrieval signals** — ✅ BUILT (2026-06-22) | — | `_consume_retrieval_signals`: bridges signal fragment-ids → source episode → its claims; a claim exposed as a candidate ≥ `RETRIEVAL_EXPOSURE_MIN`× yet NEVER fetched → demoted to background (theme carries it). Idempotent (recomputed from all signals; BACKGROUNDED is a SET). Exposure floor protects rare-but-quiet. | consolidation sees writes only | ✅ 4 cases: demotes exposed-never-fetched / keeps fetched / spares rare-quiet / survives rebuild. NOTE: promote+un-demote deferred ("needed" needs gold/SR@B); bridge is episode-level (lossy) |
 | C14 | **Run rollback + re-derive from raw** — ✅ BUILT (2026-06-22) | — | `consolidate.rollback_run(run_id)`: flag run `rolled_back` (events kept on disk for audit), free its episodes, re-materialize from the active log. `store.ACTIVE_RUN_PREDICATE` excludes rolled-back runs from `rebuild` AND the `_existing_*` re-derive guards → re-consolidation re-derives freed episodes from raw, ignoring the poisoned events. NO events-schema change (reuses `consolidation_runs.status`). | log-replay only | ✅ `test_consolidate.py` 4 cases: full reversal to pre-run state; events survive but unmaterialized; re-consolidate re-derives (blueprint re-called, not reused); unknown-run noop |
 
 **Stage gate (C):** ΔSR@B ≥ 0 on the frozen set AND **catastrophic-forgetting rate = 0**
@@ -245,11 +245,12 @@ P4  RETRIEVE — spike then build ..... ◐ BUILT (structure complete; tuning de
 P5  CONSOLIDATE safety + signals .... ◐ IN PROGRESS — safety core ✅: C14 rollback + C6/C7 reconstruction-guard
                                      merge/forget + C8 conflict versioning (margin-before-flip). 16 invariant/
                                      wiring tests; geometry in test_wrappers; resolver direction mocked.
-                                     C1 revisit-order ✅ + C10 store-integrity ✅ + C9 background-decay ✅ (offline).
-                                     LEFT: C13 (retrieval signals — needs frag↔claim bridge), C11 (cold-start
-                                     graduation) + C12 (calibration fit) — both touch the calibrated predictor and
-                                     want the SR@B loop (quota-gated). SR@B + forgetting-rate credit deferred to the
-                                     quota window (as P3/P4). EXIT: C-gate (ΔSR@B≥0, forgetting=0, rollback works)
+                                     C1 + C10 + C9 + C13 ✅ + C12 mechanism ✅ (persistence/push-down; fit RUN
+                                     deferred). LEFT: C11 (cold-start graduation — touches calibrated predictor),
+                                     and the SR@B-gated RUNS: the value_floor fit (C12), the clean baseline, and the
+                                     ΔSR@B/forgetting C-gate. All gated on API budget (eval infra ready: haiku
+                                     answerer, hardened fit_stop, /tmp/slate_eval.db w/ 972 frags, 44-cell cache).
+                                     EXIT: C-gate (ΔSR@B≥0, forgetting=0, rollback works)
 P6  Frontier (cross-cutting §4) ..... EXIT: redaction/isolation/write-during-consolidate tests green
 ```
 

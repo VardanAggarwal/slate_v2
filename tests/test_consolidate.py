@@ -552,6 +552,77 @@ def test_revisit_order_puts_surprise_first():
     assert order == ["e2", "e3", "e1"]  # contradiction first, then by novelty desc
 
 
+# ── C13: consume retrieval signals — demote exposed-but-never-fetched ─────────
+from core.consolidate import _consume_retrieval_signals, RETRIEVAL_EXPOSURE_MIN  # noqa: E402
+
+
+def _seed_frag(conn, frag_id, episode_id):
+    conn.execute(
+        "INSERT INTO fragments (id, user_id, episode_id, text) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(id) DO NOTHING", (frag_id, UID, episode_id, "frag text"))
+
+
+def _claim_on_episode(conn, claim_id, episode_id, ts):
+    emit(conn, UID, "seed", "CANONICALIZED",
+         {"action": "new", "claim_id": claim_id, "text": S1,
+          "episode_id": episode_id, "verbatim": S1, "cluster": "main", "ts": ts})
+
+
+def _signal(conn, *, fetched, dropped):
+    store.append_event(conn, UID, "RETRIEVAL_SIGNAL",
+                       {"query": "q", "fetched": fetched, "dropped": dropped,
+                        "cut_for_budget": False})
+
+
+def test_retrieval_signal_demotes_exposed_never_fetched(conn, fake_llm):
+    ts = "2026-01-01T00:00:00+00:00"
+    with conn:
+        _seed_frag(conn, "frg_d", "ep_d")
+        _claim_on_episode(conn, "clm_d", "ep_d", ts)
+        for _ in range(RETRIEVAL_EXPOSURE_MIN):       # candidate N×, never fetched
+            _signal(conn, fetched=[], dropped=["frg_d"])
+    with conn:
+        _consume_retrieval_signals(conn, UID, "run_s", ts)
+    assert store.get_claim(conn, UID, "clm_d")["background"] == 1
+
+
+def test_retrieval_signal_keeps_fetched_claim(conn, fake_llm):
+    ts = "2026-01-01T00:00:00+00:00"
+    with conn:
+        _seed_frag(conn, "frg_f", "ep_f")
+        _claim_on_episode(conn, "clm_f", "ep_f", ts)
+        for _ in range(RETRIEVAL_EXPOSURE_MIN):
+            _signal(conn, fetched=["frg_f"], dropped=[])
+    with conn:
+        _consume_retrieval_signals(conn, UID, "run_s", ts)
+    assert store.get_claim(conn, UID, "clm_f")["background"] == 0   # fetched → kept
+
+
+def test_retrieval_signal_spares_rare_quiet_claim(conn, fake_llm):
+    """Below the exposure floor → not demoted (rare-but-correct guard)."""
+    ts = "2026-01-01T00:00:00+00:00"
+    with conn:
+        _seed_frag(conn, "frg_r", "ep_r")
+        _claim_on_episode(conn, "clm_r", "ep_r", ts)
+        _signal(conn, fetched=[], dropped=["frg_r"])   # exposed once only
+    with conn:
+        _consume_retrieval_signals(conn, UID, "run_s", ts)
+    assert store.get_claim(conn, UID, "clm_r")["background"] == 0
+
+
+def test_retrieval_demote_survives_rebuild(conn, fake_llm):
+    ts = "2026-01-01T00:00:00+00:00"
+    with conn:
+        _seed_frag(conn, "frg_d", "ep_d")
+        _claim_on_episode(conn, "clm_d", "ep_d", ts)
+        for _ in range(RETRIEVAL_EXPOSURE_MIN):
+            _signal(conn, fetched=[], dropped=["frg_d"])
+    with conn:
+        _consume_retrieval_signals(conn, UID, "run_s", ts)
+    rebuild(conn)
+    assert store.get_claim(conn, UID, "clm_d")["background"] == 1
+
+
 # ── C9: background decay — fold a recurrent claim into its theme ───────────────
 from core.consolidate import _demote_background, BACKGROUND_MIN_REPEATS  # noqa: E402
 

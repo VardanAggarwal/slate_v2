@@ -202,6 +202,15 @@ CREATE TABLE IF NOT EXISTS events (
     payload_json TEXT NOT NULL
 );
 
+-- C12 calibration: the fitted compression/budget profile per user (the bet over
+-- Q,B that consolidation owns and pushes down to Write/Retrieve). NOT event-derived
+-- and NOT truncated by rebuild — it is fitted config, like consolidation_runs.
+CREATE TABLE IF NOT EXISTS calibration_profiles (
+    user_id      TEXT PRIMARY KEY,
+    profile_json TEXT NOT NULL,
+    updated_at   TEXT
+);
+
 CREATE TABLE IF NOT EXISTS consolidation_runs (
     id            TEXT PRIMARY KEY,
     user_id       TEXT NOT NULL,
@@ -724,6 +733,21 @@ def claim_support_count(conn: sqlite3.Connection, user_id: str, claim_id: str) -
         (claim_id, user_id)).fetchone()["n"]
 
 
+def fragment_episode(conn: sqlite3.Connection, user_id: str, frag_id: str) -> str | None:
+    """The source episode of a fragment — the C13 bridge from a retrieval signal
+    (which keys on fragment ids) to the claims derived from the same episode."""
+    row = conn.execute(
+        "SELECT episode_id FROM fragments WHERE id = ? AND user_id = ?",
+        (frag_id, user_id)).fetchone()
+    return row["episode_id"] if row else None
+
+
+def claims_for_episode(conn: sqlite3.Connection, user_id: str, episode_id: str) -> list[str]:
+    return [r["claim_id"] for r in conn.execute(
+        "SELECT DISTINCT claim_id FROM claim_support WHERE episode_id = ? AND user_id = ?",
+        (episode_id, user_id))]
+
+
 def contradiction_pairs(conn: sqlite3.Connection, user_id: str,
                         claim_ids: list[str] | None = None) -> list[tuple[str, str]]:
     """(from_id, to_id) for every 'contradicts' edge, optionally restricted to
@@ -1060,6 +1084,22 @@ def last_run(conn: sqlite3.Connection, user_id: str) -> sqlite3.Row | None:
     return conn.execute(
         """SELECT * FROM consolidation_runs WHERE user_id = ?
            ORDER BY started_at DESC LIMIT 1""", (user_id,)).fetchone()
+
+
+def get_calibration(conn: sqlite3.Connection, user_id: str) -> dict:
+    """C12 — the fitted calibration profile for a user, or {} if none fitted."""
+    row = conn.execute(
+        "SELECT profile_json FROM calibration_profiles WHERE user_id = ?",
+        (user_id,)).fetchone()
+    return json.loads(row["profile_json"]) if row else {}
+
+
+def set_calibration(conn: sqlite3.Connection, user_id: str, profile: dict) -> None:
+    conn.execute(
+        """INSERT INTO calibration_profiles (user_id, profile_json, updated_at)
+           VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET
+           profile_json = excluded.profile_json, updated_at = excluded.updated_at""",
+        (user_id, json.dumps(profile), now_iso()))
 
 
 def get_run(conn: sqlite3.Connection, run_id: str) -> sqlite3.Row | None:
