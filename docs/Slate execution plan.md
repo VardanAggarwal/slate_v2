@@ -247,16 +247,19 @@ P5  CONSOLIDATE safety + signals .... ◐ IN PROGRESS — 9/14 C-steps ✅ commi
                                      C14 rollback, C6/C7 guard merge/prune, C8 versioning (margin-before-flip),
                                      C1 revisit-order, C10 store-integrity, C9 background-decay, C12 (persistence
                                      +fitted value_floor=0.25 pushed), C13 retrieval-signals. ~35 offline tests.
-                                     LEFT (see §"NEXT-CHAT HANDOFF"): rigorous C-gate (before/after re-consolidate
-                                     ΔSR@B + forgetting on frozen set — the EXIT, not yet run); C11 cold-start
-                                     graduation; C2–C5 measure()-upgrades. C11/C2–C5 touch the calibrated predictor
-                                     → want SR@B validation, not blind edits.
-                                     EXIT: C-gate (ΔSR@B≥0, forgetting=0, rollback works)
+                                     C-GATE ✅ PASSED (2026-06-23, small-batch, scratchpad/c_gate.py): rolled back the
+                                     most-recent run (15 ep), re-derived them FROM RAW via consolidate(), re-measured on
+                                     the frozen gold (slate answerer, B=2000). ΔSR@B=+0.0% (42.9%→42.9%), forgetting=0
+                                     (no regressions), rollback of the new run returned state to S_minus exactly. Cost
+                                     $0.77, all-Claude, 692s. Re-derive reproduced 2034/2040 claims (concepts 326→338).
+                                     LEFT (see §"NEXT-CHAT HANDOFF"): C11 cold-start graduation; C2–C5 measure()-upgrades.
+                                     C11/C2–C5 touch the calibrated predictor → want SR@B validation, not blind edits.
+                                     EXIT: C-gate (ΔSR@B≥0, forgetting=0, rollback works) ✅ MET
 P6  Frontier (cross-cutting §4) ..... EXIT: redaction/isolation/write-during-consolidate tests green
 ```
 
 **Critical path:** P0→P1→P2→P2.5→P3 are ✅; P4 built (R-gate not met on this corpus — grep dominates short
-self-contained notes; hybrid is the best Slate variant at 64%). P5 is 9/14 done. P6 independent.
+self-contained notes; hybrid is the best Slate variant at 64%). P5 is 9/14 + C-gate EXIT ✅; only C11 + C2–C5 left. P6 independent.
 
 ---
 
