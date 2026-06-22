@@ -44,6 +44,19 @@ def _corpus_AB(rng):
     return dirs, A + B
 
 
+def _corpus_graduation(rng, loose_n):
+    """Three MATURED tight clusters (T0–T2, 10 members each) plus one LOOSE cluster
+    on its own topic whose size is `loose_n` — the cold-start region under test."""
+    dirs = _topic_dirs(5, rng)              # 0–2 tight; 3 loose; 4 reserved
+    rows: list = []
+    for k in range(3):
+        rows += _rows([_frag(dirs[k], rng, noise=0.04) for _ in range(10)],
+                      f"T{k}", start=len(rows))
+    rows += _rows([_frag(dirs[3], rng, noise=0.5) for _ in range(loose_n)],
+                  "LOOSE", start=len(rows))
+    return rows
+
+
 # ── measure(): pure sensor ──────────────────────────────────────────────────────
 def test_measure_anchor_and_residual():
     rng = np.random.default_rng(SEED)
@@ -172,6 +185,38 @@ def test_decide_ranking_most_surprising_first():
     out = predict.decide(ms, {"z_echo": -99})         # routing irrelevant to ranking
     # off-topic (idx 1) is the most surprising → ranked first
     assert out["ranking"][0] == 1
+
+
+# ── compute_baselines(): C11 cold-start graduation ───────────────────────────────
+def test_baselines_cold_start_region_trusts_prior():
+    """A freshly-formed (2-member) LOOSE region's own σ is estimated from 2 points
+    — untrustworthy. C11 shrinks it toward the prior-over-clusters, so its reported
+    cohesion sits between its raw local spread and the prior, not at the raw."""
+    rng = np.random.default_rng(SEED)
+    corpus = _corpus_graduation(rng, loose_n=2)
+    b = predict.compute_baselines(corpus)
+    prior_mu, _ = b["prior"]
+    mu_loose, _ = b["clusters"]["LOOSE"]
+    # n=2, N0=4 → weight 1/3 local, 2/3 prior: the reported μ is pulled most of the
+    # way to the prior, well below a raw 2-point loose estimate.
+    assert abs(mu_loose - prior_mu) < abs(mu_loose - 1.0)
+
+
+def test_baselines_matured_region_trusts_local():
+    """The SAME loose topic, now matured (many members), is trusted on its own
+    cohesion: its reported μ tracks its genuinely-wide local spread, no longer
+    collapsed onto the (tighter) prior. Graduation is monotone in member count."""
+    rng = np.random.default_rng(SEED)
+    young = predict.compute_baselines(_corpus_graduation(
+        np.random.default_rng(SEED), loose_n=2))["clusters"]["LOOSE"][0]
+    mature = predict.compute_baselines(_corpus_graduation(
+        np.random.default_rng(SEED), loose_n=30))["clusters"]["LOOSE"][0]
+    prior = predict.compute_baselines(_corpus_graduation(
+        np.random.default_rng(SEED), loose_n=2))["prior"][0]
+    # A loose region is wider than the tight-dominated prior; as it matures its
+    # reported μ moves AWAY from the prior toward that wider truth.
+    assert mature > young
+    assert (mature - prior) > (young - prior)
 
 
 # ── resolve_direction(): the LLM layer, direction only ───────────────────────────

@@ -42,6 +42,9 @@ import numpy as np
 SPAN_K = 6          # vectors that reconstruct a point
 STAT_K = 12         # wider sample for estimating a region's spread
 SHRINK_N0 = 8.0     # pseudo-count: blend a local estimate toward the prior
+GRADUATION_N0 = 4.0  # C11: pseudo-count a REGION must accrue before its own
+                     # cohesion is trusted over the prior-over-clusters (cold-start
+                     # graduation). n >> N0 → trust local; n << N0 → trust prior.
 SD_FLOOR = 0.03
 RIDGE_LAMBDA = 0.05  # closer neighbours trusted more (weighted reconstruction)
 GRAM_MAX_N = 4000   # cache the full n×n Gram below this (~128MB at n=4000); above, per-row
@@ -232,20 +235,37 @@ def compute_baselines(corpus: list[dict], C: np.ndarray | None = None) -> dict:
         if cl is not None:
             groups.setdefault(cl, []).append(i)
 
-    clusters: dict[str, tuple[float, float]] = {}
+    # First pass: each region's RAW cohesion (μ, σ) + its member count. The prior
+    # is the population expectation over these raw estimates, so it must be formed
+    # BEFORE the cold-start shrink (else it would chase its own shrunk clusters).
+    raw: dict[str, tuple[float, float, int]] = {}
     for cl, idxs in groups.items():
         if len(idxs) < 2:
             continue
         res = np.array([_loo_residual(i, C, G[i] if G is not None else None)
                         for i in idxs])
-        clusters[cl] = (float(res.mean()), float(max(res.std(), SD_FLOOR)))
+        raw[cl] = (float(res.mean()), float(max(res.std(), SD_FLOOR)), len(idxs))
 
-    if len(clusters) >= 2:
-        mus = np.array([m for m, _ in clusters.values()])
-        sds = np.array([s for _, s in clusters.values()])
+    if len(raw) >= 2:
+        mus = np.array([m for m, _, _ in raw.values()])
+        sds = np.array([s for _, s, _ in raw.values()])
         prior = (float(mus.mean()), float(max(sds.mean(), SD_FLOOR)))
     else:
         prior = corpus_prior(C, G=G)
+
+    # C11 cold-start graduation: a region's own spread is only trustworthy once it
+    # has accrued members — a 2-member region's σ is estimated from 2 points, so
+    # betting routing on it manufactures noise. Shrink each region toward the
+    # prior-over-clusters by its size (weight n/(n+N0)): a fresh region reports ≈
+    # the prior, a matured one reports ≈ its local cohesion. Continuous, so a z
+    # measured against a region does not jump as the region crosses a count.
+    prior_mu, prior_sd = prior
+    clusters: dict[str, tuple[float, float]] = {}
+    for cl, (mu_raw, sd_raw, n) in raw.items():
+        w = n / (n + GRADUATION_N0)
+        mu = w * mu_raw + (1.0 - w) * prior_mu
+        sd = max(SD_FLOOR, w * sd_raw + (1.0 - w) * prior_sd)
+        clusters[cl] = (mu, sd)
     return {"clusters": clusters, "prior": prior}
 
 
