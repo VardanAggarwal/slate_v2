@@ -28,8 +28,10 @@ consolidation and pushed down — never baked here (mirrors recall/assembly).
 """
 from __future__ import annotations
 
-from core import assembly, store
-from core.encode import get_embedder
+import numpy as np
+
+from core import assembly, calibration as calib, predict, scan, store
+from core.encode import get_embedder, split_sentences
 
 # Seed breadth: how many nearest fragments to hand the assembly loop. Wider than
 # the final assembly so the greedy selector has room to pick for COVERAGE, not just
@@ -39,8 +41,25 @@ SEED_K = 40
 # or the char budget — not an arbitrary item count — is what stops assembly. The
 # v2 recall used a hard k=8/12; here k is a budget, not the stop criterion.
 MAX_ITEMS = 24
+# R7 answerability triage: if NOTHING in memory anchors the query (best candidate's
+# relevance below this), return nothing rather than padding with the nearest-but-
+# irrelevant spans (PRD §Retrieve "return nothing rather than padding"). Default
+# sits between the corpus's ambient cosine (~0.10) and answer cosine (~0.66) seen in
+# the R0 spike — conservative; a fit-target like the rest, never SR@B-tuned here.
+TRIAGE_MIN_REL = 0.15
+# R3 borrow: a borrowed cross-theme span must ALIGN with the query's uncovered-nuance
+# direction at least this much (cosine) — a genuine fit, not noise. Fit-target.
+BORROW_MIN_REL = 0.25
+# `value_floor` is the R2/R7 relevance-aware STOP — the P3 calibration target that
+# kills the observed over-injection (assembly pads to budget, hurting SR@B@B/2; see
+# docs/retrieve-workflow-eval.md). LEFT None (disabled) here on purpose: it must be
+# FITTED against frozen SR@B by C12 and pushed down, never pre-tuned in source.
+# `decompose`/`borrow` (R1/R3) are likewise default-OFF: structurally present and
+# tested, but they must earn their place against frozen SR@B before they fire.
 DEFAULT_CALIBRATION = {"gain_floor": assembly.GAIN_FLOOR, "max_items": MAX_ITEMS,
-                       "per_cluster": {}}
+                       "value_floor": assembly.VALUE_FLOOR,
+                       "triage_min_rel": TRIAGE_MIN_REL,
+                       "borrow_min_rel": BORROW_MIN_REL, "per_cluster": {}}
 
 
 def _embed_query(query: str):
@@ -48,20 +67,144 @@ def _embed_query(query: str):
                                  show_progress_bar=False)[0]
 
 
+def decompose_query(query: str, *, calibration: dict | None = None) -> list[str]:
+    """R1 — split a multi-part query into independent sub-queries via the sequential
+    scan wrapper (topic boundaries BETWEEN the query's sentences). A single-clause
+    query returns `[query]` unchanged; a compound query yields one sub-query per
+    planted part, so R4 can later allocate budget across them. Pure/offline."""
+    # min_chars=1: queries are short, so don't drop a brief clause the way the
+    # write-side sentence floor (SENT_MIN_CHARS=40) would.
+    sents = split_sentences(query, min_chars=1)
+    if len(sents) <= 1:
+        return [query.strip()] if query.strip() else []
+    E = get_embedder().encode(sents, normalize_embeddings=True, show_progress_bar=False)
+    segs = scan.segment(np.asarray(E, dtype=float), calibration=calibration, scope="query")
+    # scan MERGES same-topic sentences; at query scale it often can't measure a
+    # boundary (too few points) and returns one segment. The seed is unioned and
+    # assembly runs once over it, so OVER-splitting is harmless while UNDER-splitting
+    # loses a part — so when scan can't separate multiple sentences, fall back to one
+    # sub-query per sentence (the finest independent units).
+    if len(segs) <= 1:
+        return [s.strip() for s in sents if s.strip()]
+    subs = [" ".join(sents[i] for i in seg).strip() for seg in segs]
+    return [s for s in subs if s]
+
+
+def _borrow_nuance(query_emb, pool: list[dict], *,
+                   min_rel: float = BORROW_MIN_REL) -> dict | None:
+    """R3 — borrow a transferable nuance from ANOTHER theme. Mechanism (PRD line 168,
+    "a low-residual *fit* across a theme boundary"):
+
+      1. TOPIC — the query's on-topic theme = the cluster of its most-relevant
+         candidate (`pool` is similarity-descending).
+      2. RESIDUAL — reconstruct the query from its OWN topic's spans; the leftover
+         `residual_direction` is the part of the query the topic can't cover — the
+         uncovered nuance, as a direction.
+      3. MATCH — among NON-topic candidates, the one whose embedding best aligns with
+         that residual direction is the transferable nuance. Borrow it only if the
+         alignment clears `min_rel` (a real fit, not noise).
+
+    Returns the borrowed candidate (flagged `borrowed`, `gain`=the fit) or None.
+    No-op when there is no theme boundary (topic cluster missing) or the topic
+    already covers the query (no residual to fill)."""
+    if not pool:
+        return None
+    topic = pool[0].get("cluster")
+    if topic is None:                       # no theme to anchor → nothing to cross
+        return None
+    topic_embs = [np.asarray(c["embedding"], dtype=float)
+                  for c in pool if c.get("cluster") == topic]
+    non_topic = [c for c in pool if c.get("cluster") != topic]
+    if not topic_embs or not non_topic:
+        return None
+
+    resid = predict.residual_direction(np.asarray(query_emb, dtype=float),
+                                       np.vstack(topic_embs))
+    rn = float(np.linalg.norm(resid))
+    if rn < 1e-6:                           # topic fully reconstructs the query
+        return None
+    resid = resid / rn
+
+    fits = [(c, float(np.asarray(c["embedding"], dtype=float) @ resid)) for c in non_topic]
+    best, fit = max(fits, key=lambda t: t[1])
+    if fit < min_rel:                       # no off-topic span fits the uncovered gap
+        return None
+    return {**best, "gain": round(fit, 4), "value": round(fit, 4), "share": 0.0,
+            "relevance": round(best["similarity"], 4), "borrowed": True}
+
+
+def record_retrieval_signal(conn, user_id: str, query: str, *, fetched: list[dict],
+                            seed: list[dict], truncated: bool,
+                            run_id: str | None = None) -> None:
+    """R8 — append a RETRIEVAL_SIGNAL event (fetched / dropped / cut-for-budget) for
+    consolidation C13 to consume (promote dropped-but-needed, demote
+    salient-but-never-fetched). Append-only — NOT materialized into the semantic
+    store, so consolidate.apply_event ignores it; it is read straight from the log."""
+    fetched_ids = {f["frag_id"] for f in fetched}
+    store.append_event(conn, user_id, "RETRIEVAL_SIGNAL", {
+        "query": query,
+        "fetched": [f["frag_id"] for f in fetched],
+        "dropped": [c["frag_id"] for c in seed if c["frag_id"] not in fetched_ids],
+        "cut_for_budget": bool(truncated),
+    }, run_id=run_id)
+
+
+def _seed_pool(conn, user_id: str, query: str, *, seed_k: int,
+               decompose: bool, calibration: dict | None):
+    """Seed candidate fragments for `query`. With R1 decompose ON, union the seeds
+    of each independent sub-query (dedup by frag_id, keep the max similarity) so a
+    multi-part query covers every part; OFF, a single knn seed. Returns
+    (candidates, query_embedding)."""
+    emb = _embed_query(query)
+    if not decompose:
+        return store.fragment_candidates(conn, user_id, emb, k=seed_k), emb
+    subs = decompose_query(query, calibration=calibration)
+    if len(subs) <= 1:
+        return store.fragment_candidates(conn, user_id, emb, k=seed_k), emb
+    # Embed every sub-query in ONE encode call — under the prod HF API each
+    # _embed_query is a network round-trip, so a per-sub loop would be N of them.
+    sub_embs = get_embedder().encode(subs, normalize_embeddings=True,
+                                     show_progress_bar=False)
+    merged: dict[str, dict] = {}
+    for se in sub_embs:
+        for c in store.fragment_candidates(conn, user_id, se, k=seed_k):
+            cur = merged.get(c["frag_id"])
+            if cur is None or c["similarity"] > cur["similarity"]:
+                merged[c["frag_id"]] = c
+    return list(merged.values()), emb
+
+
 def fragment_recall(conn, user_id: str, query: str, *, seed_k: int = SEED_K,
-                    k: int | None = None, calibration: dict | None = None) -> list[dict]:
+                    k: int | None = None, calibration: dict | None = None,
+                    decompose: bool = False, borrow: bool = False,
+                    signals: bool = False, run_id: str | None = None) -> list[dict]:
     """Rank + select fragments for a query via the assembly wrapper.
 
     Returns the CHOSEN fragments in assembly order (most-informative first), each
     enriched with its marginal `gain` (unique residual it added) and `share`
     (its fraction of total assembled information — the budget split, PRD R4).
     `stopped`-on-saturation vs filled-k is reflected by len(result) < the cap.
-    Empty list when memory holds nothing for the query (PRD: return nothing, not
-    padding)."""
-    calibration = calibration or DEFAULT_CALIBRATION
-    emb = _embed_query(query)
-    cand = store.fragment_candidates(conn, user_id, emb, k=seed_k)
+    Empty list when memory holds nothing for the query, OR when nothing in memory
+    anchors it (R7 triage — PRD: return nothing, never pad).
+
+    `decompose` (R1) seeds from independent sub-queries; `borrow` (R3) appends one
+    cross-theme nuance; `signals` (R8) logs fetched/dropped for consolidation. All
+    default OFF — the first two are fit-targets not yet earned vs SR@B."""
+    # C12: a caller override wins; otherwise load the user's fitted profile over
+    # the in-code defaults (just the defaults until a fit is pushed).
+    calibration = calibration or calib.merged(conn, DEFAULT_CALIBRATION, user_id)
+    cand, emb = _seed_pool(conn, user_id, query, seed_k=seed_k,
+                           decompose=decompose, calibration=calibration)
     if not cand:
+        return []
+
+    # R7 answerability triage: if the best candidate doesn't clear the anchor floor,
+    # the query is off-corpus — return nothing instead of padding (PRD §Retrieve).
+    triage = calibration.get("triage_min_rel", TRIAGE_MIN_REL)
+    if max(c["similarity"] for c in cand) < triage:
+        if signals:
+            record_retrieval_signal(conn, user_id, query, fetched=[], seed=cand,
+                                    truncated=False, run_id=run_id)
         return []
 
     query_row = {"id": "__query__", "text": query, "embedding": emb}
@@ -75,18 +218,34 @@ def fragment_recall(conn, user_id: str, query: str, *, seed_k: int = SEED_K,
     for pos, idx in enumerate(res["chosen"]):
         c = cand[idx]
         out.append({**c, "rank": pos, "gain": res["gains"][pos],
-                    "share": res["shares"][pos], "relevance": round(weights[idx], 4)})
+                    "value": res["values"][pos], "share": res["shares"][pos],
+                    "relevance": round(weights[idx], 4)})
+    if borrow:
+        min_rel = calibration.get("borrow_min_rel", BORROW_MIN_REL)
+        chosen_ids = {c["frag_id"] for c in out}
+        nuance = _borrow_nuance(emb, cand, min_rel=min_rel)
+        if nuance and nuance["frag_id"] not in chosen_ids:
+            out.append({**nuance, "rank": len(out)})
+    if signals:
+        # cut_for_budget ≈ assembly did NOT stop on saturation (was item/budget-bound)
+        record_retrieval_signal(conn, user_id, query, fetched=out, seed=cand,
+                                truncated=not res.get("stopped", False), run_id=run_id)
     return out
 
 
 def assemble_context(conn, user_id: str, topic: str, max_chars: int = 6000,
-                     *, calibration: dict | None = None) -> str:
+                     *, calibration: dict | None = None, signals: bool = True,
+                     run_id: str | None = None) -> str:
     """Fragment-backed analog of recall.assemble_context — the answerer entrypoint.
 
     Assembles verbatim fragment spans for `topic`, grouped by source episode with
     provenance, sized to the char budget. Most-informative-first so a budget cut
-    drops the least-useful spans last (PRD: surface enough to answer within B)."""
-    chosen = fragment_recall(conn, user_id, topic, calibration=calibration)
+    drops the least-useful spans last (PRD: surface enough to answer within B).
+
+    `signals` default ON: this IS a retrieval, and per the PRD every retrieval leaves
+    fetched/dropped signals for consolidation (R8). Off for speculative/preview reads."""
+    chosen = fragment_recall(conn, user_id, topic, calibration=calibration,
+                             signals=signals, run_id=run_id)
     if not chosen:
         return f"_Slate has nothing stored about “{topic}” yet._"
 
@@ -123,5 +282,6 @@ def assemble_context(conn, user_id: str, topic: str, max_chars: int = 6000,
     return "\n".join(out)
 
 
-__all__ = ["fragment_recall", "assemble_context", "SEED_K", "MAX_ITEMS",
-           "DEFAULT_CALIBRATION"]
+__all__ = ["fragment_recall", "assemble_context", "decompose_query",
+           "record_retrieval_signal", "SEED_K", "MAX_ITEMS", "TRIAGE_MIN_REL",
+           "BORROW_MIN_REL", "DEFAULT_CALIBRATION"]

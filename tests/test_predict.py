@@ -76,6 +76,30 @@ def test_measure_z_orders_by_novelty():
     assert z_near < z_fresh < z_off, (z_near, z_fresh, z_off)
 
 
+# ── residual_direction(): the surprise as a VECTOR (Retrieve R3) ──────────────────
+def test_residual_direction_points_at_the_uncovered_part():
+    """The leftover of a query against its topic aligns with the part the topic does
+    NOT cover (the uncovered-nuance direction), not the topic direction."""
+    rng = np.random.default_rng(SEED)
+    dirs = _topic_dirs(3, rng)                        # 0 = topic, 2 = uncovered nuance
+    A = np.vstack([_frag(dirs[0], rng) for _ in range(8)])
+    q = dirs[0] + 0.8 * dirs[2]
+    q = q / np.linalg.norm(q)
+    resid = predict.residual_direction(q, A)
+    resid = resid / np.linalg.norm(resid)
+    assert abs(resid @ dirs[2]) > abs(resid @ dirs[0])   # leftover ≈ the nuance dir
+    assert resid @ dirs[2] > 0.6
+
+
+def test_residual_direction_vanishes_when_topic_covers_query():
+    """A query squarely inside its topic has almost no residual direction."""
+    rng = np.random.default_rng(SEED)
+    d = _topic_dirs(1, rng)[0]
+    A = np.vstack([_frag(d, rng) for _ in range(8)])
+    resid = predict.residual_direction(_frag(d, rng, noise=0.005), A)
+    assert np.linalg.norm(resid) < 0.2
+
+
 # ── decide(): the route matrix (W6) ──────────────────────────────────────────────
 def test_decide_route_matrix():
     """PREDICTED / AMBIGUOUS / NOVEL over labeled fixtures. z-ordering is the

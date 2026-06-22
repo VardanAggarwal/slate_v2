@@ -146,6 +146,41 @@ def _residual_against(v: np.ndarray, pool: np.ndarray) -> float:
 residual_against = _residual_against
 
 
+def residuals_against(X: np.ndarray, pool: np.ndarray) -> np.ndarray:
+    """Batch `residual_against`: residual norm of EACH row of `X` against its
+    SPAN_K nearest neighbours in `pool`. Returns only the magnitude — no
+    baselines/z/peer geometry — which is the one quantity `assembly.assemble`
+    reads from a measurement. Numerically identical to the `residual` field
+    `measure()` returns (measure's two-stage STAT_K→SPAN_K top-k reduces to this
+    single SPAN_K projection), so it is a drop-in that skips the per-step baseline
+    recompute measure() would do for fields assembly never uses. Empty pool →
+    all-ones (every probe maximally novel)."""
+    X = np.atleast_2d(np.asarray(X, dtype=float))
+    if pool.shape[0] == 0:
+        return np.ones(X.shape[0])
+    return np.array([_residual_against(X[i], pool) for i in range(X.shape[0])])
+
+
+def residual_direction(v: np.ndarray, pool: np.ndarray) -> np.ndarray:
+    """The part of `v` its nearest SPAN_K neighbours in `pool` CANNOT reconstruct,
+    as a VECTOR — the *direction* of the surprise, not just its magnitude (the
+    companion to `residual_against`). Same weighted span-projection as
+    `_project_residual`; returns `v − proj` (unnormalised). Empty pool → `v`.
+
+    Used by Retrieve.R3 (borrow): the query's residual against its OWN topic is the
+    uncovered-nuance direction to match against off-topic memory."""
+    v = np.asarray(v, dtype=float)
+    if pool.shape[0] == 0:
+        return v
+    sims = pool @ v
+    idx = _topk_idx(sims, SPAN_K)
+    span = pool[idx]
+    w = np.clip(sims[idx], 1e-3, None)
+    G = span @ span.T
+    a = np.linalg.solve(G + RIDGE_LAMBDA * np.diag(1.0 / (w * w)), span @ v)
+    return v - span.T @ a
+
+
 def _loo_residual(i: int, C: np.ndarray, sims_row: np.ndarray | None = None) -> float:
     """A member's residual against its STAT_K nearest *other* vectors — the SAME
     operator a probe gets in `_measure_one` (global nearest), minus self. The

@@ -250,6 +250,32 @@ def test_assemble_near_threshold_duplicate_excluded_by_floor():
     assert strict["chosen"] == [1] and strict["stopped"]         # partial excluded
 
 
+def test_assemble_value_floor_excludes_tangential_novel():
+    """R2/R7 relevance-aware STOP. A span ORTHOGONAL to the query has high residual
+    (fully novel vs the assembly) but ~0 relevance — the over-injection failure mode
+    in retrieval, where Y grows from a tiny seed so raw residual never saturates.
+    The default gain_floor STOP pads it in; the value_floor STOP (residual×relevance)
+    drops it."""
+    rng = np.random.default_rng(SEED)
+    dirs = _topic_dirs(3, rng)
+    q = _frag(dirs[0], rng)                          # the query
+    relevant = _blend(dirs[0], dirs[1], 0.7, rng)    # on-topic, partly novel → high weight
+    tangential = _frag(dirs[2], rng)                 # orthogonal → high residual, ~0 weight
+    cand = np.vstack([relevant, tangential])
+    w = [float(q @ relevant), float(q @ tangential)]  # relevance = cosine to the query
+
+    # raw-residual STOP (default): tangential's high residual pads it in
+    loose = assembly.assemble(cand, seed=q[None], weights=w,
+                              calibration={"gain_floor": 0.0})
+    assert set(loose["chosen"]) == {0, 1}            # both kept — over-injection
+    assert len(loose["values"]) == len(loose["chosen"])
+
+    # value-based STOP: tangential has high residual but ~0 value → excluded, STOP fires
+    strict = assembly.assemble(cand, seed=q[None], weights=w,
+                               calibration={"gain_floor": 0.0, "value_floor": 0.15})
+    assert strict["chosen"] == [0] and strict["stopped"]
+
+
 def test_guard_borderline_between_redundant_and_unique():
     """A blended loser is partially reconstructable — measure()'s z must place it
     BETWEEN a pure restatement and a unique fact (monotone), so any fitted

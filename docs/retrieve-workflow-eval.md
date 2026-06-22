@@ -54,7 +54,41 @@ Wired into the SR@B harness as the `frag` answerer alongside `slate` (v2 claims)
 `grep` (FTS over raw). Tests: `tests/test_retrieve.py` 7/7 (relevance ordering,
 empty/isolation guards, provenance grouping, budget truncation, dedup).
 
-## SR@B — fragments vs claims vs grep (2026-06-22)
+## SR@B — CLEAN API run + C12 value_floor fit (2026-06-22, supersedes the noisy run below)
+
+Funded Anthropic API (answerer + judge both **sonnet** — a haiku answerer was tried
+and *deflated* SR@B, failing queries sonnet passed, so it was reverted). Full n=14
+gold per cell, no excluded errors. Cost ~$0.97 baseline + ~$0.75 fit. The numbers in
+the older CLI-judged table further down are **superseded** by this.
+
+| system | SR@B @ B=2000 | tail | SR@B @ B=1000 | tail |
+|---|---|---|---|---|
+| slate (v2 claims) | 50% | 40% | 43% | 40% |
+| **frag** | 57% | 40% | 50% | 20% |
+| **hybrid** (frag+concept) | **64%** | 60% | 43% | 0% |
+| **grep** (raw FTS) | **86%** | 100% | **71%** | 60% |
+
+- **hybrid > frag > slate** — the frag+concept hybrid is the best Slate variant (64%),
+  confirming the complementarity thesis; it owns the tail (60%) the single paths miss.
+- **grep still dominates** (86%) — same short, self-contained-note corpus story: 2–3 raw
+  notes fit in B and carry the answer verbatim, so compression has little to win. Slate's
+  parsimony thesis only pays where the raw doesn't fit (a tighter-budget / larger-note
+  corpus, still to be measured).
+- **B/2 over-injection is real**: hybrid collapses 64%→43% (tail 60%→0%) at B=1000.
+
+**C12 value_floor fit (frag path, pushed to `calibration_profiles`):**
+
+| floor | B=2000 SR@B / tail / ctx | B=1000 SR@B / tail / ctx |
+|---|---|---|
+| none (raw residual) | 57% / 40% / 1856 | 50% / 20% / 895 |
+| **0.25 (fitted, pushed)** | 57% / 40% / **1729** | **57%** / **40%** / 870 |
+
+The relevance-aware STOP earns its keep: at **B/2 it lifts SR@B 50→57% and tail 20→40%**
+(kills the over-injection), and at full B it holds SR@B while trimming context (parsimony).
+`value_floor=0.25` is persisted per-user; `retrieve.assemble_context` loads it by default.
+This is the C12 loop run end-to-end — fit against frozen SR@B, pushed down — not pre-tuned.
+
+## SR@B — fragments vs claims vs grep (2026-06-22, NOISY CLI run — SUPERSEDED above)
 
 Judge+answerer via the `claude` CLI (subscription); see the LLM-infra note at the
 foot. Errors (session-limit blips) excluded, so per-cell denominators vary 11–14 —
@@ -111,14 +145,51 @@ and return nothing when the whole query is off-corpus. **Deferred — it must be
 against SR@B (the system's own discipline), and the LLM window was exhausted; do not
 ship an unvalidated knob.**
 
+## P3 progress — relevance-aware STOP built (2026-06-22)
+
+The R2/R7 stop is **built as an opt-in `value_floor` knob** in `core/assembly.py`:
+the PICK already maximised residual×relevance, but the STOP read raw residual; with
+`value_floor` set, STOP now fires on the same marginal **value** = residual×relevance,
+so a high-residual-but-tangential span can't pad. Default OFF (`None`) — preserves
+every existing caller's raw-residual semantics; `retrieve.py` registers it as the
+fit target but leaves it disabled (not pre-tuned). Geometry-tested
+(`tests/test_wrappers.py::test_assemble_value_floor_excludes_tangential_novel`,
+147/147 green): an orthogonal-to-query span is padded in under the raw stop, dropped
+under the value stop.
+
+The fit driver `eval/fit_stop.py` sweeps `value_floor` vs **frozen** SR@B (the only
+credit; plan risk #2), tie-broken by tail then by *lower* mean-ctx (parsimony). It is
+**resumable** (per-(floor,budget,query) cache flushed each call) so the quota-gated
+judge can stop+resume across CLI session windows. **Not yet run** — needs fragments
+materialized on a db copy (the live `data/engine.db` has 0 fragments) + a clean LLM
+window; the fitted floor then gets pushed down by C12.
+
+## frag+concept HYBRID answerer — BUILT (2026-06-22)
+
+`core/hybrid.py` (`hybrid_context`) blends the two complementary single paths under
+one budget B: **concepts/claims for the tail** (`recall.assemble_context`) +
+**fragments for specificity** (`retrieve.assemble_context`). A thin orchestrator —
+no new geometry; each sub-path keeps its own seed/select/provenance/dedup. Budget is
+split by `concept_share` (fragments keep the majority, concepts get a guaranteed tail
+slice); if one path is empty its slice is handed to the other, both empty → the
+sentinel. Wired as the `hybrid` SR@B answerer (`eval/harness.py`). `concept_share` is
+a **C12 fit target, NOT pre-tuned** (default 0.4) — mirrors `value_floor`. Offline
+geometry/plumbing tests: `tests/test_hybrid.py` 6/6 (both-paths blend, each-path
+fallback, budget, isolation), full suite 153/153.
+
+**The SR@B validation of the hybrid is deferred with the rest of the quota-gated
+sweep** (below) — the build is complete and offline-tested; the North-Star credit
+waits on a clean LLM window.
+
 ## Next (data-driven)
 
-1. **R2/R7 relevance-aware stop** — kill the over-injection; validate on SR@B@B/2 and a
-   B/4 point (where Slate should overtake grep). Highest-confidence improvement.
-2. **frag+concept hybrid answerer** — fragments for specificity + concepts for the
-   tail; target the 67%-vs-20% tail gap. This is where Slate beats both single paths.
+1. **Run the `fit_stop` sweep** — validate the value_floor on SR@B@B/2 and a B/4 point
+   (where Slate should overtake grep). Materialize fragments on a copy first.
+   *Deferred (quota-gated); skipped this pass per direction.*
+2. ✅ **frag+concept hybrid answerer** — BUILT (see above); SR@B credit pending the
+   same window. Target: the 67%-vs-20% tail gap.
 3. **P3 calibration loop** — now unblocked: fit per-cluster `z_echo`/`gain_floor`/
-   `prox_margin` against frozen SR@B.
+   `prox_margin` **and** the hybrid's `concept_share`/`value_floor` against frozen SR@B.
 4. Re-run the full matrix once quota refreshes (it was noisy; pin down on a clean run).
 
 ## LLM-infra note (operational)
