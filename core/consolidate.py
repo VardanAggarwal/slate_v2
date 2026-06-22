@@ -12,7 +12,7 @@ import hashlib
 import json
 from datetime import datetime, timezone
 
-from core import config, guard, llm, store
+from core import config, guard, llm, predict, store
 from core.encode import get_embedder, split_sentences
 
 # Strength deltas (spaced-repetition pressure)
@@ -241,7 +241,8 @@ def apply_event(conn, user_id: str, type_: str, payload: dict) -> None:
         from core import write
         write.apply_fragmented(conn, user_id, p)
 
-    # ENCODED / BLUEPRINTED: episodic-side or log-only — nothing to materialize.
+    # ENCODED / BLUEPRINTED / INTEGRITY_FLAGGED: episodic-side or log-only —
+    # nothing to materialize (INTEGRITY_FLAGGED is a review signal, not state).
 
 
 def rebuild(conn) -> dict:
@@ -693,6 +694,56 @@ def _reconcile(conn, user_id: str, run_id: str, claim_ids: list[str], ts: str) -
     return cost
 
 
+# ── Step 5c: store-integrity check (C10) ──────────────────────────────────────
+def _primary_support_episode(conn, user_id: str, claim_id: str) -> str | None:
+    row = conn.execute(
+        "SELECT episode_id FROM claim_support WHERE claim_id = ? AND user_id = ? "
+        "ORDER BY episode_id LIMIT 1", (claim_id, user_id)).fetchone()
+    return row["episode_id"] if row else None
+
+
+def _check_integrity(conn, user_id: str, run_id: str, claim_ids: list[str],
+                     ts: str) -> None:
+    """C10 — is each derived claim faithful to the raw episode it was distilled
+    from? Route the claim against its source sentences (the same predictor, X=the
+    claim, Y=the raw episode):
+      PREDICTED → grounded in the source, faithful (pass)
+      NOVEL     → not grounded in the cited source → FLAG (ungrounded)
+      AMBIGUOUS → resolver decides direction; contradicts source → FLAG
+    Geometry uses STORED vectors (no embedding call); the resolver runs only on
+    AMBIGUOUS claims. Flags are an `INTEGRITY_FLAGGED` event (log-only — PRD: a
+    store-integrity check, NOT a headline metric), committed in one short txn."""
+    flags = []
+    for cid in claim_ids:
+        claim = store.get_claim(conn, user_id, cid)
+        emb = store.claim_embedding(conn, user_id, cid)
+        ep_id = _primary_support_episode(conn, user_id, cid)
+        if not claim or emb is None or not ep_id:
+            continue
+        sents = store.episode_sentences_with_vectors(conn, user_id, ep_id)
+        if len(sents) < 2:                       # too thin to route → skip (cold)
+            continue
+        corpus = [{"id": f"{ep_id}:{s['idx']}", "text": s["text"],
+                   "embedding": s["embedding"]} for s in sents]
+        v = predict.decide(predict.measure(
+            [{"id": cid, "text": claim["text"], "embedding": emb}], corpus))["fragments"][0]
+        if v["route"] == predict._PREDICTED:
+            continue
+        if v["route"] == predict._NOVEL:
+            flags.append((cid, ep_id, "ungrounded", None))
+        else:  # AMBIGUOUS — geometry can't see a flipped polarity; ask the resolver
+            anchor = v.get("anchor_text") or ""
+            if predict.resolve_direction(claim["text"], anchor)["direction"] == "contradict":
+                flags.append((cid, ep_id, "contradicts_source", anchor))
+    if not flags:
+        return
+    with conn:
+        for cid, ep_id, kind, anchor in flags:
+            emit(conn, user_id, run_id, "INTEGRITY_FLAGGED",
+                 {"claim_id": cid, "episode_id": ep_id, "kind": kind,
+                  "anchor_text": anchor, "ts": ts})
+
+
 # ── Step 6: latent bridges (embedding math + small verify calls) ──────────────
 def _bridges(conn, user_id: str, run_id: str, ts: str) -> float:
     import numpy as np
@@ -811,6 +862,19 @@ def _prune_safely(conn, user_id: str, run_id: str, ts: str) -> None:
                 "reason": "reconstructable_dormant", "ts": ts})
 
 
+# ── C1: revisit order — spend effort where surprise was highest ───────────────
+def _revisit_order(episodes: list) -> list:
+    """Order a batch most-surprising first (PRD §How C1: AMBIGUOUS / high-residual
+    revisited first). Surprise is read from the encode-time receipt: a
+    contradiction (a residual ON an anchor — the AMBIGUOUS case) outranks raw
+    novelty count. Pure WORK-ORDERING — the batch membership (oldest N, fair) is
+    unchanged, so it only steers which items the resolver budget hits first."""
+    def surprise(ep):
+        r = json.loads(ep["receipt_json"] or "{}")
+        return (len(r.get("contradictions", [])), r.get("n_novelties", 0))
+    return sorted(episodes, key=surprise, reverse=True)
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 def consolidate(conn, user_id: str, max_episodes: int = 50) -> dict:
     """One sleep cycle over one user's oldest unconsolidated episodes (sync mode).
@@ -818,7 +882,8 @@ def consolidate(conn, user_id: str, max_episodes: int = 50) -> dict:
     A failed run leaves its episodes unmarked, so the next run retries them;
     md5 claim ids + ON CONFLICT appliers make replayed decisions idempotent.
     """
-    episodes = store.unconsolidated_episodes(conn, user_id)[:max_episodes]
+    episodes = _revisit_order(
+        store.unconsolidated_episodes(conn, user_id)[:max_episodes])
     if not episodes:
         return {"status": "noop", "episodes": 0}
 
@@ -862,6 +927,8 @@ def consolidate(conn, user_id: str, max_episodes: int = 50) -> dict:
 
         # C8: reconcile contradictions emitted above (LLM, so its own short txn).
         cost += _reconcile(conn, user_id, run_id, new_claim_ids, ts)
+        # C10: flag derived claims that aren't faithful to their raw source.
+        _check_integrity(conn, user_id, run_id, new_claim_ids, ts)
         cost += _bridges(conn, user_id, run_id, ts)
         with conn:
             _decay_strengthen(conn, user_id, run_id, episodes, ts)

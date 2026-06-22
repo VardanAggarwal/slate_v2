@@ -473,6 +473,85 @@ def test_contested_surfaced_at_retrieval(conn, fake_llm, monkeypatch):
     assert "⚖️ contested" in current["signals"]
 
 
+# ── C10: store-integrity — derived claim faithful to its source episode ───────
+from core.consolidate import _check_integrity  # noqa: E402
+
+
+def _seed_claim_on_episode(conn, ep_id, claim_id, text, ts):
+    emit(conn, UID, "seed", "CANONICALIZED",
+         {"action": "new", "claim_id": claim_id, "text": text,
+          "episode_id": ep_id, "verbatim": text, "cluster": "main", "ts": ts})
+    conn.commit()
+
+
+def _integrity_flags(conn):
+    return [json.loads(e["payload_json"])
+            for e in store.events_since(conn, UID, 0, types=["INTEGRITY_FLAGGED"])]
+
+
+def test_integrity_faithful_claim_passes(conn, fake_llm):
+    ts = "2026-01-01T00:00:00+00:00"
+    ep = encode(conn, UID, f"{S1} {S2} {S3}", source="test")["episode_id"]
+    _seed_claim_on_episode(conn, ep, "clm_f", S1, ts)   # verbatim of the source
+    _check_integrity(conn, UID, "run_i", ["clm_f"], ts)
+    assert _integrity_flags(conn) == []                 # grounded → no flag
+
+
+def test_integrity_ungrounded_claim_flagged(conn, fake_llm):
+    ts = "2026-01-01T00:00:00+00:00"
+    ep = encode(conn, UID, f"{S1} {S2} {S3}", source="test")["episode_id"]
+    _seed_claim_on_episode(
+        conn, ep, "clm_u",
+        "Quarterly corporate tax filing deadlines vary by jurisdiction.", ts)
+    _check_integrity(conn, UID, "run_i", ["clm_u"], ts)
+    flags = _integrity_flags(conn)
+    assert len(flags) == 1 and flags[0]["kind"] == "ungrounded"
+    assert flags[0]["claim_id"] == "clm_u"
+
+
+def test_integrity_contradiction_flagged(conn, fake_llm, monkeypatch):
+    """Geometry can't see a flipped polarity, so an AMBIGUOUS claim is sent to the
+    resolver; a contradiction with the source is flagged. Route + stance are
+    controlled (geometry tested in test_predict)."""
+    ts = "2026-01-01T00:00:00+00:00"
+    ep = encode(conn, UID, f"{S1} {S2} {S3}", source="test")["episode_id"]
+    _seed_claim_on_episode(conn, ep, "clm_c", S1, ts)
+    monkeypatch.setattr("core.predict.decide", lambda ms, calib=None: {
+        "fragments": [{"route": "AMBIGUOUS", "anchor_text": S1, "anchor_id": "x"}]})
+    monkeypatch.setattr("core.encode.classify_stance",
+                        lambda premise, hyp: "contradiction")
+    _check_integrity(conn, UID, "run_i", ["clm_c"], ts)
+    flags = _integrity_flags(conn)
+    assert len(flags) == 1 and flags[0]["kind"] == "contradicts_source"
+
+
+def test_integrity_ambiguous_but_faithful_passes(conn, fake_llm, monkeypatch):
+    ts = "2026-01-01T00:00:00+00:00"
+    ep = encode(conn, UID, f"{S1} {S2} {S3}", source="test")["episode_id"]
+    _seed_claim_on_episode(conn, ep, "clm_r", S1, ts)
+    monkeypatch.setattr("core.predict.decide", lambda ms, calib=None: {
+        "fragments": [{"route": "AMBIGUOUS", "anchor_text": S1, "anchor_id": "x"}]})
+    monkeypatch.setattr("core.encode.classify_stance",
+                        lambda premise, hyp: "entailment")   # refines, not contradicts
+    _check_integrity(conn, UID, "run_i", ["clm_r"], ts)
+    assert _integrity_flags(conn) == []
+
+
+# ── C1: revisit order — most-surprising first ─────────────────────────────────
+from core.consolidate import _revisit_order  # noqa: E402
+
+
+def test_revisit_order_puts_surprise_first():
+    eps = [
+        {"id": "e1", "receipt_json": json.dumps({"n_novelties": 1, "contradictions": []})},
+        {"id": "e2", "receipt_json": json.dumps(
+            {"n_novelties": 0, "contradictions": [{"claim_id": "x"}]})},  # AMBIGUOUS
+        {"id": "e3", "receipt_json": json.dumps({"n_novelties": 5, "contradictions": []})},
+    ]
+    order = [e["id"] for e in _revisit_order(eps)]
+    assert order == ["e2", "e3", "e1"]  # contradiction first, then by novelty desc
+
+
 def test_llm_calls_never_hold_a_write_transaction(conn, fake_llm, monkeypatch):
     """A save_note arriving mid-consolidation must never wait on a network call:
     every llm.call must happen with no transaction open on the connection."""

@@ -168,7 +168,7 @@ relabel-only decay, averaging merges, writes-only.
 
 | # | Step (PRD function) | X vs Y | Build | Replaces | Test |
 |---|---|---|---|---|---|
-| C1 | **Prioritise what to revisit first** — spend effort where surprise was highest | rank by residual; AMBIGUOUS (unresolved residuals on anchors) first | `measure()` rank over pending items (work-ordering, not a write) | undifferentiated batch pass | AMBIGUOUS/high-residual items processed before low; resolver budget spent on them first |
+| C1 | **Prioritise what to revisit first** — ✅ BUILT (2026-06-22) | rank by residual; AMBIGUOUS (unresolved residuals on anchors) first | `_revisit_order` sorts the batch most-surprising-first off the encode receipt (contradiction = AMBIGUOUS residual-on-anchor outranks raw novelty count). Pure work-ordering — batch membership (oldest N) unchanged, only steers resolver-budget order. | undifferentiated batch pass | ✅ `test_revisit_order_puts_surprise_first` (contradiction first, then novelty desc) |
 | C2 | **Dedupe** claims | claim vs rest of memory | `measure()` + iterative-assembly | `CANON_AUTO_SAME=0.92` | planted dup set collapses to 1; near-but-distinct kept |
 | C3 | **Assign** claim → theme | claim vs each concept | `measure()` nearest-cluster | similarity heuristic | assignment matches planted membership |
 | C4 | **Split / Form / Re-anchor** concepts | members vs concept centroid | `measure()` spread test | — | bimodal concept splits; drifted anchor re-centres to medoid |
@@ -177,7 +177,7 @@ relabel-only decay, averaging merges, writes-only.
 | C7 | **Forget safely / prune** — ✅ BUILT (2026-06-22) | pruned item vs what remains | `_prune_safely`: DORMANT concepts only, `guard.forget` leave-one-out → `PRUNED` event drops reconstructable members (orphaned claim deleted, re-derivable from raw via C14), protects irreplaceable ones however quiet; never empties a concept (≥1 representative); thin concepts (< `PRUNE_MIN_MEMBERS`) skipped. | relabel-only decay | ✅ drops reconstructable / protects irreplaceable / skips active / never empties (4 cases); geometry in `test_wrappers`. NOTE: "quiet"=usage gate is C13 (deferred); prune currently gates on dormant age only |
 | C8 | **Detect conflicts + version** — ✅ BUILT (2026-06-22) | ambiguous residual → `_resolve_conflict()` (LLM) | `claims` gain `status`/`superseded_by`/`qualifier`/`version_group` (additive migration). `_reconcile` resolves each `contradicts` edge into supersede/scope/version; `VERSIONED` event applies it. **Margin-before-flip** on claim `strength` (`VERSION_FLIP_MARGIN`): a sub-margin supersede is held as a *version*, incumbent stays current → no oscillation. Resolution frozen in payload → replay-deterministic. recall surfaces ⚖️ contested/superseded; loser never dropped. | first-claim heuristic | ✅ 6 cases: flip past margin / blocked-by-margin held / scope-with-qualifiers / both-stand / survives rebuild / contested-surfaced. Resolver direction mocked (LLM's job); margin+versioning logic tested. NOTE: margin metric is `strength` until C13 usage signals |
 | C9 | **Demote to background** | repeated low-residual item over time | usage + repetition signal (logged, not measured) | — | item surprising once then echoed N× → folded into theme |
-| C10 | **Store-integrity check** — derived claim faithful to its source | derived claim vs its source episode | `measure()`/route between claim and raw episode | — | derived claim that contradicts its raw source (without changing today's answer) flagged; faithful claim passes |
+| C10 | **Store-integrity check** — ✅ BUILT (2026-06-22) | derived claim vs its source episode | `_check_integrity` routes each derived claim against its source-episode sentences (stored vectors, no embed call): PREDICTED → grounded/pass; NOVEL → ungrounded FLAG; AMBIGUOUS → resolver, contradicts-source FLAG (geometry can't see flipped polarity). `INTEGRITY_FLAGGED` is log-only (a review signal, NOT a headline metric — PRD). | — | ✅ 4 cases: faithful passes / ungrounded flagged / contradiction flagged (route+stance mocked) / ambiguous-but-faithful passes |
 | C11 | **Gauge saturation + graduate region from cold-start** | region spread stability | `compute_baselines` maturity check | no cold-start handling at all | region with < graduation count → trusts prior; matured region → trusts local |
 | C12 | **Fit calibration + push down** | SR@B over candidate `z_echo`/`prox_margin` | calibration persistence + fit loop | hard-coded `Z_ECHO=-3.5` | fitted calibration beats default on frozen SR@B; pushed to Write/Retrieve |
 | C13 | **Consume retrieval signals** | — | promote/demote/resolve from R8 events | consolidation sees writes only | salient-but-never-retrieved demoted; dropped-but-needed promoted; rare-correct NOT suppressed |
@@ -245,10 +245,10 @@ P4  RETRIEVE — spike then build ..... ◐ BUILT (structure complete; tuning de
 P5  CONSOLIDATE safety + signals .... ◐ IN PROGRESS — safety core ✅: C14 rollback + C6/C7 reconstruction-guard
                                      merge/forget + C8 conflict versioning (margin-before-flip). 16 invariant/
                                      wiring tests; geometry in test_wrappers; resolver direction mocked.
-                                     LEFT: C1 (revisit-order), C9 (background decay), C10 (store-integrity),
-                                     C11 (cold-start graduation), C12 (calibration fit), C13 (retrieval signals).
-                                     SR@B + forgetting-rate credit deferred to the quota window (as P3/P4).
-                                     EXIT: C-gate (ΔSR@B≥0, forgetting=0, rollback works)
+                                     C1 revisit-order ✅ + C10 store-integrity ✅ (offline). LEFT: C9 (background
+                                     decay), C11 (cold-start graduation), C13 (retrieval signals), C12 (calibration
+                                     fit — gated on SR@B quota). SR@B + forgetting-rate credit deferred to the
+                                     quota window (as P3/P4). EXIT: C-gate (ΔSR@B≥0, forgetting=0, rollback works)
 P6  Frontier (cross-cutting §4) ..... EXIT: redaction/isolation/write-during-consolidate tests green
 ```
 
