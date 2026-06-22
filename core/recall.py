@@ -23,6 +23,7 @@ MIN_ACTIVATION = 0.05
 
 FREQUENT_STRENGTH = 2.0   # 🔁 claim re-encountered (1.0 + 2×SUPPORT_BUMP)
 TIME_GAP_DAYS = 45        # 🕰️ resurfacing after this long
+BACKGROUND_SCORE_FACTOR = 0.5  # 🌫️ C9: demote a folded-into-theme claim's standalone pull
 
 
 def _days_since(iso_ts: str | None) -> int:
@@ -119,6 +120,11 @@ def _score_node(conn, user_id: str, node: str, activation: float, via: str) -> d
         n_support = conn.execute(
             "SELECT COUNT(*) AS n FROM claim_support WHERE claim_id = ? AND user_id = ?",
             (node, user_id)).fetchone()["n"]
+        # C9: a background claim's theme stands for it — demote its standalone pull
+        # (don't drop it; the concept surfaces instead).
+        if c["background"]:
+            score *= BACKGROUND_SCORE_FACTOR
+            signals.append("🌫️ background")
         out = {"type": "claim", "id": node, "text": c["text"],
                "strength": round(c["strength"], 2), "n_episodes": n_support,
                "score": round(score, 4), "signals": signals,

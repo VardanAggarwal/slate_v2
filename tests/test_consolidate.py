@@ -552,6 +552,78 @@ def test_revisit_order_puts_surprise_first():
     assert order == ["e2", "e3", "e1"]  # contradiction first, then by novelty desc
 
 
+# ── C9: background decay — fold a recurrent claim into its theme ───────────────
+from core.consolidate import _demote_background, BACKGROUND_MIN_REPEATS  # noqa: E402
+
+
+def _seed_member_claim(conn, claim_id, n_support, ts):
+    """A claim attached to a concept, supported by n_support episodes."""
+    emit(conn, UID, "seed", "CANONICALIZED",
+         {"action": "new", "claim_id": claim_id, "text": S1,
+          "episode_id": "ep_0", "verbatim": S1, "cluster": "main", "ts": ts})
+    for i in range(1, n_support):
+        emit(conn, UID, "seed", "CANONICALIZED",
+             {"action": "support", "claim_id": claim_id,
+              "episode_id": f"ep_{i}", "verbatim": S1, "cluster": "main", "ts": ts})
+    emit(conn, UID, "seed", "CONCEPT_CREATED",
+         {"concept_id": "cpt_bg", "label": "bg", "canonical": "bg",
+          "claim_ids": [claim_id], "ts": ts})
+    conn.commit()
+
+
+def test_background_folds_recurrent_member(conn, fake_llm):
+    ts = "2026-01-01T00:00:00+00:00"
+    _seed_member_claim(conn, "clm_bg", n_support=BACKGROUND_MIN_REPEATS + 1, ts=ts)
+    with conn:
+        _demote_background(conn, UID, "run_bg", ["clm_bg"], ts)
+    assert store.get_claim(conn, UID, "clm_bg")["background"] == 1
+
+
+def test_background_skips_rare_claim(conn, fake_llm):
+    """A claim seen once (rare) is never demoted — the rare-correct guard."""
+    ts = "2026-01-01T00:00:00+00:00"
+    _seed_member_claim(conn, "clm_rare", n_support=1, ts=ts)
+    with conn:
+        _demote_background(conn, UID, "run_bg", ["clm_rare"], ts)
+    assert store.get_claim(conn, UID, "clm_rare")["background"] == 0
+
+
+def test_background_requires_a_theme(conn, fake_llm):
+    """A recurrent claim with no concept has no theme to fold into → not demoted."""
+    ts = "2026-01-01T00:00:00+00:00"
+    emit(conn, UID, "seed", "CANONICALIZED",
+         {"action": "new", "claim_id": "clm_orphan", "text": S1,
+          "episode_id": "ep_0", "verbatim": S1, "cluster": "main", "ts": ts})
+    for i in range(1, BACKGROUND_MIN_REPEATS + 1):
+        emit(conn, UID, "seed", "CANONICALIZED",
+             {"action": "support", "claim_id": "clm_orphan",
+              "episode_id": f"ep_{i}", "verbatim": S1, "cluster": "main", "ts": ts})
+    conn.commit()
+    with conn:
+        _demote_background(conn, UID, "run_bg", ["clm_orphan"], ts)
+    assert store.get_claim(conn, UID, "clm_orphan")["background"] == 0
+
+
+def test_background_demoted_at_retrieval(conn, fake_llm):
+    from core import recall
+    ts = "2026-01-01T00:00:00+00:00"
+    _seed_member_claim(conn, "clm_bg", n_support=BACKGROUND_MIN_REPEATS + 1, ts=ts)
+    before = recall._score_node(conn, UID, "clm_bg", 1.0, "seed")["score"]
+    with conn:
+        _demote_background(conn, UID, "run_bg", ["clm_bg"], ts)
+    after = recall._score_node(conn, UID, "clm_bg", 1.0, "seed")
+    assert after["score"] < before and "🌫️ background" in after["signals"]
+
+
+def test_background_survives_rebuild(conn, fake_llm):
+    ts = "2026-01-01T00:00:00+00:00"
+    _seed_member_claim(conn, "clm_bg", n_support=BACKGROUND_MIN_REPEATS + 1, ts=ts)
+    with conn:
+        _demote_background(conn, UID, "run_bg", ["clm_bg"], ts)
+    rebuild(conn)
+    assert store.get_claim(conn, UID, "clm_bg")["background"] == 1
+
+
 def test_llm_calls_never_hold_a_write_transaction(conn, fake_llm, monkeypatch):
     """A save_note arriving mid-consolidation must never wait on a network call:
     every llm.call must happen with no transaction open on the connection."""

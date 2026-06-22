@@ -99,7 +99,10 @@ CREATE TABLE IF NOT EXISTS claims (
     status        TEXT DEFAULT 'current',
     superseded_by TEXT,
     qualifier     TEXT,
-    version_group TEXT
+    version_group TEXT,
+    -- C9 background: a claim re-predicted enough to become background (its theme
+    -- now stands for it). Orthogonal to status; demotes standalone retrieval pull.
+    background    INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS claim_support (
@@ -323,7 +326,8 @@ def connect(db_path: str | Path | None = None) -> sqlite3.Connection:
 # existing table — so a new column on an existing table is added here.
 _ADD_COLUMNS = {"fragments": {"cluster": "TEXT", "medoid_idx": "INTEGER"},
                 "claims": {"status": "TEXT DEFAULT 'current'", "superseded_by": "TEXT",
-                           "qualifier": "TEXT", "version_group": "TEXT"}}
+                           "qualifier": "TEXT", "version_group": "TEXT",
+                           "background": "INTEGER DEFAULT 0"}}
 
 
 def _migrate_add_columns(conn: sqlite3.Connection) -> None:
@@ -705,6 +709,19 @@ def set_claim_version(conn: sqlite3.Connection, user_id: str, claim_id: str,
     assign = ", ".join(f"{k} = ?" for k in sets)
     conn.execute(f"UPDATE claims SET {assign} WHERE id = ? AND user_id = ?",
                  (*sets.values(), claim_id, user_id))
+
+
+def set_claim_background(conn: sqlite3.Connection, user_id: str, claim_id: str,
+                         value: int = 1) -> None:
+    """C9 — mark a claim background (its theme now represents it). Reversible."""
+    conn.execute("UPDATE claims SET background = ? WHERE id = ? AND user_id = ?",
+                 (int(value), claim_id, user_id))
+
+
+def claim_support_count(conn: sqlite3.Connection, user_id: str, claim_id: str) -> int:
+    return conn.execute(
+        "SELECT COUNT(*) AS n FROM claim_support WHERE claim_id = ? AND user_id = ?",
+        (claim_id, user_id)).fetchone()["n"]
 
 
 def contradiction_pairs(conn: sqlite3.Connection, user_id: str,

@@ -203,6 +203,11 @@ def apply_event(conn, user_id: str, type_: str, payload: dict) -> None:
     elif type_ == "DECAYED":
         store.update_concept(conn, user_id, p["concept_id"], state=p["state_to"])
 
+    elif type_ == "BACKGROUNDED":
+        # C9 — the claim has been re-predicted enough to be background; its theme
+        # now stands for it, so its standalone retrieval pull is demoted.
+        store.set_claim_background(conn, user_id, p["claim_id"], 1)
+
     elif type_ == "PRUNED":
         # C7 safe-forget: the guard confirmed the surviving members reconstruct
         # this claim, so dropping it loses no nuance. Remove it from the concept;
@@ -834,6 +839,30 @@ def _decay_strengthen(conn, user_id: str, run_id: str, episodes, ts: str) -> Non
                 "state_to": new_state, "days_inactive": days, "ts": ts})
 
 
+# C9 — background. Times a claim must be RE-predicted (support beyond the first
+# episode that minted it) before it folds into its theme. The trigger is high
+# recurrence — the opposite of rare — so it never suppresses a rare-but-correct
+# claim (PRD's one caution). Folding requires a theme to fold INTO (concept member).
+BACKGROUND_MIN_REPEATS = 2
+
+
+def _demote_background(conn, user_id: str, run_id: str, claim_ids: list[str],
+                       ts: str) -> None:
+    """Fold claims that have become background into their theme (PRD §Consolidation:
+    "things that have become pure background are folded into the theme"). Surprise
+    trending to PREDICTED is read as recurrence: a claim re-encountered across
+    ≥ BACKGROUND_MIN_REPEATS further episodes, that belongs to a concept, is
+    demoted. Scoped to this run's touched claims (where recurrence just grew)."""
+    for cid in dict.fromkeys(claim_ids):           # de-dup, keep order
+        claim = store.get_claim(conn, user_id, cid)
+        if not claim or claim["background"]:
+            continue
+        if not store.claim_in_any_concept(conn, user_id, cid):
+            continue                                # no theme to fold into
+        if store.claim_support_count(conn, user_id, cid) - 1 >= BACKGROUND_MIN_REPEATS:
+            emit(conn, user_id, run_id, "BACKGROUNDED", {"claim_id": cid, "ts": ts})
+
+
 # C7 — safe forget. Floor below which the guard returns cold_start anyway; an
 # explicit gate so prune never touches a thin concept (PRD: protect the rare).
 PRUNE_MIN_MEMBERS = 3
@@ -929,6 +958,9 @@ def consolidate(conn, user_id: str, max_episodes: int = 50) -> dict:
         cost += _reconcile(conn, user_id, run_id, new_claim_ids, ts)
         # C10: flag derived claims that aren't faithful to their raw source.
         _check_integrity(conn, user_id, run_id, new_claim_ids, ts)
+        # C9: fold recurrent (now-background) claims into their theme.
+        with conn:
+            _demote_background(conn, user_id, run_id, new_claim_ids, ts)
         cost += _bridges(conn, user_id, run_id, ts)
         with conn:
             _decay_strengthen(conn, user_id, run_id, episodes, ts)
