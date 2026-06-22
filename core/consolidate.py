@@ -12,7 +12,7 @@ import hashlib
 import json
 from datetime import datetime, timezone
 
-from core import config, llm, store
+from core import config, guard, llm, store
 from core.encode import get_embedder, split_sentences
 
 # Strength deltas (spaced-repetition pressure)
@@ -151,11 +151,22 @@ def apply_event(conn, user_id: str, type_: str, payload: dict) -> None:
         store.recompute_concept_embedding(conn, user_id, p["concept_id"])
 
     elif type_ == "MERGED":
-        # Snapshots of both concepts ride in the payload; the loser's history
-        # lives in the event log, so removing its row is non-destructive.
-        for cid in p["loser_snapshot"]["member_claim_ids"]:
+        # C6 nuance guard: fold only the members the winner reconstructs; members
+        # the guard kept (fold/kept partition frozen in the payload for replay)
+        # stay in the loser, which therefore survives. Legacy events without the
+        # partition fold everything (fold_claim_ids defaults to all loser members).
+        all_members = p["loser_snapshot"]["member_claim_ids"]
+        fold_ids = p.get("fold_claim_ids", all_members)
+        kept_ids = p.get("kept_claim_ids", [])
+        for cid in fold_ids:
             store.add_concept_member(conn, user_id, p["winner_id"], cid)
-        store.delete_concept(conn, user_id, p["loser_id"])
+        if kept_ids:  # nuance remains → loser is not emptied, only the folded leave
+            for cid in fold_ids:
+                store.remove_concept_member(conn, user_id, p["loser_id"], cid)
+            store.update_concept(conn, user_id, p["loser_id"], last_activity=p["ts"])
+            store.recompute_concept_embedding(conn, user_id, p["loser_id"])
+        else:
+            store.delete_concept(conn, user_id, p["loser_id"])
         store.update_concept(conn, user_id, p["winner_id"], label=p.get("label"),
                              canonical=p.get("canonical"), last_activity=p["ts"])
         store.recompute_concept_embedding(conn, user_id, p["winner_id"])
@@ -192,6 +203,37 @@ def apply_event(conn, user_id: str, type_: str, payload: dict) -> None:
     elif type_ == "DECAYED":
         store.update_concept(conn, user_id, p["concept_id"], state=p["state_to"])
 
+    elif type_ == "PRUNED":
+        # C7 safe-forget: the guard confirmed the surviving members reconstruct
+        # this claim, so dropping it loses no nuance. Remove it from the concept;
+        # if no concept still holds it, drop it from working memory (re-derivable
+        # from raw — that is what makes the prune safe).
+        store.remove_concept_member(conn, user_id, p["concept_id"], p["claim_id"])
+        if not store.claim_in_any_concept(conn, user_id, p["claim_id"]):
+            store.delete_claim(conn, user_id, p["claim_id"])
+        if p.get("concept_id"):
+            store.recompute_concept_embedding(conn, user_id, p["concept_id"])
+
+    elif type_ == "VERSIONED":
+        # C8 — apply a reconciliation decided (with the flip margin) before emit.
+        # Both rivals join one version_group; the current view is surfaced as
+        # contested at retrieval, the loser is never silently dropped.
+        grp = p["version_group"]
+        store.set_claim_version(conn, user_id, p["current_id"],
+                                status="current", version_group=grp,
+                                qualifier=p.get("qualifier_current"))
+        if p["mode"] == "supersede":
+            store.set_claim_version(conn, user_id, p["other_id"],
+                                    status="superseded", superseded_by=p["current_id"],
+                                    version_group=grp)
+        elif p["mode"] == "scope":  # both true under different conditions
+            store.set_claim_version(conn, user_id, p["other_id"],
+                                    status="current", version_group=grp,
+                                    qualifier=p.get("qualifier_other"))
+        else:  # "version": both stand; other is held
+            store.set_claim_version(conn, user_id, p["other_id"],
+                                    status="version", version_group=grp)
+
     elif type_ == "FRAGMENTED":
         # Write-side working memory. Decided by the async refine pass (core/write);
         # the applier here is what lets rebuild() re-derive fragments from the log
@@ -203,14 +245,36 @@ def apply_event(conn, user_id: str, type_: str, payload: dict) -> None:
 
 
 def rebuild(conn) -> dict:
-    """Truncate the semantic store (all users) and re-apply the entire event
-    log, each event under the user that emitted it. Admin path."""
+    """Truncate the semantic store (all users) and re-apply the event log, each
+    event under the user that emitted it. Rolled-back runs are skipped, so this
+    is also the re-materialization path after a rollback. Admin path."""
     with conn:
         store.truncate_semantic(conn)
-        events = store.events_since(conn, None, 0)
+        events = store.events_since(conn, None, 0, include_rolled_back=False)
         for ev in events:
             apply_event(conn, ev["user_id"], ev["type"], json.loads(ev["payload_json"]))
     return {"events_applied": len(events)}
+
+
+def rollback_run(conn, run_id: str) -> dict:
+    """Reverse one consolidation run (PRD §Consolidation: "bad runs must be
+    undoable"). The run's events are flagged rolled-back (kept on disk for
+    audit), its episodes are made re-eligible, and the semantic store is
+    re-materialized from the remaining active log.
+
+    This also defeats a *poisoned* log: a re-run after rollback re-derives the
+    freed episodes from their immutable raw text — the rolled-back BLUEPRINTED/
+    CANONICALIZED events are invisible to the `_existing_*` guards (they filter
+    on the same active-run predicate), so nothing stale is reused."""
+    run = store.get_run(conn, run_id)
+    if run is None:
+        return {"status": "unknown_run", "run_id": run_id}
+    with conn:
+        store.mark_run_rolled_back(conn, run_id)
+        freed = store.unconsolidate_run_episodes(conn, run_id)
+    res = rebuild(conn)
+    return {"status": "rolled_back", "run_id": run_id,
+            "episodes_freed": freed, "events_applied": res["events_applied"]}
 
 
 # ── Step 2: blueprint extraction ──────────────────────────────────────────────
@@ -275,19 +339,23 @@ def blueprint(text: str) -> tuple[dict, float]:
 # near-duplicate claims. An episode's BLUEPRINTED event and its CANONICALIZED
 # events are written in one transaction, so either both exist fully or neither.
 def _existing_blueprint(conn, user_id: str, episode_id: str) -> dict | None:
+    # Active runs only — a rolled-back run's blueprint must not short-circuit
+    # re-derivation from raw (the poisoned-log guard; see rollback_run).
     row = conn.execute(
-        """SELECT payload_json FROM events WHERE type = 'BLUEPRINTED'
+        f"""SELECT payload_json FROM events WHERE type = 'BLUEPRINTED'
            AND user_id = ?
            AND json_extract(payload_json, '$.episode_id') = ?
+           AND {store.ACTIVE_RUN_PREDICATE}
            ORDER BY seq DESC LIMIT 1""", (user_id, episode_id)).fetchone()
     return json.loads(row["payload_json"])["blueprint"] if row else None
 
 
 def _existing_canon(conn, user_id: str, episode_id: str) -> list[tuple[str, str]]:
     rows = conn.execute(
-        """SELECT payload_json FROM events WHERE type = 'CANONICALIZED'
+        f"""SELECT payload_json FROM events WHERE type = 'CANONICALIZED'
            AND user_id = ?
-           AND json_extract(payload_json, '$.episode_id') = ? ORDER BY seq""",
+           AND json_extract(payload_json, '$.episode_id') = ?
+           AND {store.ACTIVE_RUN_PREDICATE} ORDER BY seq""",
         (user_id, episode_id)).fetchall()
     out = []
     for r in rows:
@@ -443,11 +511,15 @@ def _apply_concept_decisions(conn, user_id, run_id, decisions, valid_claims,
         elif action == "MERGE":
             w, l = d.get("winner_id"), d.get("loser_id")
             if w in valid_concepts and l in valid_concepts and w != l:
+                loser_snap = _snapshot(conn, user_id, l)
+                fold_ids, kept_ids = _merge_guard_partition(
+                    conn, user_id, w, loser_snap["member_claim_ids"])
                 emit(conn, user_id, run_id, "MERGED", {
                     "winner_id": w, "loser_id": l,
                     "label": d.get("label"), "canonical": d.get("canonical"),
+                    "fold_claim_ids": fold_ids, "kept_claim_ids": kept_ids,
                     "winner_snapshot": _snapshot(conn, user_id, w),
-                    "loser_snapshot": _snapshot(conn, user_id, l), "ts": ts})
+                    "loser_snapshot": loser_snap, "ts": ts})
         elif action == "SPLIT" and d.get("concept_id") in valid_concepts:
             members = set(store.concept_member_ids(conn, user_id, d["concept_id"]))
             into = []
@@ -469,6 +541,37 @@ def _snapshot(conn, user_id: str, concept_id: str) -> dict:
     c = store.get_concept(conn, user_id, concept_id)
     return {"concept": dict(c) if c else None,
             "member_claim_ids": store.concept_member_ids(conn, user_id, concept_id)}
+
+
+def _members_with_emb(conn, user_id: str, claim_ids: list[str]) -> list[dict]:
+    """Memory rows {"id","text","embedding"} for the reconstruction guard, read
+    from STORED vectors (vec_claims) — no embedding call, so it is safe inside a
+    txn even when prod embeds via the HF API (memory: slate-embeddings-hf-only)."""
+    rows = []
+    for cid in claim_ids:
+        emb = store.claim_embedding(conn, user_id, cid)
+        claim = store.get_claim(conn, user_id, cid)
+        if emb is not None and claim is not None:
+            rows.append({"id": cid, "text": claim["text"], "embedding": emb})
+    return rows
+
+
+def _merge_guard_partition(conn, user_id: str, winner_id: str,
+                           loser_member_ids: list[str]) -> tuple[list[str], list[str]]:
+    """C6 nuance guard. Split the loser's members into those the winner already
+    reconstructs (safe to FOLD) vs those carrying a nuance the merge would erase
+    (KEEP standalone in the loser). Pure geometry over stored vectors; the LLM
+    concept-pass already played resolver in proposing the merge, and C14 makes a
+    wrong fold reversible. Empty/uncomparable → legacy behaviour (fold all)."""
+    survivors = _members_with_emb(conn, user_id,
+                                  store.concept_member_ids(conn, user_id, winner_id))
+    losers = _members_with_emb(conn, user_id, loser_member_ids)
+    if not survivors or not losers:
+        return list(loser_member_ids), []
+    verdicts = guard.merge(losers, survivors, scope=winner_id)
+    fold = [v["id"] for v in verdicts if v["safe_to_drop"]]
+    keep = [v["id"] for v in verdicts if not v["safe_to_drop"]]
+    return fold, keep
 
 
 # ── Step 5: relations (spine promotion + contradiction receipts) ──────────────
@@ -508,6 +611,86 @@ def _relations(conn, user_id: str, run_id: str, episode, bp: dict,
                 "from_id": episode_claim_ids[0], "to_id": old_claim,
                 "relation": "contradicts", "weight": 1.0,
                 "evidence_episode_id": episode["id"], "ts": ts})
+
+
+# ── Step 5b: reconcile + version conflicts (C8) ───────────────────────────────
+# Challenger must outweigh the incumbent by this much (claim strength — the
+# spaced-repetition signal) before the CURRENT view flips, so a belief that
+# flip-flops can't oscillate forever (PRD §Consolidation). A scopeable knob
+# (usage signals from C13 will refine the metric); a constant for now.
+VERSION_FLIP_MARGIN = 1.0
+
+PROMPT_VERSION = """Two of the user's notes contradict each other. Decide how they reconcile. Return ONLY JSON.
+
+NEWER claim: "{newer}"
+OLDER claim: "{older}"
+
+Pick "mode":
+- "supersede": the newer claim replaces the older on better/newer grounds (a changed mind).
+- "scope": both are true under DIFFERENT conditions — give each a short "qualifier_newer"/"qualifier_older" naming its condition.
+- "version": both genuinely stand as rival views; neither clearly wins.
+
+{"mode": "supersede|scope|version", "qualifier_newer": null, "qualifier_older": null}"""
+
+
+def _resolve_conflict(newer_text: str, older_text: str) -> tuple[dict, float]:
+    """Reconcile a contradiction into supersede/scope/version (PRD: the predictor
+    detects, the resolver — LLM — reconciles). On LLM failure the safe default is
+    "version": keep both, flip nothing, drop nothing."""
+    try:
+        result = llm.call(
+            PROMPT_VERSION.replace("{newer}", newer_text).replace("{older}", older_text),
+            tier="judgment", max_tokens=512)
+        j = result["json"]
+        mode = (j.get("mode") or "version").lower()
+        if mode not in ("supersede", "scope", "version"):
+            mode = "version"
+        return {"mode": mode, "qualifier_newer": j.get("qualifier_newer"),
+                "qualifier_older": j.get("qualifier_older")}, result["cost"]
+    except llm.LLMError:
+        return {"mode": "version"}, 0.0
+
+
+def _reconcile(conn, user_id: str, run_id: str, claim_ids: list[str], ts: str) -> float:
+    """Resolve every contradiction touching this run's claims. Reads + LLM run
+    OUTSIDE any txn (a concurrent save_note never waits on the network); the
+    VERSIONED events then commit in one short txn. The flip margin is applied
+    here, so the resulting current/other is frozen in the payload → deterministic
+    replay (the applier never re-resolves)."""
+    seen, decisions, cost = set(), [], 0.0
+    for a_id, b_id in store.contradiction_pairs(conn, user_id, claim_ids):
+        key = tuple(sorted((a_id, b_id)))
+        if key in seen:
+            continue
+        seen.add(key)
+        ca = store.get_claim(conn, user_id, a_id)   # newer (challenger)
+        cb = store.get_claim(conn, user_id, b_id)   # older (incumbent)
+        if not ca or not cb:
+            continue
+        res, c = _resolve_conflict(ca["text"], cb["text"])
+        cost += c
+        decisions.append((dict(ca), dict(cb), res))
+    if not decisions:
+        return cost
+
+    with conn:
+        for ca, cb, res in decisions:
+            grp = cb["version_group"] or ca["version_group"] or cb["id"]
+            payload = {"version_group": grp, "ts": ts,
+                       "qualifier_current": None, "qualifier_other": None}
+            mode = res["mode"]
+            if mode == "scope":  # both stand under conditions — no flip
+                payload.update(mode="scope", current_id=cb["id"], other_id=ca["id"],
+                               qualifier_current=res.get("qualifier_older"),
+                               qualifier_other=res.get("qualifier_newer"))
+            elif (mode == "supersede"
+                  and ca["strength"] >= cb["strength"] + VERSION_FLIP_MARGIN):
+                payload.update(mode="supersede", current_id=ca["id"],  # newer wins
+                               other_id=cb["id"])
+            else:  # sub-margin supersede or "version": incumbent stays, challenger held
+                payload.update(mode="version", current_id=cb["id"], other_id=ca["id"])
+            emit(conn, user_id, run_id, "VERSIONED", payload)
+    return cost
 
 
 # ── Step 6: latent bridges (embedding math + small verify calls) ──────────────
@@ -600,6 +783,34 @@ def _decay_strengthen(conn, user_id: str, run_id: str, episodes, ts: str) -> Non
                 "state_to": new_state, "days_inactive": days, "ts": ts})
 
 
+# C7 — safe forget. Floor below which the guard returns cold_start anyway; an
+# explicit gate so prune never touches a thin concept (PRD: protect the rare).
+PRUNE_MIN_MEMBERS = 3
+
+
+def _prune_safely(conn, user_id: str, run_id: str, ts: str) -> None:
+    """Prune what the remaining structure can reconstruct (PRD §Consolidation:
+    "only let go of what the remaining structure can reconstruct"). Restricted to
+    DORMANT concepts (old, quiet); the reconstruction guard's leave-one-out z then
+    drops only the reconstructable members and PROTECTS the irreplaceable ones —
+    however quiet. Never empties a concept: at least one representative stays."""
+    for c in store.all_concepts(conn, user_id):
+        if c["state"] != "dormant":
+            continue
+        member_ids = store.concept_member_ids(conn, user_id, c["id"])
+        if len(member_ids) < PRUNE_MIN_MEMBERS:
+            continue
+        verdicts = guard.forget(_members_with_emb(conn, user_id, member_ids),
+                                scope=c["id"])
+        droppable = [v["id"] for v in verdicts if v["safe_to_drop"]]
+        if len(droppable) >= len(member_ids):   # never forget an entire concept
+            droppable = droppable[1:]
+        for cid in droppable:
+            emit(conn, user_id, run_id, "PRUNED", {
+                "concept_id": c["id"], "claim_id": cid,
+                "reason": "reconstructable_dormant", "ts": ts})
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 def consolidate(conn, user_id: str, max_episodes: int = 50) -> dict:
     """One sleep cycle over one user's oldest unconsolidated episodes (sync mode).
@@ -649,9 +860,12 @@ def consolidate(conn, user_id: str, max_episodes: int = 50) -> dict:
             for ep, bp, episode_claims in per_episode:
                 _relations(conn, user_id, run_id, ep, bp, episode_claims)
 
+        # C8: reconcile contradictions emitted above (LLM, so its own short txn).
+        cost += _reconcile(conn, user_id, run_id, new_claim_ids, ts)
         cost += _bridges(conn, user_id, run_id, ts)
         with conn:
             _decay_strengthen(conn, user_id, run_id, episodes, ts)
+            _prune_safely(conn, user_id, run_id, ts)
 
         with conn:
             for ep, _, _ in per_episode:  # skipped episodes stay unconsolidated

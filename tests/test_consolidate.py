@@ -3,8 +3,9 @@ import json
 import pytest
 
 from core import store
-from core.consolidate import (_decay_strengthen, apply_event, consolidate,
-                              emit, rebuild)
+from core.consolidate import (_apply_concept_decisions, _decay_strengthen,
+                              _prune_safely, apply_event, consolidate, emit,
+                              rebuild, rollback_run)
 from core.encode import encode, split_sentences
 from core.llm import LLMError
 from tests.conftest import UID
@@ -200,6 +201,276 @@ def test_retry_reuses_blueprint_and_canon_events(conn, fake_llm, monkeypatch):
     assert len(store.events_since(conn, UID, 0, types=["CANONICALIZED"])) == canon_events
     assert conn.execute("SELECT COUNT(*) FROM claims").fetchone()[0] == claims_before
     assert store.unconsolidated_episodes(conn, UID) == []
+
+
+# ── C14: run-scoped rollback + re-derive from raw ─────────────────────────────
+def test_rollback_fully_reverses_a_run(conn, fake_llm):
+    """A bad run is undoable: the semantic store returns to its exact pre-run
+    state (PRD §Consolidation: bad runs must be undoable)."""
+    encode(conn, UID, S1, source="test")
+    consolidate(conn, UID)               # run A — the keeper
+    before = _dump_semantic(conn)
+
+    encode(conn, UID, S3, source="test")
+    run_b = consolidate(conn, UID)["run_id"]   # run B — to be undone
+    assert _dump_semantic(conn) != before      # B did change the store
+
+    res = rollback_run(conn, run_b)
+    assert res["status"] == "rolled_back"
+    assert res["episodes_freed"] == 1
+    assert _dump_semantic(conn) == before       # fully reversed to pre-B state
+
+
+def test_rollback_keeps_events_on_disk_but_unmaterialized(conn, fake_llm):
+    """Rolled-back events survive for audit; they are simply not re-applied."""
+    encode(conn, UID, S1, source="test")
+    run = consolidate(conn, UID)["run_id"]
+    n_all = len(store.events_since(conn, UID, 0))                 # full log
+    n_active = len(store.events_since(conn, UID, 0, include_rolled_back=False))
+    assert n_all == n_active and n_all > 0
+    assert any(e["run_id"] == run for e in store.events_since(conn, UID, 0))  # run emitted some
+
+    rollback_run(conn, run)
+    assert len(store.events_since(conn, UID, 0)) == n_all        # nothing deleted
+    # only write-side events (run_id NULL, e.g. ENCODED) stay active; no run events
+    active = store.events_since(conn, UID, 0, include_rolled_back=False)
+    assert active and all(e["run_id"] is None for e in active)
+    assert conn.execute("SELECT COUNT(*) FROM claims").fetchone()[0] == 0  # not materialized
+
+
+def test_rollback_then_reconsolidate_rederives_from_raw(conn, fake_llm):
+    """Re-derivation bypasses a poisoned log: after rollback the freed episode
+    is re-blueprinted from its raw text — the rolled-back BLUEPRINTED/CANONICALIZED
+    events do NOT short-circuit the `_existing_*` guards."""
+    encode(conn, UID, S1, source="test")
+    run_b = consolidate(conn, UID)["run_id"]
+    assert store.unconsolidated_episodes(conn, UID) == []   # consolidated
+
+    rollback_run(conn, run_b)
+    assert len(store.unconsolidated_episodes(conn, UID)) == 1   # freed
+
+    bp_before = fake_llm["blueprint"]
+    run_c = consolidate(conn, UID)
+    assert run_c["status"] == "ok" and run_c["run_id"] != run_b
+    assert fake_llm["blueprint"] > bp_before                # re-derived, not reused
+    assert conn.execute("SELECT COUNT(*) FROM claims").fetchone()[0] == 1  # S1 back
+
+
+def test_rollback_unknown_run_is_noop(conn, fake_llm):
+    encode(conn, UID, S1, source="test")
+    consolidate(conn, UID)
+    before = _dump_semantic(conn)
+    res = rollback_run(conn, "run_does_not_exist")
+    assert res["status"] == "unknown_run"
+    assert _dump_semantic(conn) == before
+
+
+# ── C6: merge nuance guard. Guard GEOMETRY is in test_wrappers; these check the
+#       partition → MERGED-event → applier WIRING with controlled verdicts. ─────
+def _seed_two_concepts(conn, ts):
+    """Winner cpt_w[w1]; loser cpt_l[ldup, lnuance]."""
+    for cid, text in (("w1", S1), ("ldup", S2), ("lnuance", S3)):
+        emit(conn, UID, "seed", "CANONICALIZED",
+             {"action": "new", "claim_id": cid, "text": text,
+              "episode_id": "ep_x", "verbatim": text, "cluster": "main", "ts": ts})
+    emit(conn, UID, "seed", "CONCEPT_CREATED",
+         {"concept_id": "cpt_w", "label": "w", "canonical": "w",
+          "claim_ids": ["w1"], "ts": ts})
+    emit(conn, UID, "seed", "CONCEPT_CREATED",
+         {"concept_id": "cpt_l", "label": "l", "canonical": "l",
+          "claim_ids": ["ldup", "lnuance"], "ts": ts})
+    conn.commit()
+
+
+def test_merge_guard_folds_dup_keeps_nuance(conn, fake_llm, monkeypatch):
+    ts = "2026-01-01T00:00:00+00:00"
+    _seed_two_concepts(conn, ts)
+    monkeypatch.setattr("core.guard.merge", lambda losers, survivors, **kw: [
+        {"id": x["id"], "safe_to_drop": x["id"] == "ldup"} for x in losers])
+    with conn:
+        _apply_concept_decisions(
+            conn, UID, "run_m",
+            [{"action": "MERGE", "winner_id": "cpt_w", "loser_id": "cpt_l"}],
+            {"w1", "ldup", "lnuance"}, {"cpt_w", "cpt_l"}, ts)
+    assert set(store.concept_member_ids(conn, UID, "cpt_w")) == {"w1", "ldup"}
+    assert store.concept_member_ids(conn, UID, "cpt_l") == ["lnuance"]  # nuance kept
+    assert store.get_concept(conn, UID, "cpt_l") is not None            # loser survives
+
+
+def test_merge_full_fold_deletes_loser(conn, fake_llm, monkeypatch):
+    ts = "2026-01-01T00:00:00+00:00"
+    _seed_two_concepts(conn, ts)
+    monkeypatch.setattr("core.guard.merge", lambda losers, survivors, **kw: [
+        {"id": x["id"], "safe_to_drop": True} for x in losers])
+    with conn:
+        _apply_concept_decisions(
+            conn, UID, "run_m",
+            [{"action": "MERGE", "winner_id": "cpt_w", "loser_id": "cpt_l"}],
+            {"w1", "ldup", "lnuance"}, {"cpt_w", "cpt_l"}, ts)
+    assert set(store.concept_member_ids(conn, UID, "cpt_w")) == {"w1", "ldup", "lnuance"}
+    assert store.get_concept(conn, UID, "cpt_l") is None                # all folded
+
+
+def test_merge_partition_survives_rebuild(conn, fake_llm, monkeypatch):
+    """The fold/kept split is frozen in the event payload, so log-replay
+    reproduces the partial merge without re-running the (non-replayable) guard."""
+    ts = "2026-01-01T00:00:00+00:00"
+    _seed_two_concepts(conn, ts)
+    monkeypatch.setattr("core.guard.merge", lambda losers, survivors, **kw: [
+        {"id": x["id"], "safe_to_drop": x["id"] == "ldup"} for x in losers])
+    with conn:
+        _apply_concept_decisions(
+            conn, UID, "run_m",
+            [{"action": "MERGE", "winner_id": "cpt_w", "loser_id": "cpt_l"}],
+            {"w1", "ldup", "lnuance"}, {"cpt_w", "cpt_l"}, ts)
+    # break the guard so a re-run would differ — only the payload should drive replay
+    monkeypatch.setattr("core.guard.merge", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("guard must not run at apply time")))
+    rebuild(conn)
+    assert set(store.concept_member_ids(conn, UID, "cpt_w")) == {"w1", "ldup"}
+    assert store.concept_member_ids(conn, UID, "cpt_l") == ["lnuance"]
+
+
+# ── C7: safe-forget prune. Guard geometry in test_wrappers; wiring here. ───────
+def _seed_dormant_concept(conn, ts, state="dormant"):
+    for cid, text in (("m1", S1), ("m2", S2), ("m3", S3)):
+        emit(conn, UID, "seed", "CANONICALIZED",
+             {"action": "new", "claim_id": cid, "text": text,
+              "episode_id": "ep_x", "verbatim": text, "cluster": "main", "ts": ts})
+    emit(conn, UID, "seed", "CONCEPT_CREATED",
+         {"concept_id": "cpt_d", "label": "d", "canonical": "d",
+          "claim_ids": ["m1", "m2", "m3"], "ts": ts})
+    with conn:
+        store.update_concept(conn, UID, "cpt_d", state=state)
+    conn.commit()
+
+
+def test_prune_drops_reconstructable_protects_irreplaceable(conn, fake_llm, monkeypatch):
+    ts = "2026-01-01T00:00:00+00:00"
+    _seed_dormant_concept(conn, ts)
+    monkeypatch.setattr("core.guard.forget", lambda members, **kw: [
+        {"id": x["id"], "safe_to_drop": x["id"] == "m2"} for x in members])
+    with conn:
+        _prune_safely(conn, UID, "run_p", ts)
+    assert set(store.concept_member_ids(conn, UID, "cpt_d")) == {"m1", "m3"}
+    assert store.get_claim(conn, UID, "m2") is None        # orphan → re-derivable, dropped
+    assert store.get_claim(conn, UID, "m1") is not None     # irreplaceable, protected
+
+
+def test_prune_skips_non_dormant(conn, fake_llm, monkeypatch):
+    ts = "2026-01-01T00:00:00+00:00"
+    _seed_dormant_concept(conn, ts, state="active")
+    monkeypatch.setattr("core.guard.forget", lambda members, **kw: (_ for _ in ()).throw(
+        AssertionError("active concept must not be pruned")))
+    with conn:
+        _prune_safely(conn, UID, "run_p", ts)
+    assert set(store.concept_member_ids(conn, UID, "cpt_d")) == {"m1", "m2", "m3"}
+
+
+def test_prune_never_empties_concept(conn, fake_llm, monkeypatch):
+    ts = "2026-01-01T00:00:00+00:00"
+    _seed_dormant_concept(conn, ts)
+    monkeypatch.setattr("core.guard.forget", lambda members, **kw: [
+        {"id": x["id"], "safe_to_drop": True} for x in members])
+    with conn:
+        _prune_safely(conn, UID, "run_p", ts)
+    assert len(store.concept_member_ids(conn, UID, "cpt_d")) == 1  # one representative kept
+
+
+# ── C8: conflict detection + versioning. Resolver DIRECTION is mocked (it is the
+#       LLM's job); the versioning + margin-before-flip logic is what's tested. ─
+from core.consolidate import _reconcile  # noqa: E402
+
+
+def _seed_conflict(conn, ts, a_strength=1.0, b_strength=1.0):
+    """a = newer challenger, b = older incumbent, with a 'contradicts' edge."""
+    for cid, text in (("clm_a", S1), ("clm_b", S2)):
+        emit(conn, UID, "seed", "CANONICALIZED",
+             {"action": "new", "claim_id": cid, "text": text,
+              "episode_id": "ep_x", "verbatim": text, "cluster": "main", "ts": ts})
+    with conn:
+        store.bump_claim_strength(conn, UID, "clm_a", ts, a_strength - 1.0)
+        store.bump_claim_strength(conn, UID, "clm_b", ts, b_strength - 1.0)
+    emit(conn, UID, "seed", "RELATED",
+         {"from_id": "clm_a", "to_id": "clm_b", "relation": "contradicts",
+          "weight": 1.0, "evidence_episode_id": "ep_x", "ts": ts})
+    conn.commit()
+
+
+def _mock_resolver(monkeypatch, mode, **quals):
+    monkeypatch.setattr("core.consolidate._resolve_conflict",
+                        lambda newer, older: ({"mode": mode, **quals}, 0.0))
+
+
+def test_version_supersede_flips_past_margin(conn, fake_llm, monkeypatch):
+    ts = "2026-01-01T00:00:00+00:00"
+    _seed_conflict(conn, ts, a_strength=3.0, b_strength=1.0)   # challenger clears margin
+    _mock_resolver(monkeypatch, "supersede")
+    _reconcile(conn, UID, "run_v", ["clm_a", "clm_b"], ts)
+    a, b = store.get_claim(conn, UID, "clm_a"), store.get_claim(conn, UID, "clm_b")
+    assert a["status"] == "current"
+    assert b["status"] == "superseded" and b["superseded_by"] == "clm_a"
+    assert a["version_group"] and a["version_group"] == b["version_group"]  # neither dropped
+
+
+def test_version_supersede_blocked_by_margin_holds_as_version(conn, fake_llm, monkeypatch):
+    """A single contradicting note must NOT flip the current view (oscillation
+    guard): sub-margin challenger is held as a version, incumbent stays current."""
+    ts = "2026-01-01T00:00:00+00:00"
+    _seed_conflict(conn, ts, a_strength=1.0, b_strength=1.0)   # no margin
+    _mock_resolver(monkeypatch, "supersede")
+    _reconcile(conn, UID, "run_v", ["clm_a", "clm_b"], ts)
+    a, b = store.get_claim(conn, UID, "clm_a"), store.get_claim(conn, UID, "clm_b")
+    assert b["status"] == "current"        # incumbent holds
+    assert a["status"] == "version"        # challenger held, not dropped
+    assert a["version_group"] == b["version_group"]
+
+
+def test_version_scope_keeps_both_with_qualifiers(conn, fake_llm, monkeypatch):
+    ts = "2026-01-01T00:00:00+00:00"
+    _seed_conflict(conn, ts)
+    _mock_resolver(monkeypatch, "scope",
+                   qualifier_newer="when remote", qualifier_older="when in office")
+    _reconcile(conn, UID, "run_v", ["clm_a", "clm_b"], ts)
+    a, b = store.get_claim(conn, UID, "clm_a"), store.get_claim(conn, UID, "clm_b")
+    assert a["status"] == "current" and b["status"] == "current"  # both true, scoped
+    assert a["qualifier"] == "when remote" and b["qualifier"] == "when in office"
+
+
+def test_version_both_stand_holds_challenger(conn, fake_llm, monkeypatch):
+    ts = "2026-01-01T00:00:00+00:00"
+    _seed_conflict(conn, ts)
+    _mock_resolver(monkeypatch, "version")
+    _reconcile(conn, UID, "run_v", ["clm_a", "clm_b"], ts)
+    a, b = store.get_claim(conn, UID, "clm_a"), store.get_claim(conn, UID, "clm_b")
+    assert b["status"] == "current" and a["status"] == "version"
+
+
+def test_version_decision_survives_rebuild(conn, fake_llm, monkeypatch):
+    """The current/other split is frozen in the VERSIONED payload, so replay
+    reproduces it without re-resolving (the resolver is not deterministic)."""
+    ts = "2026-01-01T00:00:00+00:00"
+    _seed_conflict(conn, ts, a_strength=3.0, b_strength=1.0)
+    _mock_resolver(monkeypatch, "supersede")
+    _reconcile(conn, UID, "run_v", ["clm_a", "clm_b"], ts)
+    monkeypatch.setattr("core.consolidate._resolve_conflict",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("resolver must not run at apply time")))
+    rebuild(conn)
+    assert store.get_claim(conn, UID, "clm_b")["status"] == "superseded"
+    assert store.get_claim(conn, UID, "clm_a")["status"] == "current"
+
+
+def test_contested_surfaced_at_retrieval(conn, fake_llm, monkeypatch):
+    from core import recall
+    ts = "2026-01-01T00:00:00+00:00"
+    _seed_conflict(conn, ts, a_strength=3.0, b_strength=1.0)
+    _mock_resolver(monkeypatch, "supersede")
+    _reconcile(conn, UID, "run_v", ["clm_a", "clm_b"], ts)
+    superseded = recall._score_node(conn, UID, "clm_b", 1.0, "seed")
+    current = recall._score_node(conn, UID, "clm_a", 1.0, "seed")
+    assert "⚖️ superseded" in superseded["signals"] and superseded["superseded_by"] == "clm_a"
+    assert "⚖️ contested" in current["signals"]
 
 
 def test_llm_calls_never_hold_a_write_transaction(conn, fake_llm, monkeypatch):

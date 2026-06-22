@@ -84,11 +84,11 @@ Input: raw note text + ts. Output: immutable episode (raw) + a set of routed fra
 Real-corpus check (166 notes, `docs/write-workflow-eval.md` §v3.1): 972 stored / 60 PREDICTED-dropped
 / 22 intra-echoes / 74 regions, 18s, no network. `tests/test_write.py` 19/19.
 
-> **⛔ Blocker for P3 (calibration loop):** fragments are an **orphan branch** — `recall`/
-> `assemble_context` read claims/concepts and `consolidate` blueprints from `raw_text`; **neither
-> reads fragments.** So `z_echo`/the per-cluster knob have no path to SR@B and C12 cannot be fitted
-> until RETRIEVE reads the fragment layer. Today's SR@B (42.9%) is the v2 claims pipeline, untouched
-> by Write. Wiring fragments into retrieval is the real prerequisite — slot it ahead of P3.
+> **✅ RESOLVED by P2.5 (2026-06-22):** fragments were an **orphan branch** — `recall`/
+> `assemble_context` read claims/concepts and `consolidate` blueprints from `raw_text`; neither read
+> fragments, so `z_echo`/the per-cluster knob had no path to SR@B. `core/retrieve.py` now reads the
+> fragment layer via the assembly wrapper and is wired as the `frag` SR@B answerer, so C12 can be
+> fitted — P3 is unblocked. (`consolidate` still blueprints from `raw_text` — out of scope for P2.5.)
 
 | # | Step (PRD function) | X vs Y (predictor) | Build | Replaces | Test |
 |---|---|---|---|---|---|
@@ -173,15 +173,15 @@ relabel-only decay, averaging merges, writes-only.
 | C3 | **Assign** claim → theme | claim vs each concept | `measure()` nearest-cluster | similarity heuristic | assignment matches planted membership |
 | C4 | **Split / Form / Re-anchor** concepts | members vs concept centroid | `measure()` spread test | — | bimodal concept splits; drifted anchor re-centres to medoid |
 | C5 | **Bridge candidacy** — non-obvious links between themes | medoid vs medoid (residual *band*: close enough to relate, enough residual to be non-obvious) | `measure()` between concept medoids; emit bridge candidates | — | planted related-but-distinct concept pair → bridge proposed; near-dup pair (residual≈0) and unrelated pair (residual≫) → no bridge |
-| C6 | **Merge safely** | loser's nuance vs survivor structure | **reconstruction guard** | centroid averaging (`store.py:631`) | nuance-carrying member is NOT merged (residual high); pure-dup IS; resolver confirms before commit |
-| C7 | **Forget safely / prune** | pruned item vs what remains | **reconstruction guard** | relabel-only decay (`consolidate.py:571`) | reconstructable one-off pruned; irreplaceable rare item protected even if never retrieved |
-| C8 | **Detect conflicts + version** | ambiguous residual → `resolve_direction()` | versioning schema (status/version/qualifier + `superseded_by`); margin-before-flip | first-claim heuristic (`consolidate.py:497`) | contradiction → both versions kept, current surfaced as contested; oscillation needs margin to flip |
+| C6 | **Merge safely** — ✅ BUILT (2026-06-22) | loser's nuance vs survivor structure | `guard.merge` partitions loser members into FOLD (winner reconstructs) vs KEEP (carries nuance) at the MERGE decision; partition frozen in the `MERGED` payload (`fold_claim_ids`/`kept_claim_ids`) → replay-deterministic, guard never re-runs at apply. Loser survives if any nuance remains; full-fold deletes it (legacy events fold all). Embeddings read from `vec_claims` (no HF call inside txn). | centroid averaging | ✅ folds dup / keeps nuance / full-fold deletes loser / partition survives rebuild (4 cases); geometry in `test_wrappers` |
+| C7 | **Forget safely / prune** — ✅ BUILT (2026-06-22) | pruned item vs what remains | `_prune_safely`: DORMANT concepts only, `guard.forget` leave-one-out → `PRUNED` event drops reconstructable members (orphaned claim deleted, re-derivable from raw via C14), protects irreplaceable ones however quiet; never empties a concept (≥1 representative); thin concepts (< `PRUNE_MIN_MEMBERS`) skipped. | relabel-only decay | ✅ drops reconstructable / protects irreplaceable / skips active / never empties (4 cases); geometry in `test_wrappers`. NOTE: "quiet"=usage gate is C13 (deferred); prune currently gates on dormant age only |
+| C8 | **Detect conflicts + version** — ✅ BUILT (2026-06-22) | ambiguous residual → `_resolve_conflict()` (LLM) | `claims` gain `status`/`superseded_by`/`qualifier`/`version_group` (additive migration). `_reconcile` resolves each `contradicts` edge into supersede/scope/version; `VERSIONED` event applies it. **Margin-before-flip** on claim `strength` (`VERSION_FLIP_MARGIN`): a sub-margin supersede is held as a *version*, incumbent stays current → no oscillation. Resolution frozen in payload → replay-deterministic. recall surfaces ⚖️ contested/superseded; loser never dropped. | first-claim heuristic | ✅ 6 cases: flip past margin / blocked-by-margin held / scope-with-qualifiers / both-stand / survives rebuild / contested-surfaced. Resolver direction mocked (LLM's job); margin+versioning logic tested. NOTE: margin metric is `strength` until C13 usage signals |
 | C9 | **Demote to background** | repeated low-residual item over time | usage + repetition signal (logged, not measured) | — | item surprising once then echoed N× → folded into theme |
 | C10 | **Store-integrity check** — derived claim faithful to its source | derived claim vs its source episode | `measure()`/route between claim and raw episode | — | derived claim that contradicts its raw source (without changing today's answer) flagged; faithful claim passes |
 | C11 | **Gauge saturation + graduate region from cold-start** | region spread stability | `compute_baselines` maturity check | no cold-start handling at all | region with < graduation count → trusts prior; matured region → trusts local |
 | C12 | **Fit calibration + push down** | SR@B over candidate `z_echo`/`prox_margin` | calibration persistence + fit loop | hard-coded `Z_ECHO=-3.5` | fitted calibration beats default on frozen SR@B; pushed to Write/Retrieve |
 | C13 | **Consume retrieval signals** | — | promote/demote/resolve from R8 events | consolidation sees writes only | salient-but-never-retrieved demoted; dropped-but-needed promoted; rare-correct NOT suppressed |
-| C14 | **Run rollback + re-derive from raw** | — | `run_id` on every event; drop run N → rebuild N−1; re-run from episodes (not log) | log-replay only (`consolidate.py:198`) | bad run fully reversible; re-derivation bypasses a poisoned log |
+| C14 | **Run rollback + re-derive from raw** — ✅ BUILT (2026-06-22) | — | `consolidate.rollback_run(run_id)`: flag run `rolled_back` (events kept on disk for audit), free its episodes, re-materialize from the active log. `store.ACTIVE_RUN_PREDICATE` excludes rolled-back runs from `rebuild` AND the `_existing_*` re-derive guards → re-consolidation re-derives freed episodes from raw, ignoring the poisoned events. NO events-schema change (reuses `consolidation_runs.status`). | log-replay only | ✅ `test_consolidate.py` 4 cases: full reversal to pre-run state; events survive but unmaterialized; re-consolidate re-derives (blueprint re-called, not reused); unknown-run noop |
 
 **Stage gate (C):** ΔSR@B ≥ 0 on the frozen set AND **catastrophic-forgetting rate = 0**
 (no previously-passing frozen query now fails) AND every run reversible.
@@ -226,20 +226,41 @@ A step is "done" only when its row's test passes *and* its stage gate (SR@B) hol
 P0  Eval harness (SR@B) ............ ✅ DONE  (eval/harness.py; frozen gold.jsonl, 20 queries; baselines captured)
 P1  Wrappers + test_predict.py ..... ✅ DONE  (§0 wrappers green; route-matrix tested)
 P2  Wire predictor into WRITE ...... ✅ DONE  (W1–W8 built; medoid + batched + per-cluster; test_write 19/19)
-P2.5 Wire fragments into RETRIEVE .. ⛔ NEW PREREQUISITE — recall/consolidate don't read fragments (orphan
-                                     branch), so P3 has no objective. Must precede P3.
-P3  Calibration loop (W↔C) ......... ⏸ BLOCKED on P2.5; C12 fits per-cluster z_echo vs SR@B (knob now live)
-P4  RETRIEVE — spike then build ..... EXIT: R0 spike passes; R-gate (sufficiency ↑, Slate≥RAG@B)
-P5  CONSOLIDATE safety + signals .... EXIT: C-gate (ΔSR@B≥0, forgetting=0, rollback works)
+P2.5 Wire fragments into RETRIEVE .. ✅ DONE (2026-06-22) — core/retrieve.py reads fragments via assembly
+                                     wrapper; wired as `frag` SR@B answerer; orphan branch closed; test_retrieve 7/7.
+                                     See docs/retrieve-workflow-eval.md.
+P3  Calibration loop (W↔C) ......... ◐ IN PROGRESS — relevance-aware STOP built as opt-in `value_floor`
+                                     knob (assembly.py, default OFF; geometry-tested, 147/147). Fit driver
+                                     eval/fit_stop.py (resumable, sweeps value_floor vs frozen SR@B). LEFT:
+                                     run the quota-gated SR@B sweep + push the fitted floor down (C12).
+P4  RETRIEVE — spike then build ..... ◐ BUILT (structure complete; tuning deferred). R0 spike ✅ PASS. R1 decompose /
+                                     R3 borrow / R8 retrieval-signals built (core/retrieve.py, opt-in default-OFF);
+                                     R2/R7 value_floor stop + R4/R5/R6 assembly + frag+concept HYBRID (core/hybrid.py)
+                                     done. First-principles review (vs PRD §Retrieve) fixed 3 gaps: R7 answerability
+                                     TRIAGE now returns-nothing for off-corpus queries (was: pad with nearest); R8
+                                     signals now EMITTED on the answerer path (assemble_context, default-ON); R3 borrow
+                                     rebuilt to topic→query-residual→match-off-topic via predict.residual_direction
+                                     (was: max-novelty vs chosen). tests 33/33 retrieve+predict. R-gate credit + knob
+                                     fits (value_floor/concept_share/triage/borrow) DEFERRED to the final SR@B pass.
+P5  CONSOLIDATE safety + signals .... ◐ IN PROGRESS — safety core ✅: C14 rollback + C6/C7 reconstruction-guard
+                                     merge/forget + C8 conflict versioning (margin-before-flip). 16 invariant/
+                                     wiring tests; geometry in test_wrappers; resolver direction mocked.
+                                     LEFT: C1 (revisit-order), C9 (background decay), C10 (store-integrity),
+                                     C11 (cold-start graduation), C12 (calibration fit), C13 (retrieval signals).
+                                     SR@B + forgetting-rate credit deferred to the quota window (as P3/P4).
+                                     EXIT: C-gate (ΔSR@B≥0, forgetting=0, rollback works)
 P6  Frontier (cross-cutting §4) ..... EXIT: redaction/isolation/write-during-consolidate tests green
 ```
 
-**Critical path:** P0→P1→P2 are ✅. **P3 (calibration) is the original next step but is gated on a
-newly-surfaced prerequisite, P2.5:** the WRITE fragment layer is an orphan branch — `recall`/
-`assemble_context` read claims/concepts and `consolidate` blueprints from `raw_text`, so turning
-`z_echo` moves nothing measurable. Retrieval must read fragments (overlaps P4/R2) before the
-calibration loop has an objective. P4 still carries the biggest unproven risk (embedding asymmetry —
-R0 spike gates it). P5 is the heaviest schema/safety lift. P6 is independent.
+**Critical path:** P0→P1→P2→P2.5 are ✅. **P2.5 closed the orphan branch** — `core/retrieve.py` reads
+the fragment layer via the assembly wrapper and is wired as the `frag` SR@B answerer, so `z_echo`/the
+per-cluster knob finally move something measurable. **P3 (calibration) is now unblocked** and is the next
+step; its top lever is the relevance-aware stop (R2/R7) that kills the observed over-injection — fitted
+against SR@B, not pre-tuned. P4's R0 asymmetry risk is **retired** (spike passed; symmetric MiniLM kept),
+but its R-gate is **not yet met** by fragment-only retrieval (frag loses the tail to claims; grep dominates
+this short-note corpus) — the frag+concept hybrid is the path to the gate, and is now **built**
+(`core/hybrid.py`, wired as the `hybrid` answerer, offline-tested 6/6); its SR@B credit is deferred with the
+quota-gated sweep. P5 is the heaviest schema/safety lift. P6 is independent.
 
 ## 7. Review — predictor + 3 wrappers (2026-06-21, before P2)
 

@@ -87,12 +87,19 @@ CREATE TABLE IF NOT EXISTS episode_sentences (
 
 -- SEMANTIC STORE (derived; rebuildable from episodes + events)
 CREATE TABLE IF NOT EXISTS claims (
-    id         TEXT PRIMARY KEY,            -- clm_<md5 of user_id + canonical text>
-    user_id    TEXT NOT NULL,
-    text       TEXT NOT NULL,
-    strength   REAL DEFAULT 1.0,
-    created_at TEXT,
-    last_seen  TEXT
+    id            TEXT PRIMARY KEY,         -- clm_<md5 of user_id + canonical text>
+    user_id       TEXT NOT NULL,
+    text          TEXT NOT NULL,
+    strength      REAL DEFAULT 1.0,
+    created_at    TEXT,
+    last_seen     TEXT,
+    -- C8 versioning: a claim is 'current' | 'superseded' | 'version' (held).
+    -- version_group ties the rival beliefs together; superseded_by points a
+    -- past belief at the one that replaced it; qualifier scopes a conditional.
+    status        TEXT DEFAULT 'current',
+    superseded_by TEXT,
+    qualifier     TEXT,
+    version_group TEXT
 );
 
 CREATE TABLE IF NOT EXISTS claim_support (
@@ -314,7 +321,9 @@ def connect(db_path: str | Path | None = None) -> sqlite3.Connection:
 # Idempotent additive column migrations for tables that predate a column. The
 # schema is otherwise CREATE-IF-NOT-EXISTS, which never adds a column to an
 # existing table — so a new column on an existing table is added here.
-_ADD_COLUMNS = {"fragments": {"cluster": "TEXT", "medoid_idx": "INTEGER"}}
+_ADD_COLUMNS = {"fragments": {"cluster": "TEXT", "medoid_idx": "INTEGER"},
+                "claims": {"status": "TEXT DEFAULT 'current'", "superseded_by": "TEXT",
+                           "qualifier": "TEXT", "version_group": "TEXT"}}
 
 
 def _migrate_add_columns(conn: sqlite3.Connection) -> None:
@@ -449,8 +458,14 @@ def append_event(conn: sqlite3.Connection, user_id: str, type_: str, payload: di
 
 
 def events_since(conn: sqlite3.Connection, user_id: str | None, seq: int = 0,
-                 types: list[str] | None = None) -> list[sqlite3.Row]:
-    """user_id=None spans all users — reserved for rebuild (admin path)."""
+                 types: list[str] | None = None,
+                 include_rolled_back: bool = True) -> list[sqlite3.Row]:
+    """user_id=None spans all users — reserved for rebuild (admin path).
+
+    Default returns the FULL log (audit/inspection). Materialization (rebuild,
+    re-derive) passes ``include_rolled_back=False`` so a rolled-back run's events
+    are skipped — the run never happened as far as the semantic store is concerned
+    (events stay on disk for audit; only their materialization is suppressed)."""
     q = "SELECT * FROM events WHERE seq > ?"
     args: list = [seq]
     if user_id is not None:
@@ -459,7 +474,17 @@ def events_since(conn: sqlite3.Connection, user_id: str | None, seq: int = 0,
     if types:
         q += f" AND type IN ({','.join('?' * len(types))})"
         args.extend(types)
+    if not include_rolled_back:
+        q += " AND " + ACTIVE_RUN_PREDICATE
     return conn.execute(q + " ORDER BY seq", args).fetchall()
+
+
+# A run's events are materialized only while the run is not rolled back. Write-side
+# events (run_id IS NULL) are never consolidation runs, so always active.
+ACTIVE_RUN_PREDICATE = (
+    "(run_id IS NULL OR run_id NOT IN "
+    "(SELECT id FROM consolidation_runs WHERE status = 'rolled_back'))"
+)
 
 
 # ── Episodic writes (called by encode.py inside one transaction) ──────────────
@@ -650,6 +675,59 @@ def claim_embedding(conn: sqlite3.Connection, user_id: str, claim_id: str):
         "SELECT embedding FROM vec_claims WHERE claim_id = ? AND user_id = ?",
         (claim_id, user_id)).fetchone()
     return _deserialize(row["embedding"]) if row else None
+
+
+def claim_in_any_concept(conn: sqlite3.Connection, user_id: str, claim_id: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM concept_members WHERE claim_id = ? AND user_id = ? LIMIT 1",
+        (claim_id, user_id)).fetchone() is not None
+
+
+def delete_claim(conn: sqlite3.Connection, user_id: str, claim_id: str) -> None:
+    """Drop a claim from working memory (claim + support + vector). The raw
+    episodes it was derived from are untouched, so it stays re-derivable — this
+    is only ever called on a guard-confirmed reconstructable claim (C7 prune)."""
+    conn.execute("DELETE FROM claim_support WHERE claim_id = ? AND user_id = ?",
+                 (claim_id, user_id))
+    conn.execute("DELETE FROM concept_members WHERE claim_id = ? AND user_id = ?",
+                 (claim_id, user_id))
+    conn.execute("DELETE FROM claims WHERE id = ? AND user_id = ?", (claim_id, user_id))
+    conn.execute("DELETE FROM vec_claims WHERE claim_id = ?", (claim_id,))
+
+
+def set_claim_version(conn: sqlite3.Connection, user_id: str, claim_id: str,
+                      **fields) -> None:
+    """C8 — set a claim's version state. Additive; only the named columns move."""
+    allowed = {"status", "superseded_by", "qualifier", "version_group"}
+    sets = {k: v for k, v in fields.items() if k in allowed}
+    if not sets:
+        return
+    assign = ", ".join(f"{k} = ?" for k in sets)
+    conn.execute(f"UPDATE claims SET {assign} WHERE id = ? AND user_id = ?",
+                 (*sets.values(), claim_id, user_id))
+
+
+def contradiction_pairs(conn: sqlite3.Connection, user_id: str,
+                        claim_ids: list[str] | None = None) -> list[tuple[str, str]]:
+    """(from_id, to_id) for every 'contradicts' edge, optionally restricted to
+    edges touching `claim_ids`. The conflict signal C8 reconciles."""
+    q = ("SELECT from_id, to_id FROM relations WHERE relation = 'contradicts' "
+         "AND user_id = ?")
+    rows = conn.execute(q, (user_id,)).fetchall()
+    pairs = [(r["from_id"], r["to_id"]) for r in rows]
+    if claim_ids is not None:
+        s = set(claim_ids)
+        pairs = [p for p in pairs if p[0] in s or p[1] in s]
+    return pairs
+
+
+def claim_versions(conn: sqlite3.Connection, user_id: str,
+                   version_group: str) -> list[sqlite3.Row]:
+    """All claims belonging to one belief's version group (current + held +
+    superseded). Used to surface 'contested' at retrieval."""
+    return conn.execute(
+        "SELECT * FROM claims WHERE version_group = ? AND user_id = ? ORDER BY id",
+        (version_group, user_id)).fetchall()
 
 
 def insert_concept(conn: sqlite3.Connection, user_id: str, concept_id: str,
@@ -965,6 +1043,27 @@ def last_run(conn: sqlite3.Connection, user_id: str) -> sqlite3.Row | None:
     return conn.execute(
         """SELECT * FROM consolidation_runs WHERE user_id = ?
            ORDER BY started_at DESC LIMIT 1""", (user_id,)).fetchone()
+
+
+def get_run(conn: sqlite3.Connection, run_id: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM consolidation_runs WHERE id = ?", (run_id,)).fetchone()
+
+
+def mark_run_rolled_back(conn: sqlite3.Connection, run_id: str) -> None:
+    """Flag a run rolled back. Its events stay on disk (audit) but are excluded
+    from materialization by ACTIVE_RUN_PREDICATE — the reversible commit."""
+    conn.execute(
+        "UPDATE consolidation_runs SET status = 'rolled_back' WHERE id = ?",
+        (run_id,))
+
+
+def unconsolidate_run_episodes(conn: sqlite3.Connection, run_id: str) -> int:
+    """Drop the consolidated-bookkeeping rows for a run so its episodes are
+    re-eligible for the next consolidate() pass (re-derive from raw)."""
+    cur = conn.execute(
+        "DELETE FROM episode_consolidations WHERE run_id = ?", (run_id,))
+    return cur.rowcount
 
 
 def mark_consolidated(conn: sqlite3.Connection, user_id: str, episode_id: str,

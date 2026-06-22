@@ -119,9 +119,18 @@ def _score_node(conn, user_id: str, node: str, activation: float, via: str) -> d
         n_support = conn.execute(
             "SELECT COUNT(*) AS n FROM claim_support WHERE claim_id = ? AND user_id = ?",
             (node, user_id)).fetchone()["n"]
-        return {"type": "claim", "id": node, "text": c["text"],
-                "strength": round(c["strength"], 2), "n_episodes": n_support,
-                "score": round(score, 4), "signals": signals}
+        out = {"type": "claim", "id": node, "text": c["text"],
+               "strength": round(c["strength"], 2), "n_episodes": n_support,
+               "score": round(score, 4), "signals": signals,
+               "status": c["status"]}
+        # C8: the current view is returned, but contestation is always surfaced.
+        if c["version_group"] and len(store.claim_versions(conn, user_id,
+                                                            c["version_group"])) > 1:
+            signals.append("⚖️ superseded" if c["status"] == "superseded"
+                           else "⚖️ contested")
+            if c["superseded_by"]:
+                out["superseded_by"] = c["superseded_by"]
+        return out
 
     if node.startswith("cpt_"):
         c = store.get_concept(conn, user_id, node)
