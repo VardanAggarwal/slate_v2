@@ -169,10 +169,10 @@ relabel-only decay, averaging merges, writes-only.
 | # | Step (PRD function) | X vs Y | Build | Replaces | Test |
 |---|---|---|---|---|---|
 | C1 | **Prioritise what to revisit first** — ✅ BUILT (2026-06-22) | rank by residual; AMBIGUOUS (unresolved residuals on anchors) first | `_revisit_order` sorts the batch most-surprising-first off the encode receipt (contradiction = AMBIGUOUS residual-on-anchor outranks raw novelty count). Pure work-ordering — batch membership (oldest N) unchanged, only steers resolver-budget order. | undifferentiated batch pass | ✅ `test_revisit_order_puts_surprise_first` (contradiction first, then novelty desc) |
-| C2 | **Dedupe** claims | claim vs rest of memory | `measure()` + iterative-assembly | `CANON_AUTO_SAME=0.92` | planted dup set collapses to 1; near-but-distinct kept |
-| C3 | **Assign** claim → theme | claim vs each concept | `measure()` nearest-cluster | similarity heuristic | assignment matches planted membership |
-| C4 | **Split / Form / Re-anchor** concepts | members vs concept centroid | `measure()` spread test | — | bimodal concept splits; drifted anchor re-centres to medoid |
-| C5 | **Bridge candidacy** — non-obvious links between themes | medoid vs medoid (residual *band*: close enough to relate, enough residual to be non-obvious) | `measure()` between concept medoids; emit bridge candidates | — | planted related-but-distinct concept pair → bridge proposed; near-dup pair (residual≈0) and unrelated pair (residual≫) → no bridge |
+| C2 | **Dedupe** claims — ✅ BUILT (2026-06-23) | claim vs rest of memory | `_dedup_route`: `measure()`/`decide()` over a new claim vs its STAT_K neighbourhood of existing claims — PREDICTED→same, AMBIGUOUS→LLM, NOVEL→new. Calibrated `DEDUP_Z_ECHO=1.0` to the claim-dedup z-scale (exact dup z≈0, distinct z≳5; clean gap on the live corpus). Cosine fallback (`CANON_*`) only for cold neighbourhoods (≤SPAN_K), the C11 stance. | `CANON_AUTO_SAME=0.92` | ✅ planted dup → same, distinct → new (`test_c2_dedup_route_*`); real-corpus probe: exact dup→same 60/60 |
+| C3 | **Assign** claim → theme — ✅ BUILT (2026-06-23) | claim vs each concept | `_membership_z`: spread-relative `measure()` nearest-cluster gate (claim's z vs the concept's own cohesion ≤ `CONCEPT_MEMBERSHIP_Z`) replacing the flat `knn similarity >= 0.40` floor; cosine fallback for thin concepts. | similarity heuristic | ✅ in-topic plausible, off-topic not (`test_c3_membership_z_*`) |
+| C4 | **Split / Form / Re-anchor** concepts — ✅ BUILT (2026-06-23) | members vs concept spread | `_spread_is_bimodal` (pure-numpy two-pole detector → SPLIT candidate) + `_concept_geometry` medoid re-anchor, surfaced as `geometry`/`representative` hints in the concept-pass context; LLM stays the arbiter. | — | ✅ bimodal splits / cohesive doesn't; medoid is central (`test_c4_*`) |
+| C5 | **Bridge candidacy** — non-obvious links between themes — ✅ BUILT (2026-06-23) | medoid vs region (residual *band*: close enough to relate, enough residual to be non-obvious) | `_bridges`: medoid-vs-other-region symmetric RESIDUAL band `[0.40,0.85]` via `predict.residuals_against`, replacing the centroid-cosine `BRIDGE_LOW/HIGH`. | centroid cosine band | ✅ related→in-band, near-dup→below, unrelated→above (`test_c5_bridge_residual_band`) |
 | C6 | **Merge safely** — ✅ BUILT (2026-06-22) | loser's nuance vs survivor structure | `guard.merge` partitions loser members into FOLD (winner reconstructs) vs KEEP (carries nuance) at the MERGE decision; partition frozen in the `MERGED` payload (`fold_claim_ids`/`kept_claim_ids`) → replay-deterministic, guard never re-runs at apply. Loser survives if any nuance remains; full-fold deletes it (legacy events fold all). Embeddings read from `vec_claims` (no HF call inside txn). | centroid averaging | ✅ folds dup / keeps nuance / full-fold deletes loser / partition survives rebuild (4 cases); geometry in `test_wrappers` |
 | C7 | **Forget safely / prune** — ✅ BUILT (2026-06-22) | pruned item vs what remains | `_prune_safely`: DORMANT concepts only, `guard.forget` leave-one-out → `PRUNED` event drops reconstructable members (orphaned claim deleted, re-derivable from raw via C14), protects irreplaceable ones however quiet; never empties a concept (≥1 representative); thin concepts (< `PRUNE_MIN_MEMBERS`) skipped. | relabel-only decay | ✅ drops reconstructable / protects irreplaceable / skips active / never empties (4 cases); geometry in `test_wrappers`. NOTE: "quiet"=usage gate is C13 (deferred); prune currently gates on dormant age only |
 | C8 | **Detect conflicts + version** — ✅ BUILT (2026-06-22) | ambiguous residual → `_resolve_conflict()` (LLM) | `claims` gain `status`/`superseded_by`/`qualifier`/`version_group` (additive migration). `_reconcile` resolves each `contradicts` edge into supersede/scope/version; `VERSIONED` event applies it. **Margin-before-flip** on claim `strength` (`VERSION_FLIP_MARGIN`): a sub-margin supersede is held as a *version*, incumbent stays current → no oscillation. Resolution frozen in payload → replay-deterministic. recall surfaces ⚖️ contested/superseded; loser never dropped. | first-claim heuristic | ✅ 6 cases: flip past margin / blocked-by-margin held / scope-with-qualifiers / both-stand / survives rebuild / contested-surfaced. Resolver direction mocked (LLM's job); margin+versioning logic tested. NOTE: margin metric is `strength` until C13 usage signals |
@@ -185,6 +185,9 @@ relabel-only decay, averaging merges, writes-only.
 
 **Stage gate (C):** ΔSR@B ≥ 0 on the frozen set AND **catastrophic-forgetting rate = 0**
 (no previously-passing frozen query now fails) AND every run reversible.
+**✅ MET (2026-06-23, C2–C5 C-gate, `scratchpad/c_gate_c2c5.out`):** re-consolidating a 15-episode
+batch from raw through the full C2–C5 stack gave **ΔSR@B = +7.1%** (42.9%→50.0%, query g13 newly
+passes, no regressions), **forgetting = 0**, run fully reversible (exact return to S_minus). $0.66.
 
 ---
 
@@ -243,7 +246,7 @@ P4  RETRIEVE — spike then build ..... ◐ BUILT (structure complete; tuning de
                                      rebuilt to topic→query-residual→match-off-topic via predict.residual_direction
                                      (was: max-novelty vs chosen). tests 33/33 retrieve+predict. R-gate credit + knob
                                      fits (value_floor/concept_share/triage/borrow) DEFERRED to the final SR@B pass.
-P5  CONSOLIDATE safety + signals .... ◐ IN PROGRESS — 9/14 C-steps ✅ committed (afaeb6f→e89ed7a, suite 199):
+P5  CONSOLIDATE safety + signals .... ✅ DONE (2026-06-23) — 14/14 C-steps + EXIT. Was 9/14 (afaeb6f→e89ed7a):
                                      C14 rollback, C6/C7 guard merge/prune, C8 versioning (margin-before-flip),
                                      C1 revisit-order, C10 store-integrity, C9 background-decay, C12 (persistence
                                      +fitted value_floor=0.25 pushed), C13 retrieval-signals. ~35 offline tests.
@@ -252,34 +255,33 @@ P5  CONSOLIDATE safety + signals .... ◐ IN PROGRESS — 9/14 C-steps ✅ commi
                                      the frozen gold (slate answerer, B=2000). ΔSR@B=+0.0% (42.9%→42.9%), forgetting=0
                                      (no regressions), rollback of the new run returned state to S_minus exactly. Cost
                                      $0.77, all-Claude, 692s. Re-derive reproduced 2034/2040 claims (concepts 326→338).
-                                     C11 ✅ BUILT (2026-06-23, 1a497ba): cold-start graduation in compute_baselines,
-                                     validated offline (blast-radius A/B, no-op for retrieve). LEFT: C2–C5 measure()-
-                                     upgrades (dedup/assign/split/bridge vs CANON_*/LLM) — touch the calibrated predictor,
-                                     SR@B-validate, don't edit blind. EXIT: C-gate (ΔSR@B≥0, forgetting=0, rollback) ✅ MET
+                                     ✅ COMPLETE (14/14 C-steps + EXIT). C11 (1a497ba) cold-start graduation; C2–C5
+                                     (b8d9e61) measure()-upgrades dedup/assign/split/bridge — C-gate PASS ΔSR@B=+7.1%,
+                                     forgetting=0, reversible. EXIT: C-gate (ΔSR@B≥0, forgetting=0, rollback) ✅ MET
 P6  Frontier (cross-cutting §4) ..... EXIT: redaction/isolation/write-during-consolidate tests green
 ```
 
 **Critical path:** P0→P1→P2→P2.5→P3 are ✅; P4 built (R-gate not met on this corpus — grep dominates short
-self-contained notes; hybrid is the best Slate variant at 64%). P5 is 10/14 + C-gate EXIT ✅; only C2–C5 left. P6 independent.
+self-contained notes; hybrid is the best Slate variant at 64%). P5 ✅ DONE (14/14 + C-gate EXIT, ΔSR@B=+7.1%). Only P6 (cross-cutting §4) remains.
 
 ---
 
-## NEXT-CHAT HANDOFF (2026-06-22 — read this first to resume)
+## NEXT-CHAT HANDOFF (2026-06-23 — read this first to resume)
 
-**State:** branch `v3-changes`. Offline P5 core DONE + committed (`afaeb6f`, `0ef5ef9`, `be926bb`, `e89ed7a`);
-full test suite **199 passed**. SR@B campaign run on the funded Anthropic API (~$1.7 of a $5 top-up spent;
-~$3.3 left). Clean baseline + C12 value_floor fit landed (numbers in `docs/retrieve-workflow-eval.md`, top table).
+**State:** branch `v3-changes`. **P0–P5 ✅ DONE.** Full test suite **205 passed**. SR@B campaign on the funded
+Anthropic API (started ~$3.3 left; this session's two C-gates + C2–C5 spent ~$1.4 → ~$1.9 left). Commits this
+session: `68f9780` (P3/P4 retrieve unit), `3bdf5c1` (C-gate EXIT), `1a497ba`+`a12a916` (C11), `b8d9e61` (C2–C5).
 
-**The three remaining P5 items, in priority order:**
-1. **Rigorous C-gate (the P5 EXIT, ~$0.5–1, ~1h wall-clock):** measure ΔSR@B + catastrophic-forgetting on the
-   frozen set across a consolidation run (old behaviour vs the safety core). Needs a before/after design —
-   simplest: snapshot SR@B, run `consolidate` on a batch that triggers merges/contradictions/prune, re-measure.
-   Today only the value_floor ΔSR@B (positive) is measured; rollback ✓ and forgetting=0 hold by guard design+units.
-2. **C11** cold-start graduation (per-region maturity in `predict.compute_baselines`) — touches the *calibrated*
-   predictor; validate with SR@B, don't edit blind (see memory `slate-pe-threshold-calibration`).
-3. **C2–C5** measure()-upgrades (dedup/assign/split/bridge off `measure()` vs the current CANON_*/LLM heuristics)
-   — same caution: SR@B-validate.
-Then **P6** (cross-cutting §4: redaction, isolation, write-during-consolidate).
+**P5 is COMPLETE** — all 14 C-steps + the EXIT C-gate. C2–C5 (the measure()-upgrades) landed with a C-gate
+**ΔSR@B = +7.1%** (42.9%→50.0%), forgetting=0, fully reversible (`scratchpad/c_gate_c2c5.out`). C11 cold-start
+graduation validated offline. The remaining P5 items list is cleared.
+
+**ONLY P6 LEFT** (cross-cutting §4): redaction/privacy propagation, multi-user isolation (close the
+`delete_user` corpus leak `store.py:292`), write-during-consolidate snapshot semantics, cost gate. These are
+mostly invariant/property tests + a couple of small fixes — largely OFFLINE, not SR@B-gated. See §4.
+
+**Optional follow-ups (not blocking P6):** a FULL-corpus C-gate (all 166 episodes, not the 15-ep batch) for a
+headline ΔSR@B; and the deferred C12 `value_floor` re-fit now that C2–C5 changed the store structure.
 
 **How to run the eval (gotchas baked in):**
 - Corpus user `usr_01KTXAYR20J4R6F7PT3DP10W3W` (166 notes). `config.DEFAULT_USER_ID="local"` is EMPTY — always pass `--user`.
