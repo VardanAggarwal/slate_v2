@@ -138,6 +138,27 @@ Tests: `tests/test_write.py` 19/19 (added `test_fragment_medoid_selects_a_real_s
 > knob) cannot move SR@B yet. Wiring fragments into a consumer is the prerequisite before
 > a `z_echo`-vs-SR@B fit means anything.
 
+## v3.2 — references instead of duplicate storage
+
+Two redundancies removed; the fragment now stores only what it *adds*, referencing the
+immutable episode for the rest:
+
+1. **No fragment vector is stored.** A fragment's vector IS its medoid *sentence's*
+   vector, already in `vec_sentences`. The `vec_fragments` table is dropped; the
+   fragment row carries a `medoid_idx`, and `fragment_pool`/`knn_fragments` resolve the
+   vector by referencing `vec_sentences` via `(episode_id, medoid_idx)`. Kills ~`N_frag
+   × EMBED_DIM × 4B` of byte-identical vectors (≈1.5MB on the 972-fragment eval corpus).
+2. **No fragment text in the FRAGMENTED event.** The payload carries only spans +
+   `medoid_idx` + routing metadata; `apply_fragmented` reconstructs the text from
+   `(sent_start, sent_end)` against the episode's sentences. Removes a verbatim copy of
+   ~96% of the corpus from the event log.
+
+Net: the working layer's per-note footprint drops from ~3–4× raw to the metadata + the
+verbatim `fragments.text` (the one denormalized copy kept for read-speed). No behaviour
+change — routing, weights, centre/peak are identical; `tests/test_write.py` 19/19.
+**Upgrade path:** deploy then `rebuild` — legacy FRAGMENTED events (text, no `medoid_idx`)
+are honoured by the applier, which re-derives the medoid from the span on replay.
+
 ## Recommendation
 
 Report **two separate metrics**, never one "compression ratio":

@@ -223,22 +223,27 @@ def test_fragment_medoid_selects_a_real_sentence():
     assert j == 2 and np.allclose(v, E[2])
 
 
-def test_refine_makes_no_embedding_call(conn):
+def test_refine_makes_no_embedding_call(conn, monkeypatch):
     """Point 4: fragment vectors are medoid sentences reused from encode, so refine
-    performs NO embedding round-trip — a raising embedder still completes — and
-    every stored fragment vector is one of its episode's sentence vectors."""
+    performs NO embedding round-trip — patching the embedder to raise still completes —
+    and every fragment REFERENCES a real episode sentence (medoid_idx) rather than
+    storing its own vector. The referenced vector is that sentence's encode-time vector."""
     ep = encode(conn, UID, NOTE, source="test")["episode_id"]
 
-    def boom(texts):
-        raise AssertionError("refine must not embed")
+    from core import encode as encode_mod
+    monkeypatch.setattr(encode_mod, "get_embedder",
+                        lambda: (_ for _ in ()).throw(AssertionError("refine must not embed")))
 
-    r = write.refine_episode(conn, UID, ep, embed=boom)
+    r = write.refine_episode(conn, UID, ep)
     assert r["status"] == "ok" and r["n_fragments"] >= 1
     sents = store.episode_sentences_with_vectors(conn, UID, ep)
-    for f in conn.execute("SELECT id FROM fragments WHERE episode_id=?", (ep,)).fetchall():
-        emb = store._deserialize(conn.execute(
-            "SELECT embedding FROM vec_fragments WHERE frag_id=?", (f["id"],)).fetchone()["embedding"])
-        assert any(np.allclose(emb, s["embedding"], atol=1e-5) for s in sents)
+    rows = conn.execute("SELECT id, medoid_idx FROM fragments WHERE episode_id=?",
+                        (ep,)).fetchall()
+    assert rows and all(0 <= f["medoid_idx"] < len(sents) for f in rows)  # real references
+    # the pool resolves each fragment's vector to its medoid sentence vector (no copy)
+    pool = {p["id"]: p["embedding"] for p in store.fragment_pool(conn, UID)}
+    for f in rows:
+        assert np.allclose(pool[f["id"]], sents[f["medoid_idx"]]["embedding"], atol=1e-5)
 
 
 def test_route_contradiction_held_strongest():
@@ -263,38 +268,39 @@ def test_route_contradiction_held_strongest():
 # ══════════════════════════════════════════════════════════════════════════════
 # APPLIER — reinforcement + idempotency at the store layer
 # ══════════════════════════════════════════════════════════════════════════════
-def _fake_embed(texts):
-    """Deterministic unit-norm vectors, no network — for applier tests."""
-    v = np.ones((len(texts), config.EMBED_DIM)) / np.sqrt(config.EMBED_DIM)
-    return v
-
-
 def _payload(episode_id, frags, reinforced=(), n_intra=0):
     return {"episode_id": episode_id, "ts": store.now_iso(), "memory_size": 0,
             "fragments": frags, "reinforced": list(reinforced), "n_intra_echo": n_intra}
 
 
 def test_apply_fragmented_inserts_and_reinforces(conn):
-    f = {"frag_id": "frg_x", "text": "hello world", "sent_start": 0, "sent_end": 0,
+    """The applier reconstructs text from the span and references the medoid sentence
+    vector (no fragment-vector copy), then reinforces + stays idempotent."""
+    ep = encode(conn, UID, NOTE, source="test")["episode_id"]
+    fid = store.fragment_id_for(UID, ep, 0, 0)
+    f = {"frag_id": fid, "sent_start": 0, "sent_end": 0, "medoid_idx": 0,
          "route": "NOVEL", "z": 1.2, "residual": 0.5, "weight": 1.0,
          "anchor_id": None, "direction": None, "is_centre": True, "is_novel_peak": True}
-    p1 = _payload("ep_1", [f])
+    p1 = _payload(ep, [f])
     with conn:
-        write.apply_fragmented(conn, UID, p1, embed=_fake_embed)
-    row = conn.execute("SELECT * FROM fragments WHERE id='frg_x'").fetchone()
+        write.apply_fragmented(conn, UID, p1)
+    row = conn.execute("SELECT * FROM fragments WHERE id=?", (fid,)).fetchone()
     assert row["route"] == "NOVEL" and row["is_centre"] == 1 and row["strength"] == 1.0
-    assert conn.execute("SELECT COUNT(*) FROM vec_fragments").fetchone()[0] == 1
+    # text reconstructed from the span; vector referenced from the medoid sentence
+    sents = store.episode_sentences_with_vectors(conn, UID, ep)
+    assert row["text"] == sents[0]["text"] and row["medoid_idx"] == 0
+    pool = {p["id"]: p["embedding"] for p in store.fragment_pool(conn, UID)}
+    assert np.allclose(pool[fid], sents[0]["embedding"], atol=1e-5)
 
     # reinforce it (PREDICTED echo elsewhere) — strength + count bump, no new row
     with conn:
-        write.apply_fragmented(conn, UID, _payload("ep_2", [], reinforced=["frg_x"]),
-                               embed=_fake_embed)
-    row = conn.execute("SELECT strength, reinforced FROM fragments WHERE id='frg_x'").fetchone()
+        write.apply_fragmented(conn, UID, _payload(ep, [], reinforced=[fid]))
+    row = conn.execute("SELECT strength, reinforced FROM fragments WHERE id=?", (fid,)).fetchone()
     assert row["strength"] > 1.0 and row["reinforced"] == 1
 
     # re-applying the same insert is idempotent (deterministic id, ON CONFLICT)
     with conn:
-        write.apply_fragmented(conn, UID, p1, embed=_fake_embed)
+        write.apply_fragmented(conn, UID, p1)
     assert conn.execute("SELECT COUNT(*) FROM fragments").fetchone()[0] == 1
 
 
@@ -317,7 +323,11 @@ def test_refine_episode_persists_fragments_and_event(conn):
     assert len(frags) == r["n_fragments"]
     # every stored fragment is a real route, vectorised, and spans real sentences
     assert all(f["route"] in ("NOVEL", "AMBIGUOUS") for f in frags)
-    assert conn.execute("SELECT COUNT(*) FROM vec_fragments").fetchone()[0] == len(frags)
+    # every fragment references a real medoid sentence (no separate fragment vector)
+    n_sents = conn.execute("SELECT COUNT(*) FROM episode_sentences WHERE episode_id=?",
+                           (ep,)).fetchone()[0]
+    assert all(0 <= f["medoid_idx"] < n_sents for f in frags)
+    assert len(store.fragment_pool(conn, UID)) == len(frags)
     assert sum(f["is_centre"] for f in frags) == 1
     assert sum(f["is_novel_peak"] for f in frags) == 1
     # FRAGMENTED event emitted + episode marked done
@@ -341,23 +351,18 @@ def test_rebuild_reproduces_fragments(conn):
     from core.consolidate import rebuild
     ep = encode(conn, UID, NOTE, source="test")["episode_id"]
     write.refine_episode(conn, UID, ep)
-    before = {r["id"]: (r["text"], r["route"], r["weight"],
-                        store.knn_fragments(conn, UID, store._deserialize(
-                            conn.execute("SELECT embedding FROM vec_fragments WHERE frag_id=?",
-                                         (r["id"],)).fetchone()["embedding"]), k=1)[0]["frag_id"])
+    before = {r["id"]: (r["text"], r["route"], r["weight"], r["medoid_idx"])
               for r in conn.execute("SELECT * FROM fragments").fetchall()}
 
     rebuild(conn)   # truncates fragments + replays the FRAGMENTED event
 
-    after = {r["id"]: (r["text"], r["route"], r["weight"])
+    after = {r["id"]: (r["text"], r["route"], r["weight"], r["medoid_idx"])
              for r in conn.execute("SELECT * FROM fragments").fetchall()}
-    assert set(after) == set(before)                        # same fragment ids
-    for fid, (text, route, weight, _) in before.items():
-        assert after[fid] == (text, route, weight)          # same materialised content
-    # vectors reproduced from text → a fragment is still its own nearest neighbour
-    for fid in after:
-        emb = store._deserialize(conn.execute(
-            "SELECT embedding FROM vec_fragments WHERE frag_id=?", (fid,)).fetchone()["embedding"])
+    assert after == before              # text + medoid reference reproduced exactly
+    # each fragment's referenced vector still resolves it as its own nearest neighbour
+    pool = {p["id"]: p["embedding"] for p in store.fragment_pool(conn, UID)}
+    assert set(pool) == set(after)
+    for fid, emb in pool.items():
         assert store.knn_fragments(conn, UID, emb, k=1)[0]["frag_id"] == fid
 
 

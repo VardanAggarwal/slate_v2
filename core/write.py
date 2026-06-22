@@ -55,13 +55,6 @@ PREDICTED, NOVEL, AMBIGUOUS = "PREDICTED", "NOVEL", "AMBIGUOUS"
 
 
 # ── injected defaults (production wiring; lazy so importing write is cheap) ────
-def _default_embed(texts: list[str]) -> np.ndarray:
-    from core.encode import get_embedder
-    arr = get_embedder().encode(list(texts), normalize_embeddings=True,
-                                show_progress_bar=False)
-    return np.atleast_2d(np.asarray(arr, dtype=float))
-
-
 def _memory_pool(conn, user_id: str) -> list[dict]:
     """The memory M the Write match pass routes against. Currently the Write-side
     working layer (prior fragments) — self-contained and useful before any
@@ -160,7 +153,7 @@ def fragment_representatives(specs: list[tuple[str, int, int]], sent_texts: list
 
 def route_fragments(specs: list[tuple[str, int, int]], frag_embs, memory: list[dict],
                     *, classify=None, calibration: dict | None = None,
-                    frag_id_fn=None) -> dict:
+                    frag_id_fn=None, medoid_idxs: list[int] | None = None) -> dict:
     """W4–W7 — route each fragment against memory ∪ siblings, in note order.
 
     PREDICTED  → reinforce the anchor (a prior or sibling fragment); store nothing.
@@ -184,6 +177,10 @@ def route_fragments(specs: list[tuple[str, int, int]], frag_embs, memory: list[d
     calibration = calibration or predict.DEFAULT_CALIBRATION
     frag_id_fn = frag_id_fn or (lambda s, e: f"tmp:{s}-{e}")
     frag_embs = np.atleast_2d(np.asarray(frag_embs, dtype=float))
+    # medoid_idx per fragment = the episode-sentence its vector references; absent
+    # (direct callers passing raw frag_embs) it defaults to the span start, a real
+    # sentence index. Production passes the true medoids from fragment_representatives.
+    medoid_of = (lambda i, s: medoid_idxs[i]) if medoid_idxs is not None else (lambda i, s: s)
     baselines = (predict.compute_baselines(memory)
                  if len(memory) >= predict.WARMUP_MIN_CORPUS else None)
 
@@ -232,6 +229,7 @@ def route_fragments(specs: list[tuple[str, int, int]], frag_embs, memory: list[d
         region = _region_for(route, anchor_id, fid, memory_by_id, kept_by_fid)
         planned.append({
             "frag_id": fid, "text": text, "sent_start": s, "sent_end": e,
+            "medoid_idx": medoid_of(i, s),
             "route": route, "z": m["z"], "residual": m["residual"],
             "anchor_id": anchor_id, "direction": direction, "strength": strength,
             "cluster": region, "embedding": emb})
@@ -252,11 +250,15 @@ def route_fragments(specs: list[tuple[str, int, int]], frag_embs, memory: list[d
 
 
 def _build_payload(episode_id: str, ts: str, routed: dict, memory_size: int) -> dict:
-    """The FRAGMENTED event payload — JSON-only (embeddings are recomputed from
-    text at apply time, so they never ride in the log)."""
+    """The FRAGMENTED event payload — JSON-only. Neither the fragment TEXT nor its
+    vector rides in the log: both are references into the immutable episode. Text is
+    reconstructed from (sent_start, sent_end) and the vector from medoid_idx against
+    the episode's sentences at apply time. (Legacy payloads that still carry "text"
+    are honoured by apply_fragmented.)"""
     frags = [{
-        "frag_id": p["frag_id"], "text": p["text"],
+        "frag_id": p["frag_id"],
         "sent_start": p["sent_start"], "sent_end": p["sent_end"],
+        "medoid_idx": p["medoid_idx"],
         "route": p["route"], "z": p["z"], "residual": p["residual"],
         "weight": p["weight"], "anchor_id": p["anchor_id"], "direction": p["direction"],
         "strength": p["strength"], "cluster": p.get("cluster"),
@@ -280,40 +282,39 @@ def _build_payload(episode_id: str, ts: str, routed: dict, memory_size: int) -> 
 # FRAGMENTED event per episode ever exists; rebuild() truncates fragments first and
 # replays each logged event exactly once.
 # ══════════════════════════════════════════════════════════════════════════════
-def apply_fragmented(conn, user_id: str, payload: dict, *, embed=None,
-                     embeddings: dict | None = None) -> None:
-    """Insert the routed fragments + bump the reinforced anchors. Fragment vectors
-    are taken from `embeddings` (the live refine passes its already-computed
-    vectors so NO network call happens inside the write transaction) or recomputed
-    from the fragment text (the rebuild path, where they are not cached). Either
-    way the stored vector is a deterministic function of the text."""
+def apply_fragmented(conn, user_id: str, payload: dict) -> None:
+    """Insert the routed fragments + bump the reinforced anchors. NOTHING heavy
+    rides in the payload: each fragment's TEXT is reconstructed from its
+    (sent_start, sent_end) span and its VECTOR is referenced from vec_sentences via
+    medoid_idx — both are slices of the immutable episode, so no re-embed and no
+    duplicate storage. The same path serves the live refine and rebuild() (the
+    fragment rows are a deterministic function of the episode + the frozen routing).
+
+    Backward-compat: a legacy payload that carries "text" and lacks "medoid_idx" is
+    honoured — text falls back to the stored value and the medoid is re-derived from
+    the span. A payload for an episode with no stored sentences inserts the row with
+    a NULL medoid_idx (no referable vector); this only arises off the real pipeline."""
     p = payload
-    pending = [f for f in p.get("fragments", [])
-               if not (embeddings and f["frag_id"] in embeddings)]
-    recomputed = {}
-    if pending:  # rebuild path: reproduce the MEDOID vectors deterministically
-        sents = store.episode_sentences_with_vectors(conn, user_id, p["episode_id"])
-        if sents:  # recompute each fragment's medoid from the episode's sentences
-            sent_texts = [s["text"] for s in sents]
-            sent_embs = np.vstack([s["embedding"] for s in sents])
-            for f in pending:
-                _, v = _fragment_medoid(sent_texts, sent_embs,
-                                        f["sent_start"], f["sent_end"])
-                recomputed[f["frag_id"]] = v
-        else:  # no stored sentences (bare-applier path) → embed the text
-            vecs = (embed or _default_embed)([f["text"] for f in pending])
-            recomputed = {f["frag_id"]: vecs[i] for i, f in enumerate(pending)}
+    sents = store.episode_sentences_with_vectors(conn, user_id, p["episode_id"])
+    sent_texts = [s["text"] for s in sents]
+    sent_embs = np.vstack([s["embedding"] for s in sents]) if sents else None
 
     for f in p.get("fragments", []):
-        emb = (embeddings or {}).get(f["frag_id"])
-        if emb is None:
-            emb = recomputed[f["frag_id"]]
+        s, e = f["sent_start"], f["sent_end"]
+        mi = f.get("medoid_idx")
+        if sents:
+            text = " ".join(sent_texts[s:e + 1])
+            if mi is None:                       # legacy event: derive the medoid
+                mi, _ = _fragment_medoid(sent_texts, sent_embs, s, e)
+        else:                                    # no sentences → legacy text, no vector
+            text = f.get("text", "")
+            mi = None
         store.insert_fragment(
-            conn, user_id, f["frag_id"], p["episode_id"], f["text"],
-            f["sent_start"], f["sent_end"], f["route"], f["z"], f["residual"],
+            conn, user_id, f["frag_id"], p["episode_id"], text,
+            s, e, f["route"], f["z"], f["residual"],
             f["weight"], f["anchor_id"], f["direction"],
-            bool(f["is_centre"]), bool(f["is_novel_peak"]), emb, p["ts"],
-            strength=f.get("strength", 1.0), cluster=f.get("cluster"))
+            bool(f["is_centre"]), bool(f["is_novel_peak"]), p["ts"],
+            strength=f.get("strength", 1.0), cluster=f.get("cluster"), medoid_idx=mi)
     # reinforce AFTER inserting, so a within-note echo's sibling anchor exists
     for anchor_id in p.get("reinforced", []):
         store.bump_fragment_strength(conn, user_id, anchor_id, p["ts"],
@@ -329,14 +330,14 @@ def _existing_fragmented(conn, user_id: str, episode_id: str) -> bool:
         (episode_id, user_id)).fetchone() is not None
 
 
-def refine_episode(conn, user_id: str, episode_id: str, *, embed=None,
+def refine_episode(conn, user_id: str, episode_id: str, *,
                    classify=None, calibration: dict | None = None) -> dict:
     """W2–W8 for one persisted episode. Idempotent: a note already fragmented is
-    skipped (so a retry sweep or a double trigger is a no-op). All embedding /
-    LLM work happens OUTSIDE the write transaction; the event + rows + the
-    done-marker commit atomically, so a failure mid-way leaves the episode
-    unfragmented and the next sweep retries it cleanly."""
-    embed = embed or _default_embed
+    skipped (so a retry sweep or a double trigger is a no-op). No embedding round-trip
+    happens at all — fragment vectors are medoid SENTENCE vectors already persisted at
+    encode. The only network work is the optional LLM resolver for AMBIGUOUS fragments,
+    OUTSIDE the write transaction; the event + rows + the done-marker commit atomically,
+    so a failure mid-way leaves the episode unfragmented and the next sweep retries it."""
     if _existing_fragmented(conn, user_id, episode_id):
         return {"status": "skip", "reason": "already_fragmented", "episode_id": episode_id}
     ep = store.get_episode(conn, user_id, episode_id)
@@ -358,23 +359,25 @@ def refine_episode(conn, user_id: str, episode_id: str, *, embed=None,
     # sentence vectors (no second HF call); `embed` is kept only for the applier's
     # last-resort fallback when an episode's sentences are unavailable.
     specs = plan_fragments(sent_texts, sent_embs, calibration=calibration)
-    frag_embs, _ = fragment_representatives(specs, sent_texts, sent_embs)
+    frag_embs, medoid_idxs = fragment_representatives(specs, sent_texts, sent_embs)
     memory = _memory_pool(conn, user_id)
     routed = route_fragments(
         specs, frag_embs, memory, classify=classify, calibration=calibration,
-        frag_id_fn=lambda s, e: store.fragment_id_for(user_id, episode_id, s, e))
+        frag_id_fn=lambda s, e: store.fragment_id_for(user_id, episode_id, s, e),
+        medoid_idxs=medoid_idxs)
     payload = _build_payload(episode_id, ep["ts"], routed, len(memory))
-    emb_cache = {p["frag_id"]: p["embedding"] for p in routed["planned"]}
 
     # --- commit: claim the episode FIRST (atomic race guard), then event +
     #     rows. If a concurrent trigger/sweep already fragmented it, the claim
     #     fails and we skip — no duplicate FRAGMENTED event, no double reinforce.
+    #     apply re-reads the episode's sentences (text + medoid vectors) by
+    #     reference — no re-embed, no cached vectors threaded through.
     with conn:
         if not store.mark_fragmented(conn, user_id, episode_id, len(payload["fragments"])):
             return {"status": "skip", "reason": "already_fragmented",
                     "episode_id": episode_id}
         store.append_event(conn, user_id, "FRAGMENTED", payload)
-        apply_fragmented(conn, user_id, payload, embeddings=emb_cache)
+        apply_fragmented(conn, user_id, payload)
     return {"status": "ok", "episode_id": episode_id,
             "n_fragments": len(payload["fragments"]),
             "n_reinforced": len(payload["reinforced"]),
@@ -382,7 +385,7 @@ def refine_episode(conn, user_id: str, episode_id: str, *, embed=None,
 
 
 def refine_pending(conn, user_id: str | None = None, *, max_episodes: int = 200,
-                   embed=None, classify=None) -> list[dict]:
+                   classify=None) -> list[dict]:
     """Retry sweep: process every episode the refine pass hasn't reached yet
     (HF/LLM failures, replayed imports, or the async trigger never firing). One
     stubborn note's failure leaves it unfragmented for the NEXT sweep and never
@@ -394,7 +397,7 @@ def refine_pending(conn, user_id: str | None = None, *, max_episodes: int = 200,
         refined = skipped = errors = 0
         for ep in eps:
             try:
-                r = refine_episode(conn, uid, ep["id"], embed=embed, classify=classify)
+                r = refine_episode(conn, uid, ep["id"], classify=classify)
                 if r["status"] == "ok":
                     refined += 1
                 else:

@@ -815,32 +815,94 @@ def bump_fragment_strength(conn: sqlite3.Connection, user_id: str, frag_id: str,
 
 def fragment_pool(conn: sqlite3.Connection, user_id: str) -> list[dict]:
     """All of a user's fragments as measure() corpus rows {id,text,embedding,
-    cluster}. This is the memory M the Write match pass routes against. `cluster`
+    cluster}. This is the memory M the Write match pass routes against. The
+    embedding is the fragment's medoid SENTENCE vector, REFERENCED from vec_sentences
+    via (episode_id, medoid_idx) — no duplicate fragment vector is stored. `cluster`
     is the region a fragment was assigned (anchor-inheritance at write, re-clustered
     by consolidation); NULL → measure falls back to its local-neighbour spread and
     decide() resolves the GLOBAL threshold (cold/sparse regions)."""
     rows = conn.execute(
         """SELECT f.id, f.text, f.cluster, v.embedding FROM fragments f
-           JOIN vec_fragments v ON v.frag_id = f.id
-           WHERE f.user_id = ?""", (user_id,)).fetchall()
+           JOIN vec_sentences v ON v.sent_key = f.episode_id || ':' || f.medoid_idx
+           WHERE f.user_id = ? AND f.medoid_idx IS NOT NULL""", (user_id,)).fetchall()
     return [{"id": r["id"], "text": r["text"],
              "embedding": _deserialize(r["embedding"]), "cluster": r["cluster"]}
             for r in rows]
 
 
 def knn_fragments(conn: sqlite3.Connection, user_id: str, embedding, k: int = 5) -> list[dict]:
-    """Nearest stored fragments to an embedding, within one user's partition."""
-    rows = conn.execute(
-        "SELECT frag_id, distance FROM vec_fragments WHERE embedding MATCH ? AND k = ? AND user_id = ?",
-        (serialize_float32([float(x) for x in embedding]), k, user_id)).fetchall()
-    out = []
-    for r in rows:
-        f = conn.execute("SELECT text, route, strength FROM fragments WHERE id = ? AND user_id = ?",
-                         (r["frag_id"], user_id)).fetchone()
-        if f:
-            out.append({"frag_id": r["frag_id"], "text": f["text"], "route": f["route"],
-                        "strength": f["strength"], "similarity": _sim(r["distance"])})
-    return out
+    """Nearest stored fragments to an embedding, within one user's partition. A
+    fragment's vector IS its medoid sentence's vector (no duplicate is stored), so
+    this searches vec_sentences and maps medoid hits back to fragments. vec0 returns
+    hits in ascending-distance order, so the first k that are medoids are exactly the
+    k nearest fragments; we over-fetch and widen to all sentences if a batch is short."""
+    medoids = {f"{r['episode_id']}:{r['medoid_idx']}": r for r in conn.execute(
+        "SELECT id, episode_id, medoid_idx, text, route, strength FROM fragments "
+        "WHERE user_id = ? AND medoid_idx IS NOT NULL", (user_id,))}
+    if not medoids:
+        return []
+    total = conn.execute("SELECT COUNT(*) AS n FROM episode_sentences WHERE user_id = ?",
+                         (user_id,)).fetchone()["n"]
+    emb = serialize_float32([float(x) for x in embedding])
+    kq = min(total, max(k * 8, 32))
+    while True:
+        rows = conn.execute(
+            "SELECT sent_key, distance FROM vec_sentences WHERE embedding MATCH ? AND k = ? AND user_id = ?",
+            (emb, kq, user_id)).fetchall()
+        out = []
+        for r in rows:
+            f = medoids.get(r["sent_key"])
+            if f:
+                out.append({"frag_id": f["id"], "text": f["text"], "route": f["route"],
+                            "strength": f["strength"], "similarity": _sim(r["distance"])})
+                if len(out) >= k:
+                    break
+        if len(out) >= k or kq >= total:
+            return out
+        kq = min(total, kq * 2)
+
+
+def fragment_candidates(conn: sqlite3.Connection, user_id: str, embedding,
+                        k: int = 40) -> list[dict]:
+    """Nearest fragments to a query embedding, enriched for RETRIEVE: each carries
+    its medoid SENTENCE vector (the retrieval vector, referenced from vec_sentences)
+    plus episode provenance, so core/retrieve.py can run the assembly wrapper over
+    them and format verbatim spans with sources. Like knn_fragments but returns the
+    embedding + episode_id/title/ts/cluster — the seed candidate set for assembly.
+
+    vec0 returns sentence hits in ascending-distance order; we map the medoid hits
+    back to fragments and widen the probe until we have k (or exhaust the corpus)."""
+    medoids = {f"{r['episode_id']}:{r['medoid_idx']}": dict(r) for r in conn.execute(
+        """SELECT f.id, f.episode_id, f.medoid_idx, f.text, f.route, f.strength,
+                  f.cluster, f.weight, e.title, e.ts
+           FROM fragments f JOIN episodes e ON e.id = f.episode_id
+           WHERE f.user_id = ? AND f.medoid_idx IS NOT NULL""", (user_id,))}
+    if not medoids:
+        return []
+    total = conn.execute("SELECT COUNT(*) AS n FROM episode_sentences WHERE user_id = ?",
+                         (user_id,)).fetchone()["n"]
+    emb = serialize_float32([float(x) for x in embedding])
+    kq = min(total, max(k * 8, 32))
+    while True:
+        rows = conn.execute(
+            "SELECT sent_key, embedding, distance FROM vec_sentences "
+            "WHERE embedding MATCH ? AND k = ? AND user_id = ?",
+            (emb, kq, user_id)).fetchall()
+        out = []
+        for r in rows:
+            f = medoids.get(r["sent_key"])
+            if f:
+                out.append({"id": f["id"], "frag_id": f["id"], "text": f["text"],
+                            "embedding": _deserialize(r["embedding"]),
+                            "episode_id": f["episode_id"], "title": f["title"],
+                            "ts": f["ts"], "cluster": f["cluster"],
+                            "route": f["route"], "strength": f["strength"],
+                            "weight": f["weight"], "similarity": _sim(r["distance"])})
+                if len(out) >= k:
+                    break
+        if len(out) >= k or kq >= total:
+            return out
+        kq = min(total, kq * 2)
 
 
 def fragment_count(conn: sqlite3.Connection, user_id: str) -> int:
