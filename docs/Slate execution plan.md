@@ -229,10 +229,11 @@ P2  Wire predictor into WRITE ...... ✅ DONE  (W1–W8 built; medoid + batched 
 P2.5 Wire fragments into RETRIEVE .. ✅ DONE (2026-06-22) — core/retrieve.py reads fragments via assembly
                                      wrapper; wired as `frag` SR@B answerer; orphan branch closed; test_retrieve 7/7.
                                      See docs/retrieve-workflow-eval.md.
-P3  Calibration loop (W↔C) ......... ◐ IN PROGRESS — relevance-aware STOP built as opt-in `value_floor`
-                                     knob (assembly.py, default OFF; geometry-tested, 147/147). Fit driver
-                                     eval/fit_stop.py (resumable, sweeps value_floor vs frozen SR@B). LEFT:
-                                     run the quota-gated SR@B sweep + push the fitted floor down (C12).
+P3  Calibration loop (W↔C) ......... ✅ DONE (2026-06-22) — value_floor STOP fitted vs frozen SR@B on the
+                                     funded API and PUSHED. value_floor=0.25 beats raw-residual baseline: at
+                                     B/2 SR@B 50→57% & tail 20→40% (over-injection killed), at full B holds
+                                     SR@B with less ctx (parsimony). Persisted to calibration_profiles;
+                                     retrieve loads it by default. See docs/retrieve-workflow-eval.md.
 P4  RETRIEVE — spike then build ..... ◐ BUILT (structure complete; tuning deferred). R0 spike ✅ PASS. R1 decompose /
                                      R3 borrow / R8 retrieval-signals built (core/retrieve.py, opt-in default-OFF);
                                      R2/R7 value_floor stop + R4/R5/R6 assembly + frag+concept HYBRID (core/hybrid.py)
@@ -242,27 +243,58 @@ P4  RETRIEVE — spike then build ..... ◐ BUILT (structure complete; tuning de
                                      rebuilt to topic→query-residual→match-off-topic via predict.residual_direction
                                      (was: max-novelty vs chosen). tests 33/33 retrieve+predict. R-gate credit + knob
                                      fits (value_floor/concept_share/triage/borrow) DEFERRED to the final SR@B pass.
-P5  CONSOLIDATE safety + signals .... ◐ IN PROGRESS — safety core ✅: C14 rollback + C6/C7 reconstruction-guard
-                                     merge/forget + C8 conflict versioning (margin-before-flip). 16 invariant/
-                                     wiring tests; geometry in test_wrappers; resolver direction mocked.
-                                     C1 + C10 + C9 + C13 ✅ + C12 mechanism ✅ (persistence/push-down; fit RUN
-                                     deferred). LEFT: C11 (cold-start graduation — touches calibrated predictor),
-                                     and the SR@B-gated RUNS: the value_floor fit (C12), the clean baseline, and the
-                                     ΔSR@B/forgetting C-gate. All gated on API budget (eval infra ready: haiku
-                                     answerer, hardened fit_stop, /tmp/slate_eval.db w/ 972 frags, 44-cell cache).
+P5  CONSOLIDATE safety + signals .... ◐ IN PROGRESS — 9/14 C-steps ✅ committed (afaeb6f→e89ed7a, suite 199):
+                                     C14 rollback, C6/C7 guard merge/prune, C8 versioning (margin-before-flip),
+                                     C1 revisit-order, C10 store-integrity, C9 background-decay, C12 (persistence
+                                     +fitted value_floor=0.25 pushed), C13 retrieval-signals. ~35 offline tests.
+                                     LEFT (see §"NEXT-CHAT HANDOFF"): rigorous C-gate (before/after re-consolidate
+                                     ΔSR@B + forgetting on frozen set — the EXIT, not yet run); C11 cold-start
+                                     graduation; C2–C5 measure()-upgrades. C11/C2–C5 touch the calibrated predictor
+                                     → want SR@B validation, not blind edits.
                                      EXIT: C-gate (ΔSR@B≥0, forgetting=0, rollback works)
 P6  Frontier (cross-cutting §4) ..... EXIT: redaction/isolation/write-during-consolidate tests green
 ```
 
-**Critical path:** P0→P1→P2→P2.5 are ✅. **P2.5 closed the orphan branch** — `core/retrieve.py` reads
-the fragment layer via the assembly wrapper and is wired as the `frag` SR@B answerer, so `z_echo`/the
-per-cluster knob finally move something measurable. **P3 (calibration) is now unblocked** and is the next
-step; its top lever is the relevance-aware stop (R2/R7) that kills the observed over-injection — fitted
-against SR@B, not pre-tuned. P4's R0 asymmetry risk is **retired** (spike passed; symmetric MiniLM kept),
-but its R-gate is **not yet met** by fragment-only retrieval (frag loses the tail to claims; grep dominates
-this short-note corpus) — the frag+concept hybrid is the path to the gate, and is now **built**
-(`core/hybrid.py`, wired as the `hybrid` answerer, offline-tested 6/6); its SR@B credit is deferred with the
-quota-gated sweep. P5 is the heaviest schema/safety lift. P6 is independent.
+**Critical path:** P0→P1→P2→P2.5→P3 are ✅; P4 built (R-gate not met on this corpus — grep dominates short
+self-contained notes; hybrid is the best Slate variant at 64%). P5 is 9/14 done. P6 independent.
+
+---
+
+## NEXT-CHAT HANDOFF (2026-06-22 — read this first to resume)
+
+**State:** branch `v3-changes`. Offline P5 core DONE + committed (`afaeb6f`, `0ef5ef9`, `be926bb`, `e89ed7a`);
+full test suite **199 passed**. SR@B campaign run on the funded Anthropic API (~$1.7 of a $5 top-up spent;
+~$3.3 left). Clean baseline + C12 value_floor fit landed (numbers in `docs/retrieve-workflow-eval.md`, top table).
+
+**The three remaining P5 items, in priority order:**
+1. **Rigorous C-gate (the P5 EXIT, ~$0.5–1, ~1h wall-clock):** measure ΔSR@B + catastrophic-forgetting on the
+   frozen set across a consolidation run (old behaviour vs the safety core). Needs a before/after design —
+   simplest: snapshot SR@B, run `consolidate` on a batch that triggers merges/contradictions/prune, re-measure.
+   Today only the value_floor ΔSR@B (positive) is measured; rollback ✓ and forgetting=0 hold by guard design+units.
+2. **C11** cold-start graduation (per-region maturity in `predict.compute_baselines`) — touches the *calibrated*
+   predictor; validate with SR@B, don't edit blind (see memory `slate-pe-threshold-calibration`).
+3. **C2–C5** measure()-upgrades (dedup/assign/split/bridge off `measure()` vs the current CANON_*/LLM heuristics)
+   — same caution: SR@B-validate.
+Then **P6** (cross-cutting §4: redaction, isolation, write-during-consolidate).
+
+**How to run the eval (gotchas baked in):**
+- Corpus user `usr_01KTXAYR20J4R6F7PT3DP10W3W` (166 notes). `config.DEFAULT_USER_ID="local"` is EMPTY — always pass `--user`.
+- Work on a COPY: `/tmp/slate_eval.db` (already has 972 materialized fragments; live `data/engine.db` has 0).
+  Rebuild it with: copy `data/engine.db` → checkpoint WAL → `write.refine_pending(conn, uid)` (offline, ~2min).
+- **Answerer + judge BOTH sonnet.** A haiku answerer DEFLATES SR@B (fails queries sonnet passes) — do not use it.
+- Set env so calls stay on the funded API and never cascade to the exhausted gemini free tier:
+  `LLM_FALLBACK_ORDER=claude,local`, `LLM_MAX_ATTEMPTS=6` (hardened defaults already in `eval/fit_stop.py` and
+  `scratchpad/run_baseline.py`). Cost ~$0.0072/cell; API tier rate-limits make it slow (~20s/cell), so runs are
+  RESUMABLE (per-cell cache) — launch in background + Monitor.
+- Baseline: `PYTHONPATH=. .venv/bin/python scratchpad/run_baseline.py`. Fit: `DB_PATH=/tmp/slate_eval.db
+  PYTHONPATH=. python -m eval.fit_stop --user <uid> --half --floors none,0.15,0.25 --push --cache <path>`.
+
+**Uncommitted (rides with the P3/P4 retrieve work, NOT yet committed):** `core/assembly.py`, `core/predict.py`,
+`core/retrieve.py` (incl. the C12 `calib.merged` pickup wiring), `core/hybrid.py`, `eval/harness.py` (sonnet
+answerer), `eval/fit_stop.py` (hardening + `--push`), `scratchpad/run_baseline.py`, `docs/retrieve-workflow-eval.md`,
+and the P3/P4 test files. These are interdependent (retrieve↔assembly `VALUE_FLOOR`) — commit them together as the
+P3/P4 retrieve unit. The committed C12 retrieve-pickup TEST was deferred for this reason (see `tests/test_calibration.py`).
+Memory: `slate-p5-safety-core`, `slate-srb-eval-baseline`.
 
 ## 7. Review — predictor + 3 wrappers (2026-06-21, before P2)
 
