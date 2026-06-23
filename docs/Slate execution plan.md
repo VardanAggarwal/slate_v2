@@ -90,11 +90,14 @@ Real-corpus check (166 notes, `docs/write-workflow-eval.md` §v3.1): 972 stored 
 > fragment layer via the assembly wrapper and is wired as the `frag` SR@B answerer, so C12 can be
 > fitted — P3 is unblocked. (`consolidate` still blueprints from `raw_text` — out of scope for P2.5.)
 >
-> **↑ UPDATE (2026-06-23):** `consolidate` still re-derives claims from `raw_text` (raw stays the
-> source of truth — the safety property behind C14 re-derive/rollback), but it no longer *ignores* the
-> fragment layer: Write's fragment routing now **informs** C2 dedup + C3 membership as a PRIOR
-> (`_anchor_concept_prior`), so the Write effort feeds both retrieval AND consolidation. Fragments are a
-> hint, never the input — absent fragments leave consolidate's behaviour identical. See §3 C2/C3.
+> **↑ UPDATE (2026-06-23, P6 `5592016`):** the orphan branch is now **fully closed on the
+> consolidation side too.** `consolidate` no longer LLM-blueprints over `raw_text`; it **mints claims
+> directly from the fragment layer** (`blueprint_from_fragments`) — each fragment is both claim and
+> representative_sentence, no LLM genesis. Unrefined episodes are **skipped** (next run retries once
+> Write has refined them); there is no silent fall-back to LLM-over-raw, so raw stays unprocessed
+> (PRD §21). Write's fragment routing also still feeds C2 dedup + C3 membership as a PRIOR
+> (`_anchor_concept_prior`). C14 re-derive/rollback safety is preserved: raw remains the immutable
+> source, and a re-consolidation rebuilds claims from the (raw-replayable) fragment layer. See §3.
 
 | # | Step (PRD function) | X vs Y (predictor) | Build | Replaces | Test |
 |---|---|---|---|---|---|
@@ -146,9 +149,10 @@ Today: `recall.py:41` spreading-activation with a hard `k` limit, no decompositi
 > predictor-native fragment path (`retrieve` + assembly VOI) on a **`concept_share` budget split**, and
 > commits the **R8 retrieval signals** the fragment path emits (`signals=True`) so C13 has a live
 > producer. It degrades to the pure concept path when no fragments are materialized. R1 decompose / R3
-> borrow stay **default-OFF** (fit-gated); `value_floor` and now **`concept_share`** are C12 fit-targets
-> declared in `retrieve.DEFAULT_CALIBRATION`, not baked. `core/hybrid.py` runs the fragment path exactly
-> once (no double R8 emission). The MCP wiring (`mcp_server.py`) is **uncommitted** — see the handoff.
+> borrow are now **default-ON** profile flags (`decompose`/`borrow` in `retrieve.DEFAULT_CALIBRATION`,
+> `retrieve.py:66`; a fitted profile can flip either off); `value_floor` and **`concept_share`** (=0.4)
+> are C12 fit-targets declared in `retrieve.DEFAULT_CALIBRATION`, not baked. `core/hybrid.py` runs the
+> fragment path exactly once (no double R8 emission). MCP wiring is now committed (`mcp_server.py`).
 
 **De-risk first (blocking spike):** the PRD flags retrieval as the *least-proven* use —
 a symmetric encoder may not place a query near its answering memory. Before building R2–R6,
@@ -181,10 +185,20 @@ working memory + a fitted calibration. This is where structure changes — so wh
 and the reconstruction guard live. Today: `consolidate.py:597`, fixed `CANON_*` thresholds,
 relabel-only decay, averaging merges, writes-only.
 
+> **✅ CLAIM GENESIS — fragment-sourced (P6, `5592016`):** claims are minted from Write's
+> fragment layer (`blueprint_from_fragments`, `consolidate.py:362`), **not** by an LLM
+> `blueprint()` over `raw_text`. Each verbatim fragment is both the claim and its
+> representative_sentence; the result is the same dict shape `_canonicalize_episode`/
+> `_concept_pass`/`_relations` already consumed. Episodes with no materialized fragments yet are
+> **skipped** (next run retries) — never a silent fall-back to LLM-over-raw, so raw stays
+> unprocessed (PRD §21). Dedup (C2) is **predictor-only**: `DEDUP_CALIBRATION["canon_llm"]=False`
+> gates `PROMPT_CANON` off, uncertain→NEW (PRD §178). Legacy `blueprint()`/`PROMPT_*` kept behind
+> off-flags (reversible). Follow-up: dedup z-gate sweep + full-corpus C-gate eval.
+
 | # | Step (PRD function) | X vs Y | Build | Replaces | Test |
 |---|---|---|---|---|---|
 | C1 | **Prioritise what to revisit first** — ✅ BUILT (2026-06-22) | rank by residual; AMBIGUOUS (unresolved residuals on anchors) first | `_revisit_order` sorts the batch most-surprising-first off the encode receipt (contradiction = AMBIGUOUS residual-on-anchor outranks raw novelty count). Pure work-ordering — batch membership (oldest N) unchanged, only steers resolver-budget order. | undifferentiated batch pass | ✅ `test_revisit_order_puts_surprise_first` (contradiction first, then novelty desc) |
-| C2 | **Dedupe** claims — ✅ BUILT (2026-06-23) | claim vs rest of memory | `_dedup_route`: `measure()`/`decide()` over a new claim vs its STAT_K neighbourhood of existing claims — PREDICTED→same, AMBIGUOUS→LLM, NOVEL→new. Calibrated `DEDUP_Z_ECHO=1.0` to the claim-dedup z-scale (exact dup z≈0, distinct z≳5; clean gap on the live corpus). Cosine fallback (`CANON_*`) only for cold neighbourhoods (≤SPAN_K), the C11 stance. **Fragment prior (2026-06-23):** the dedup neighbourhood is widened with the members of the concept the claim's Write-time source span anchored to (`_anchor_concept_prior`), catching dups global knn under-ranked when the LLM paraphrase drifted from the verbatim span. A hint — the predictor still routes; absent fragments = unchanged. | `CANON_AUTO_SAME=0.92` | ✅ planted dup → same, distinct → new (`test_c2_dedup_route_*`); real-corpus probe: exact dup→same 60/60; prior catches a knn-missed dup (`test_consolidate_frag_prior.py`) |
+| C2 | **Dedupe** claims — ✅ BUILT (2026-06-23) | claim vs rest of memory | `_dedup_route`: `measure()`/`decide()` over a new claim vs its STAT_K neighbourhood of existing claims — PREDICTED→same, NOVEL→new. **Predictor-only (P6):** `canon_llm=False` gates the AMBIGUOUS→`PROMPT_CANON` LLM band off (it exploded on verbatim fragments); uncertain→NEW. Calibrated `DEDUP_Z_ECHO=1.0` to the claim-dedup z-scale (exact dup z≈0, distinct z≳5; clean gap on the live corpus). Cosine fallback (`CANON_*`) only for cold neighbourhoods (≤SPAN_K), the C11 stance. **Fragment prior (2026-06-23):** the dedup neighbourhood is widened with the members of the concept the claim's Write-time source span anchored to (`_anchor_concept_prior`), catching dups global knn under-ranked when the LLM paraphrase drifted from the verbatim span. A hint — the predictor still routes; absent fragments = unchanged. | `CANON_AUTO_SAME=0.92` | ✅ planted dup → same, distinct → new (`test_c2_dedup_route_*`); real-corpus probe: exact dup→same 60/60; prior catches a knn-missed dup (`test_consolidate_frag_prior.py`) |
 | C3 | **Assign** claim → theme — ✅ BUILT (2026-06-23) | claim vs each concept | `_membership_z`: spread-relative `measure()` nearest-cluster gate (claim's z vs the concept's own cohesion ≤ `CONCEPT_MEMBERSHIP_Z`) replacing the flat `knn similarity >= 0.40` floor; cosine fallback for thin concepts. **Fragment prior (2026-06-23):** the source span's anchored concept is offered as an extra attach candidate even when global knn (k=3) under-ranks it, cutting concept fragmentation (`_anchor_concept_prior`); the LLM still attaches/splits. | similarity heuristic | ✅ in-topic plausible, off-topic not (`test_c3_membership_z_*`); prior surfaces a knn-missed concept (`test_consolidate_frag_prior.py`) |
 | C4 | **Split / Form / Re-anchor** concepts — ✅ BUILT (2026-06-23) | members vs concept spread | `_spread_is_bimodal` (pure-numpy two-pole detector → SPLIT candidate) + `_concept_geometry` medoid re-anchor, surfaced as `geometry`/`representative` hints in the concept-pass context; LLM stays the arbiter. | — | ✅ bimodal splits / cohesive doesn't; medoid is central (`test_c4_*`) |
 | C5 | **Bridge candidacy** — non-obvious links between themes — ✅ BUILT (2026-06-23) | medoid vs region (residual *band*: close enough to relate, enough residual to be non-obvious) | `_bridges`: medoid-vs-other-region symmetric RESIDUAL band `[0.40,0.85]` via `predict.residuals_against`, replacing the centroid-cosine `BRIDGE_LOW/HIGH`. | centroid cosine band | ✅ related→in-band, near-dup→below, unrelated→above (`test_c5_bridge_residual_band`) |
@@ -273,27 +287,42 @@ P5  CONSOLIDATE safety + signals .... ✅ DONE (2026-06-23) — 14/14 C-steps + 
                                      ✅ COMPLETE (14/14 C-steps + EXIT). C11 (1a497ba) cold-start graduation; C2–C5
                                      (b8d9e61) measure()-upgrades dedup/assign/split/bridge — C-gate PASS ΔSR@B=+7.1%,
                                      forgetting=0, reversible. EXIT: C-gate (ΔSR@B≥0, forgetting=0, rollback) ✅ MET
-P6  Frontier (cross-cutting §4) ..... EXIT: redaction/isolation/write-during-consolidate tests green
+P6  Fragment-sourced genesis ....... ✅ DONE (2026-06-23, 5592016) — consolidate() mints claims
+                                     from the FRAGMENT layer (blueprint_from_fragments), no LLM-over-raw;
+                                     unrefined episodes skipped; dedup predictor-only (canon_llm=False).
+                                     Raw stays unprocessed (§21); dedup = PREDICTED route (§178). Suite 217.
+                                     Follow-up (out of scope): dedup z-gate sweep + full-corpus C-gate eval.
+P7  Frontier (cross-cutting §4) ..... EXIT: redaction/isolation/write-during-consolidate tests green
 ```
 
 **Critical path:** P0→P1→P2→P2.5→P3 are ✅; P4 built (R-gate not met on this corpus — grep dominates short
-self-contained notes; hybrid is the best Slate variant at 64%). P5 ✅ DONE (14/14 + C-gate EXIT, ΔSR@B=+7.1%). Only P6 (cross-cutting §4) remains.
+self-contained notes; hybrid is the best Slate variant at 64%). P5 ✅ DONE (14/14 + C-gate EXIT, ΔSR@B=+7.1%).
+P6 ✅ DONE (fragment-sourced claim genesis, predictor-only dedup — `5592016`). Only **P7** (cross-cutting §4:
+redaction, multi-user isolation, write-during-consolidate, cost gate) remains, plus the P6 follow-up
+(dedup z-gate sweep + full-corpus C-gate eval).
 
 ---
 
 ## NEXT-CHAT HANDOFF (2026-06-23 — read this first to resume)
 
-**State:** branch `v3-changes`. **P0–P5 ✅ DONE.** Full test suite **205 passed**. SR@B campaign on the funded
+**State:** branch `v3-changes`. **P0–P6 ✅ DONE.** Full test suite **217 passed**. SR@B campaign on the funded
 Anthropic API (started ~$3.3 left; this session's two C-gates + C2–C5 spent ~$1.4 → ~$1.9 left). Commits this
-session: `68f9780` (P3/P4 retrieve unit), `3bdf5c1` (C-gate EXIT), `1a497ba`+`a12a916` (C11), `b8d9e61` (C2–C5).
+session: `68f9780` (P3/P4 retrieve unit), `3bdf5c1` (C-gate EXIT), `1a497ba`+`a12a916` (C11), `b8d9e61` (C2–C5),
+`5592016` (P6 fragment-sourced genesis + predictor-only dedup).
 
 **P5 is COMPLETE** — all 14 C-steps + the EXIT C-gate. C2–C5 (the measure()-upgrades) landed with a C-gate
 **ΔSR@B = +7.1%** (42.9%→50.0%), forgetting=0, fully reversible (`scratchpad/c_gate_c2c5.out`). C11 cold-start
 graduation validated offline. The remaining P5 items list is cleared.
 
-**ONLY P6 LEFT** (cross-cutting §4): redaction/privacy propagation, multi-user isolation (close the
+**P6 is COMPLETE** (`5592016`) — consolidation now mints claims from the fragment layer
+(`blueprint_from_fragments`), no LLM-over-`raw_text`; unrefined episodes skipped; dedup predictor-only
+(`canon_llm=False`, uncertain→NEW). Closes the long-standing consolidate-input gap; raw stays unprocessed
+(§21), dedup = PREDICTED route (§178). Legacy `blueprint()`/`PROMPT_*` kept behind off-flags (reversible).
+
+**ONLY P7 LEFT** (cross-cutting §4): redaction/privacy propagation, multi-user isolation (close the
 `delete_user` corpus leak `store.py:292`), write-during-consolidate snapshot semantics, cost gate. These are
 mostly invariant/property tests + a couple of small fixes — largely OFFLINE, not SR@B-gated. See §4.
+**P6 follow-up (not blocking P7):** dedup z-gate sweep + a full-corpus C-gate eval.
 
 **Optional follow-ups (not blocking P6):** a FULL-corpus C-gate (all 166 episodes, not the 15-ep batch) for a
 headline ΔSR@B; and the deferred C12 `value_floor` re-fit now that C2–C5 changed the store structure.

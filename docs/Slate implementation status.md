@@ -14,9 +14,12 @@ Slate runs as **two derived layers over one immutable raw store, and retrieval r
   Immutable, trigger-enforced. Ground truth for every rebuild.
 - **Fragment layer** — built by **Write** (W2–W8) off the sentence vectors via the predictor.
   Replayable from the `FRAGMENTED` event. Read by the hybrid retriever's fragment path.
-- **Claims / concepts layer** — built by **Consolidate**, which re-extracts claims with an
-  **LLM `blueprint()` over `raw_text`** (not over fragments) and then runs the predictor + guard
-  over the resulting claims.
+- **Claims / concepts layer** — built by **Consolidate**, which (since P6, `5592016`) **mints
+  claims from the fragment layer Write built** (`blueprint_from_fragments`, no LLM genesis), then
+  runs the predictor + guard over the resulting claims. Each fragment is a verbatim, predictor-
+  isolated span, so it serves as both claim and representative_sentence. Episodes with no
+  materialized fragments yet are **skipped** (never fall back to LLM-over-`raw_text`). Raw stays
+  unprocessed (PRD §21).
 - **Retrieve** — `assemble_context` → `hybrid.hybrid_context` blends the concept/claim path
   (`recall`) with the fragment path (`retrieve` + assembly), split by a calibrated `concept_share`.
 
@@ -50,17 +53,22 @@ AMBIGUOUS route.
 
 ## CONSOLIDATE — 13 of 14 active in a run
 
-Offline batch (CLI `consolidate` / nightly cron). It does **not** read the fragment layer — each
-episode is re-blueprinted by an **LLM over `raw_text`** (`consolidate.py:1156`), and the
-predictor + guard then operate on the resulting claims/concepts. `CANON_*` cosine constants
-still fire as the cold-start fallback when a neighbourhood is smaller than `SPAN_K`.
+Offline batch (CLI `consolidate` / nightly cron). Since **P6** (`5592016`) it **mints claims
+from the fragment layer** (`blueprint_from_fragments`, `consolidate.py:362` → returns the same
+dict shape the old LLM `blueprint()` produced, with no LLM call); the predictor + guard then
+operate on the resulting claims/concepts. Unrefined episodes (no fragments yet) are **skipped**,
+never re-processed from `raw_text`. Dedup (C2) is **predictor-only** — `DEDUP_CALIBRATION
+["canon_llm"]=False` gates the `PROMPT_CANON` LLM band off; an uncertain claim routes **NEW**
+(`consolidate.py:595`). `CANON_*` cosine constants still fire as the cold-start fallback when a
+neighbourhood is smaller than `SPAN_K`. The legacy LLM `blueprint()`/`_blueprint_local`/`PROMPT_*`
+remain behind off-flags (reversible).
 
 Reached in `consolidate()`'s main loop, in order:
 
 | # | Step | Mechanism | Code |
 |---|---|---|---|
 | C1 | Triage / revisit | sort batch by contradiction count then novelty | `_revisit_order:1133` |
-| C2 | Dedup claims | `measure()`/`decide()` vs neighbourhood; CANON_* only when cold | `_dedup_route:397` · `_canonicalize:1163` |
+| C2 | Dedup claims | predictor-only: `measure()`/`decide()` vs neighbourhood, uncertain→NEW (`canon_llm=False`); CANON_* only when cold | `_dedup_route:397` · `_canonicalize:1163` |
 | C3 | Concept membership | spread-relative z gate (≤ `CONCEPT_MEMBERSHIP_Z`), cosine fallback | `_membership_z:610` · `_concept_pass:1171` |
 | C4 | Split / re-anchor | bimodal spread flags SPLIT candidates; LLM decides | `_spread_is_bimodal` · `_concept_geometry:626` |
 | C5 | Relations & bridges | residual band → bridge candidates; LLM confirms | `_relations:1174` · `_bridges:1185` |
@@ -125,17 +133,20 @@ spans with the predictor's assembly VOI stop. Per-step status:
 | Fragments → retrieve | P2.5: "orphan branch closed" | ✅ **Now true.** `assemble_context` → `hybrid` reads the fragment path via `retrieve.assemble_context`. |
 | Live budget B | assembly stops at the VOI-maximising size | ✅ **Now live.** Fragment path runs the VOI stop; budget split by `concept_share` (each path still char-bounded). |
 | C13 signals | retrieval signals close the loop | ✅ **Now closed.** Fragment path emits R8 (`signals=True`), MCP commits, C13 consumes. |
-| Consolidate input | predictor spine reshapes working memory | Claims still re-extracted by an **LLM blueprint over `raw_text`** each run; fragments aren't a consolidation input. |
+| Consolidate input | predictor spine reshapes working memory | ✅ **Now fragment-sourced (P6).** `blueprint_from_fragments` mints claims from Write's fragment layer — no LLM genesis, raw never re-processed. Unrefined episodes skipped. |
 | R1 / R3 | decompose query · borrow cross-theme nuance | ✅ **Now wired.** Profile flags (`decompose`/`borrow` in `DEFAULT_CALIBRATION`), default ON, threaded through hybrid→assemble→`fragment_recall`. A fitted profile can still flip either off. |
 | C12 calibration | "fitted at consolidation and pushed down" | ✅ **Baselines now in the loop.** `_fit_baselines` re-clusters fragments onto concepts + pushes `compute_baselines` down; Write loads it. The `value_floor`/`concept_share` Q,B bet stays the offline `fit_stop.py` sweep (LLM/quota-gated). |
 | Per-stage logic | measure/decide + 3 wrappers, magnitude-not-direction | **Faithful.** Write W1–W8 and Consolidate C1–C11 reach the predictor as described. |
 
-**Net:** the topology now matches the intent — retrieval is a hybrid over both the
-LLM-blueprinted claims/concepts graph and the predictor-native fragment layer, and the R8→C13
-signal loop is closed. R1/R3 are now wired ON and C12 fits + pushes baselines down inside a run;
-the only deferred C12 piece is the LLM-judged `value_floor` SR@B sweep (offline by design).
-Remaining gaps are cross-cutting §4 work (redaction, multi-user isolation leak at `store.py:292`,
-write-during-consolidate snapshot, cost gate).
+**Net:** the topology now matches the intent end-to-end. As of **P6** the claims/concepts graph
+is **predictor-native too** — consolidation mints claims from Write's fragment layer rather than
+re-blueprinting `raw_text`, so the spine (not a generative LLM) owns chunking/centre/membership at
+both Write and Consolidate, and raw stays unprocessed (PRD §21). Dedup is the PREDICTED route with
+no LLM canon band (§178). Retrieval is a hybrid over both layers; R1/R3 are wired ON; the R8→C13
+signal loop is closed; C12 fits + pushes baselines down inside a run. The only deferred C12 piece
+is the LLM-judged `value_floor` SR@B sweep (offline by design). Remaining gaps are cross-cutting
+§4 work (redaction, multi-user isolation leak at `store.py:292`, write-during-consolidate snapshot,
+cost gate) plus the P6 follow-up (dedup z-gate sweep + full-corpus C-gate eval).
 
 ---
 
