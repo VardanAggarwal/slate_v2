@@ -269,6 +269,14 @@ def apply_event(conn, user_id: str, type_: str, payload: dict) -> None:
         from core import write
         write.apply_fragmented(conn, user_id, p)
 
+    elif type_ == "RECLUSTERED":
+        # C12 — fragment regions reassigned to their nearest consolidated concept.
+        # Emitted AFTER the run's FRAGMENTED events (higher seq), so on rebuild it
+        # re-applies over the freshly materialized fragments and the concept-scoped
+        # cluster sticks. Excluded for a rolled-back run → fragments revert to their
+        # write-time anchor-bootstrap clusters. Idempotent (plain UPDATE).
+        store.set_fragment_clusters(conn, user_id, p["assignments"])
+
     # ENCODED / BLUEPRINTED / INTEGRITY_FLAGGED: episodic-side or log-only —
     # nothing to materialize (INTEGRITY_FLAGGED is a review signal, not state).
 
@@ -1189,6 +1197,46 @@ def _revisit_order(episodes: list) -> list:
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
+def _fit_baselines(conn, user_id: str, run_id: str, ts: str) -> None:
+    """C12 — re-cluster fragments onto the consolidated concept graph, then recompute
+    and push down the per-cluster cohesion baselines (predict.compute_baselines).
+
+    This is the "fitted at consolidation and pushed down" step for the MEASUREMENT
+    half of calibration (the per-region μ,σ + prior that a residual's z is judged
+    against — core/predict.py §2). It runs AFTER the concept pass, so the regions are
+    the settled concepts, not write-time anchor-inheritance guesses:
+
+      1. RE-CLUSTER — assign each fragment to its nearest concept (cosine over the
+         materialized concept vectors); emit RECLUSTERED so the assignment is
+         event-sourced (survives rebuild, reverts on rollback).
+      2. BASELINES — compute_baselines over the re-clustered corpus and persist it,
+         so Write loads a stable snapshot instead of rebuilding it on every write.
+
+    The Q,B bet (`value_floor`/`concept_share`) is NOT fitted here — it needs the
+    LLM-judged SR@B sweep and stays the offline `eval/fit_stop.py --push` pass.
+    No-op below WARMUP_MIN_CORPUS (cold corpus → Write recomputes on the fly)."""
+    import numpy as np
+
+    frags = store.fragment_pool(conn, user_id)
+    if len(frags) < predict.WARMUP_MIN_CORPUS:
+        return
+
+    concepts = store.concept_pool(conn, user_id)
+    if concepts:
+        # Nearest consolidated region per fragment, in ONE matmul (both sides are
+        # already unit-normalized, so the dot product is the cosine).
+        FE = np.vstack([np.asarray(f["embedding"], dtype=float) for f in frags])
+        CE = np.vstack([np.asarray(c["embedding"], dtype=float) for c in concepts])
+        cids = [c["concept_id"] for c in concepts]
+        nearest = (FE @ CE.T).argmax(axis=1)
+        assignments = {frags[i]["id"]: cids[int(nearest[i])] for i in range(len(frags))}
+        emit(conn, user_id, run_id, "RECLUSTERED", {"assignments": assignments, "ts": ts})
+        for f, j in zip(frags, nearest):
+            f["cluster"] = cids[int(j)]    # reflect the reassignment for the recompute below
+
+    store.set_baselines(conn, user_id, predict.compute_baselines(frags))
+
+
 def consolidate(conn, user_id: str, max_episodes: int = 50) -> dict:
     """One sleep cycle over one user's oldest unconsolidated episodes (sync mode).
 
@@ -1251,6 +1299,11 @@ def consolidate(conn, user_id: str, max_episodes: int = 50) -> dict:
         with conn:
             _decay_strengthen(conn, user_id, run_id, episodes, ts)
             _prune_safely(conn, user_id, run_id, ts)
+
+        # C12: regions are now settled — re-cluster fragments onto them and push the
+        # recomputed cohesion baselines down to Write (measurement half of calibration).
+        with conn:
+            _fit_baselines(conn, user_id, run_id, ts)
 
         with conn:
             for ep, _, _ in per_episode:  # skipped episodes stay unconsolidated

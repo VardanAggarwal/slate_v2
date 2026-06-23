@@ -892,3 +892,87 @@ def test_c5_bridge_residual_band():
     related = _unit(0.5 * a + 0.5 * _topic(771))
     r_rel = float(predict.residuals_against(related, region_a)[0])
     assert Cmod.BRIDGE_RES_LOW <= r_rel <= Cmod.BRIDGE_RES_HIGH
+
+
+# ── C12: re-cluster fragments onto concepts + push baselines down ─────────────
+from core import write  # noqa: E402
+
+C12_NOTES = [
+    "Spaced repetition is the most reliable way to retain knowledge over years. "
+    "Active recall beats passive rereading for durable long-term memory.",
+    "Memory consolidation happens during sleep when the brain replays experiences. "
+    "Deep sleep is when the hippocampus hands memories to the cortex.",
+    "Constraints often increase creativity rather than limiting what can be made. "
+    "A tight brief forces sharper choices than a blank canvas does.",
+]
+
+
+def _seed_fragmented_corpus(conn):
+    """Encode several notes and run the refine pass so fragments exist for C12."""
+    for note in C12_NOTES:
+        encode(conn, UID, note, source="test")
+    write.refine_pending(conn, UID)
+
+
+def test_c12_reclusters_fragments_and_pushes_baselines(conn, fake_llm):
+    _seed_fragmented_corpus(conn)
+    assert len(store.fragment_pool(conn, UID)) >= predict.WARMUP_MIN_CORPUS
+    assert store.get_baselines(conn, UID) == {}        # nothing pushed pre-consolidation
+
+    consolidate(conn, UID)
+
+    concept_ids = {c["concept_id"] for c in store.concept_pool(conn, UID)}
+    assert concept_ids                                  # concepts formed
+    frags = store.fragment_pool(conn, UID)
+    # every fragment is now scoped to a consolidated concept region (was anchor-bootstrap)
+    assert all(f["cluster"] in concept_ids for f in frags)
+
+    base = store.get_baselines(conn, UID)
+    assert set(base) == {"clusters", "prior"}
+    assert base["clusters"] and all(k in concept_ids for k in base["clusters"])
+    assert len(base["prior"]) == 2                      # (mu, sd) prior-over-clusters
+
+
+def test_c12_baselines_feed_the_next_write(conn, fake_llm, monkeypatch):
+    """A write AFTER consolidation reads the pushed-down baselines instead of
+    recomputing them over the corpus."""
+    _seed_fragmented_corpus(conn)
+    consolidate(conn, UID)
+    pushed = store.get_baselines(conn, UID)
+    assert pushed
+
+    seen = {}
+    real = write.route_fragments
+
+    def spy(*a, **kw):
+        seen["baselines"] = kw.get("baselines")
+        return real(*a, **kw)
+
+    monkeypatch.setattr(write, "route_fragments", spy)
+    ep = encode(conn, UID, "Interleaving topics while studying improves retention.",
+                source="test")["episode_id"]
+    write.refine_episode(conn, UID, ep)
+    assert seen["baselines"] == pushed                  # the pushed snapshot, not a recompute
+
+
+def test_c12_recluster_survives_rebuild(conn, fake_llm):
+    _seed_fragmented_corpus(conn)
+    consolidate(conn, UID)
+    before = {f["id"]: f["cluster"] for f in store.fragment_pool(conn, UID)}
+    assert any(v is not None for v in before.values())
+    rebuild(conn)
+    after = {f["id"]: f["cluster"] for f in store.fragment_pool(conn, UID)}
+    assert after == before                              # RECLUSTERED replays after FRAGMENTED
+
+
+def test_c12_recluster_reverts_on_rollback(conn, fake_llm):
+    _seed_fragmented_corpus(conn)
+    bootstrap = {f["id"]: f["cluster"] for f in store.fragment_pool(conn, UID)}
+    r = consolidate(conn, UID)
+    reclustered = {f["id"]: f["cluster"] for f in store.fragment_pool(conn, UID)}
+    assert reclustered != bootstrap                     # consolidation moved them onto concepts
+
+    rollback_run(conn, r["run_id"])
+    rebuild(conn)
+    after = {f["id"]: f["cluster"] for f in store.fragment_pool(conn, UID)}
+    assert after == bootstrap                            # rolled-back RECLUSTERED is excluded

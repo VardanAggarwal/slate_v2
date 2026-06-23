@@ -48,7 +48,7 @@ AMBIGUOUS route.
 
 ---
 
-## CONSOLIDATE — 12 of 14 active in a run
+## CONSOLIDATE — 13 of 14 active in a run
 
 Offline batch (CLI `consolidate` / nightly cron). It does **not** read the fragment layer — each
 episode is re-blueprinted by an **LLM over `raw_text`** (`consolidate.py:1156`), and the
@@ -72,11 +72,19 @@ Reached in `consolidate()`'s main loop, in order:
 | C11 | Cold-start fallback | `CANON_*` cosine path when a neighbourhood ≤ `SPAN_K` | `_dedup_route:435` |
 | C13 | Consume retrieval signals | active — now fed by the live fragment path's R8 (committed in MCP) | `_consume_retrieval_signals:1040` |
 
+**In a normal run (added):**
+
+- **C12 — fit baselines + push down.** `_fit_baselines` runs at the end of `consolidate()`:
+  re-clusters every fragment onto its nearest consolidated concept (`RECLUSTERED` event →
+  `store.set_fragment_clusters`, so it survives rebuild / reverts on rollback), then
+  `predict.compute_baselines` over the re-clustered corpus → `store.set_baselines`. Write loads
+  the pushed snapshot (`store.get_baselines` → `route_fragments(baselines=…)`) instead of
+  recomputing per write. So the **measurement half** of calibration is now "fitted at
+  consolidation and pushed down". The **Q,B bet** (`value_floor`/`concept_share`) still needs the
+  LLM-judged SR@B sweep and stays the offline `eval/fit_stop.py --push` pass — by design.
+
 **Not in a normal run:**
 
-- **C12 — fit calibration.** `predict.compute_baselines:215` is **never called** by `consolidate()`.
-  Calibration is fitted by a separate offline script; MCP loads the fitted profile via
-  `calib.merged`. So "fitted at consolidation and pushed down" is not in the loop.
 - **C14 — rollback / re-derive.** `rollback_run:288` is implemented and correct, but admin-invoked,
   not part of a normal pass.
 
@@ -99,9 +107,9 @@ spans with the predictor's assembly VOI stop. Per-step status:
 
 | Step | Status |
 |---|---|
-| R1 decompose | default **OFF** |
+| R1 decompose | **on** (profile flag, default ON) |
 | R2 value_floor stop | per calibration |
-| R3 borrow cross-theme | default **OFF** |
+| R3 borrow cross-theme | **on** (profile flag, default ON) |
 | R4 budget alloc | on |
 | R5 VOI stop (`GAIN_FLOOR`) | on |
 | R6 prioritise | on |
@@ -118,14 +126,15 @@ spans with the predictor's assembly VOI stop. Per-step status:
 | Live budget B | assembly stops at the VOI-maximising size | ✅ **Now live.** Fragment path runs the VOI stop; budget split by `concept_share` (each path still char-bounded). |
 | C13 signals | retrieval signals close the loop | ✅ **Now closed.** Fragment path emits R8 (`signals=True`), MCP commits, C13 consumes. |
 | Consolidate input | predictor spine reshapes working memory | Claims still re-extracted by an **LLM blueprint over `raw_text`** each run; fragments aren't a consolidation input. |
-| R1 / R3 | decompose query · borrow cross-theme nuance | Coded in the now-live fragment path but **still default-OFF** pending tuning. |
-| C12 calibration | "fitted at consolidation and pushed down" | `compute_baselines()` **still not called** in `consolidate()`. Fit is a separate offline script. |
+| R1 / R3 | decompose query · borrow cross-theme nuance | ✅ **Now wired.** Profile flags (`decompose`/`borrow` in `DEFAULT_CALIBRATION`), default ON, threaded through hybrid→assemble→`fragment_recall`. A fitted profile can still flip either off. |
+| C12 calibration | "fitted at consolidation and pushed down" | ✅ **Baselines now in the loop.** `_fit_baselines` re-clusters fragments onto concepts + pushes `compute_baselines` down; Write loads it. The `value_floor`/`concept_share` Q,B bet stays the offline `fit_stop.py` sweep (LLM/quota-gated). |
 | Per-stage logic | measure/decide + 3 wrappers, magnitude-not-direction | **Faithful.** Write W1–W8 and Consolidate C1–C11 reach the predictor as described. |
 
 **Net:** the topology now matches the intent — retrieval is a hybrid over both the
 LLM-blueprinted claims/concepts graph and the predictor-native fragment layer, and the R8→C13
-signal loop is closed. Remaining gaps are tuning (R1/R3 default-OFF; C12 fitted offline rather than
-in a run) plus cross-cutting §4 work (redaction, multi-user isolation leak at `store.py:292`,
+signal loop is closed. R1/R3 are now wired ON and C12 fits + pushes baselines down inside a run;
+the only deferred C12 piece is the LLM-judged `value_floor` SR@B sweep (offline by design).
+Remaining gaps are cross-cutting §4 work (redaction, multi-user isolation leak at `store.py:292`,
 write-during-consolidate snapshot, cost gate).
 
 ---

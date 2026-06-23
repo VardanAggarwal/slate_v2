@@ -54,12 +54,16 @@ BORROW_MIN_REL = 0.25
 # kills the observed over-injection (assembly pads to budget, hurting SR@B@B/2; see
 # docs/retrieve-workflow-eval.md). LEFT None (disabled) here on purpose: it must be
 # FITTED against frozen SR@B by C12 and pushed down, never pre-tuned in source.
-# `decompose`/`borrow` (R1/R3) are likewise default-OFF: structurally present and
-# tested, but they must earn their place against frozen SR@B before they fire.
+# `decompose`/`borrow` (R1/R3) are now wired into the pipeline as profile flags: ON
+# by default so a multi-part query covers every part (R1) and a query whose own theme
+# can't fully cover it borrows one aligned cross-theme span (R3). Both stay
+# calibration-controllable — a fitted profile can flip either off — but they are no
+# longer structurally unreachable from the hybrid/MCP path.
 DEFAULT_CALIBRATION = {"gain_floor": assembly.GAIN_FLOOR, "max_items": MAX_ITEMS,
                        "value_floor": assembly.VALUE_FLOOR,
                        "triage_min_rel": TRIAGE_MIN_REL,
                        "borrow_min_rel": BORROW_MIN_REL,
+                       "decompose": True, "borrow": True,
                        # `concept_share` is the hybrid budget split (concepts vs fragments;
                        # mirrors `hybrid.CONCEPT_SHARE`). Declared here so the single fitted
                        # profile can carry/push it like `value_floor` — it's a C12 fit-target,
@@ -182,7 +186,7 @@ def _seed_pool(conn, user_id: str, query: str, *, seed_k: int,
 
 def fragment_recall(conn, user_id: str, query: str, *, seed_k: int = SEED_K,
                     k: int | None = None, calibration: dict | None = None,
-                    decompose: bool = False, borrow: bool = False,
+                    decompose: bool | None = None, borrow: bool | None = None,
                     signals: bool = False, run_id: str | None = None) -> list[dict]:
     """Rank + select fragments for a query via the assembly wrapper.
 
@@ -194,11 +198,17 @@ def fragment_recall(conn, user_id: str, query: str, *, seed_k: int = SEED_K,
     anchors it (R7 triage — PRD: return nothing, never pad).
 
     `decompose` (R1) seeds from independent sub-queries; `borrow` (R3) appends one
-    cross-theme nuance; `signals` (R8) logs fetched/dropped for consolidation. All
-    default OFF — the first two are fit-targets not yet earned vs SR@B."""
+    cross-theme nuance; `signals` (R8) logs fetched/dropped for consolidation.
+    `decompose`/`borrow` default to the calibration profile (ON by default — see
+    DEFAULT_CALIBRATION); pass an explicit bool to override the profile for one call."""
     # C12: a caller override wins; otherwise load the user's fitted profile over
     # the in-code defaults (just the defaults until a fit is pushed).
     calibration = calibration or calib.merged(conn, DEFAULT_CALIBRATION, user_id)
+    # Resolve R1/R3 toggles: an explicit bool arg wins; else the profile flag; else off.
+    if decompose is None:
+        decompose = bool(calibration.get("decompose", False))
+    if borrow is None:
+        borrow = bool(calibration.get("borrow", False))
     cand, emb = _seed_pool(conn, user_id, query, seed_k=seed_k,
                            decompose=decompose, calibration=calibration)
     if not cand:

@@ -211,6 +211,18 @@ CREATE TABLE IF NOT EXISTS calibration_profiles (
     updated_at   TEXT
 );
 
+-- C12 baselines: the per-cluster cohesion (μ,σ) + prior-over-clusters that the
+-- predictor measures a residual's z against. MEASUREMENT context (not the Q,B bet —
+-- see core/predict.py §2), recomputed at consolidation when clusters change and
+-- pushed down so Write reads a stable snapshot instead of rebuilding it every write.
+-- Derived cache (recomputable from the corpus), so — like calibration_profiles — it
+-- is NOT event-derived and survives rebuild untouched; the next run refreshes it.
+CREATE TABLE IF NOT EXISTS baselines (
+    user_id        TEXT PRIMARY KEY,
+    baselines_json TEXT NOT NULL,
+    updated_at     TEXT
+);
+
 CREATE TABLE IF NOT EXISTS consolidation_runs (
     id            TEXT PRIMARY KEY,
     user_id       TEXT NOT NULL,
@@ -856,6 +868,27 @@ def all_concepts(conn: sqlite3.Connection, user_id: str) -> list[sqlite3.Row]:
                         (user_id,)).fetchall()
 
 
+def concept_pool(conn: sqlite3.Connection, user_id: str) -> list[dict]:
+    """Every concept's id + (normalized mean-of-members) vector — the consolidated
+    REGIONS a fragment is re-clustered against at C12. Reads the materialized
+    vec_concepts; concepts with no vector (emptied/just-deleted) are skipped."""
+    rows = conn.execute(
+        "SELECT concept_id, embedding FROM vec_concepts WHERE user_id = ? ORDER BY concept_id",
+        (user_id,)).fetchall()
+    return [{"concept_id": r["concept_id"], "embedding": _deserialize(r["embedding"])}
+            for r in rows]
+
+
+def set_fragment_clusters(conn: sqlite3.Connection, user_id: str,
+                          assignments: dict[str, str]) -> int:
+    """C12 re-cluster applier: set each fragment's `cluster` to its assigned region
+    (concept id). Bulk UPDATE keyed on (user_id, frag_id). Returns rows touched."""
+    conn.executemany(
+        "UPDATE fragments SET cluster = ? WHERE user_id = ? AND id = ?",
+        [(cluster, user_id, fid) for fid, cluster in assignments.items()])
+    return len(assignments)
+
+
 def recompute_concept_embedding(conn: sqlite3.Connection, user_id: str,
                                 concept_id: str) -> None:
     """Concept vector = normalized mean of member claim vectors (deterministic,
@@ -1123,6 +1156,23 @@ def set_calibration(conn: sqlite3.Connection, user_id: str, profile: dict) -> No
            VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET
            profile_json = excluded.profile_json, updated_at = excluded.updated_at""",
         (user_id, json.dumps(profile), now_iso()))
+
+
+def get_baselines(conn: sqlite3.Connection, user_id: str) -> dict:
+    """C12 — the per-cluster cohesion baselines pushed down at the last
+    consolidation, or {} if none yet (cold start → Write recomputes on the fly)."""
+    row = conn.execute(
+        "SELECT baselines_json FROM baselines WHERE user_id = ?",
+        (user_id,)).fetchone()
+    return json.loads(row["baselines_json"]) if row else {}
+
+
+def set_baselines(conn: sqlite3.Connection, user_id: str, baselines: dict) -> None:
+    conn.execute(
+        """INSERT INTO baselines (user_id, baselines_json, updated_at)
+           VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET
+           baselines_json = excluded.baselines_json, updated_at = excluded.updated_at""",
+        (user_id, json.dumps(baselines), now_iso()))
 
 
 def get_run(conn: sqlite3.Connection, run_id: str) -> sqlite3.Row | None:

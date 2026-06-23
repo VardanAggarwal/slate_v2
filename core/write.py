@@ -153,7 +153,8 @@ def fragment_representatives(specs: list[tuple[str, int, int]], sent_texts: list
 
 def route_fragments(specs: list[tuple[str, int, int]], frag_embs, memory: list[dict],
                     *, classify=None, calibration: dict | None = None,
-                    frag_id_fn=None, medoid_idxs: list[int] | None = None) -> dict:
+                    frag_id_fn=None, medoid_idxs: list[int] | None = None,
+                    baselines: dict | None = None) -> dict:
     """W4–W7 — route each fragment against memory ∪ siblings, in note order.
 
     PREDICTED  → reinforce the anchor (a prior or sibling fragment); store nothing.
@@ -181,8 +182,11 @@ def route_fragments(specs: list[tuple[str, int, int]], frag_embs, memory: list[d
     # (direct callers passing raw frag_embs) it defaults to the span start, a real
     # sentence index. Production passes the true medoids from fragment_representatives.
     medoid_of = (lambda i, s: medoid_idxs[i]) if medoid_idxs is not None else (lambda i, s: s)
-    baselines = (predict.compute_baselines(memory)
-                 if len(memory) >= predict.WARMUP_MIN_CORPUS else None)
+    # C12: prefer the baselines consolidation fitted + pushed down (a stable snapshot
+    # over the settled concept regions); recompute on-the-fly only when none are
+    # persisted yet (cold start, before the first consolidation).
+    if baselines is None and len(memory) >= predict.WARMUP_MIN_CORPUS:
+        baselines = predict.compute_baselines(memory)
 
     # one batched pass: all fragments vs the fixed memory (single gemm inside measure)
     frag_dicts = [{"text": t, "embedding": e} for (t, _, _), e in zip(specs, frag_embs)]
@@ -361,10 +365,13 @@ def refine_episode(conn, user_id: str, episode_id: str, *,
     specs = plan_fragments(sent_texts, sent_embs, calibration=calibration)
     frag_embs, medoid_idxs = fragment_representatives(specs, sent_texts, sent_embs)
     memory = _memory_pool(conn, user_id)
+    # C12: read the baselines consolidation pushed down (empty until the first run →
+    # route_fragments recomputes from `memory`).
+    baselines = store.get_baselines(conn, user_id) or None
     routed = route_fragments(
         specs, frag_embs, memory, classify=classify, calibration=calibration,
         frag_id_fn=lambda s, e: store.fragment_id_for(user_id, episode_id, s, e),
-        medoid_idxs=medoid_idxs)
+        medoid_idxs=medoid_idxs, baselines=baselines)
     payload = _build_payload(episode_id, ep["ts"], routed, len(memory))
 
     # --- commit: claim the episode FIRST (atomic race guard), then event +
