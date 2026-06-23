@@ -61,6 +61,24 @@ def test_hybrid_falls_back_to_concepts_when_no_fragments(conn):
     assert "moat" in ctx.lower()
 
 
+def test_hybrid_runs_fragment_path_once_when_concepts_empty(conn, monkeypatch):
+    """No claims → fragments take the whole budget, but the fragment path (heavy
+    assembly + R8 signals=ON) must run EXACTLY ONCE, not be sized then re-run at full
+    budget — a double run double-emits R8, inflating C13 exposure counts."""
+    _seed(conn)
+    calls = {"n": 0}
+    real = hybrid.retrieve.assemble_context
+
+    def counting(*a, **k):
+        calls["n"] += 1
+        return real(*a, **k)
+
+    monkeypatch.setattr(hybrid.retrieve, "assemble_context", counting)
+    ctx = hybrid.hybrid_context(conn, UID, "AI memory paradigm")
+    assert calls["n"] == 1
+    assert "memory" in ctx.lower()
+
+
 def test_hybrid_nothing_stored(conn):
     """Both paths empty → the explicit sentinel, never a padded guess."""
     msg = hybrid.hybrid_context(conn, UID, "quantum gardening on mars")

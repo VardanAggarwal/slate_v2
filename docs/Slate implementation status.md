@@ -1,59 +1,156 @@
 # Slate — implementation status
 
-Companion to `Slate PRD v2.md`. The PRD is the *what* (design, deferring mechanism). This file is the *how / now*: where the code stands today against that design, and the concrete gaps. Keep mechanism here, not in the PRD.
+Companion to `Slate PRD v2.md` (the *what*) and `Slate execution plan.md` (the step map).
+This file is the *how / now*: what the **code actually runs today**, traced from the MCP entry
+points through `encode.py`, `write.py`, `consolidate.py`, `recall.py`, `hybrid.py` and
+`retrieve.py` — not what the docs describe. File:line refs are ground truth on branch
+`v3-changes`.
 
-## Built vs missing
+## The shape of it today
 
-| Capability (PRD concept) | Status |
+Slate runs as **two derived layers over one immutable raw store, and retrieval reads both.**
+
+- **Raw memory** — `episodes` + `episode_sentences` + `vec_sentences` + the `ENCODED` event.
+  Immutable, trigger-enforced. Ground truth for every rebuild.
+- **Fragment layer** — built by **Write** (W2–W8) off the sentence vectors via the predictor.
+  Replayable from the `FRAGMENTED` event. Read by the hybrid retriever's fragment path.
+- **Claims / concepts layer** — built by **Consolidate**, which re-extracts claims with an
+  **LLM `blueprint()` over `raw_text`** (not over fragments) and then runs the predictor + guard
+  over the resulting claims.
+- **Retrieve** — `assemble_context` → `hybrid.hybrid_context` blends the concept/claim path
+  (`recall`) with the fragment path (`retrieve` + assembly), split by a calibrated `concept_share`.
+
+The predictor (`core/predict.py`) is the spine and is genuinely reached by Write and Consolidate.
+The remaining gaps are **tuning, not topology**.
+
+---
+
+## WRITE — all 8 steps reached at runtime
+
+`save_note` (MCP) runs W1 synchronously, then spawns a daemon thread (`trigger_refine_async`,
+`write.py:414`) for W2–W8. The CLI `encode` runs `refine_episode` (`write.py:333`) inline.
+Refine makes **zero new embedding calls** — medoids reuse the W1 sentence vectors; fragment
+vectors aren't stored, they're reconstructed from a medoid index on read.
+
+| # | Step | Mechanism | Code |
+|---|---|---|---|
+| W1 | Persist raw (sync) | episode + sentences + vec_sentences, `ENCODED` event with receipt | `encode.py:216` · `store.insert_episode:508` |
+| W2 | Segment | causal `nearest_sim` z-score boundaries (DROP_Z) | `scan.fragments:116` ← `plan_fragments:79` |
+| W3 | Variable-resolution | FOLD_Z keeps fine fragments where surprise is high | `scan.fragments:141` |
+| W4 | Intra-note dedup | if a kept sibling beats memory, re-measure vs `M ∪ siblings` | `write.py:206` · `_nearest_kept_sibling:98` |
+| W5 | Batched match | one GEMM: all fragments vs memory → anchor + residual | `route_fragments:154` · `predict.measure:189` |
+| W6 | Route & resolve | `decide()` → route; NLI `resolve_direction` fires **only on AMBIGUOUS** | `predict.decide:430` · `resolve_direction:481` |
+| W7 | Centre & peak | medoid = min-residual sentence; novel peak = max z (read off measurements) | `_fragment_medoid:121` |
+| W8 | Persist working | `FRAGMENTED` event + `insert_fragment` (NOVEL/AMBIGUOUS only); race-guarded, replayable | `mark_fragmented:1049` · `apply_fragmented:285` |
+
+**Status: faithful to spec.** Every W-step is wired and reached. LLM is invoked only on the
+AMBIGUOUS route.
+
+---
+
+## CONSOLIDATE — 12 of 14 active in a run
+
+Offline batch (CLI `consolidate` / nightly cron). It does **not** read the fragment layer — each
+episode is re-blueprinted by an **LLM over `raw_text`** (`consolidate.py:1156`), and the
+predictor + guard then operate on the resulting claims/concepts. `CANON_*` cosine constants
+still fire as the cold-start fallback when a neighbourhood is smaller than `SPAN_K`.
+
+Reached in `consolidate()`'s main loop, in order:
+
+| # | Step | Mechanism | Code |
+|---|---|---|---|
+| C1 | Triage / revisit | sort batch by contradiction count then novelty | `_revisit_order:1133` |
+| C2 | Dedup claims | `measure()`/`decide()` vs neighbourhood; CANON_* only when cold | `_dedup_route:397` · `_canonicalize:1163` |
+| C3 | Concept membership | spread-relative z gate (≤ `CONCEPT_MEMBERSHIP_Z`), cosine fallback | `_membership_z:610` · `_concept_pass:1171` |
+| C4 | Split / re-anchor | bimodal spread flags SPLIT candidates; LLM decides | `_spread_is_bimodal` · `_concept_geometry:626` |
+| C5 | Relations & bridges | residual band → bridge candidates; LLM confirms | `_relations:1174` · `_bridges:1185` |
+| C6 | Merge safely | `guard.merge` partitions loser into FOLD vs KEEP at the merge | `guard.merge:725` |
+| C7 | Forget / prune | dormant concepts only; leave-one-out drops reconstructable members | `_prune_safely:1090` |
+| C8 | Reconcile & version | `contradiction_pairs` → supersede/scope/version; margin-before-flip | `_reconcile:1177` · `_resolve_conflict:790` |
+| C9 | Demote background | re-predicted ≥ N times → `BACKGROUNDED`, folds into theme | `_demote_background:1016` |
+| C10 | Integrity check | claim vs source episode; ungrounded → `INTEGRITY_FLAGGED` (log-only) | `_check_integrity:1179` |
+| C11 | Cold-start fallback | `CANON_*` cosine path when a neighbourhood ≤ `SPAN_K` | `_dedup_route:435` |
+| C13 | Consume retrieval signals | active — now fed by the live fragment path's R8 (committed in MCP) | `_consume_retrieval_signals:1040` |
+
+**Not in a normal run:**
+
+- **C12 — fit calibration.** `predict.compute_baselines:215` is **never called** by `consolidate()`.
+  Calibration is fitted by a separate offline script; MCP loads the fitted profile via
+  `calib.merged`. So "fitted at consolidation and pushed down" is not in the loop.
+- **C14 — rollback / re-derive.** `rollback_run:288` is implemented and correct, but admin-invoked,
+  not part of a normal pass.
+
+---
+
+## RETRIEVE — hybrid, both layers live
+
+`assemble_context` now runs `hybrid.hybrid_context` (`mcp_server.py:343`). It reserves a
+`concept_share` slice of the budget for the concept/claim path and gives the rest to the fragment
+path, then merges. If one side is empty it re-runs the other at full budget — a safe superset of
+the old concept-only behaviour. The separate `recall(query, k)` tool still runs pure spreading
+activation for quick lookups.
+
+**Concept path** (`hybrid.py:70` → `recall.assemble_context` → `recall.py:42`): the hard tail —
+synthesis across notes over the claims/concepts graph (kNN claims/concepts + 2-hop spread,
+≤ concept_budget).
+
+**Fragment path** (`retrieve.py:236` → `fragment_recall` + assembly): specificity — verbatim
+spans with the predictor's assembly VOI stop. Per-step status:
+
+| Step | Status |
 |---|---|
-| Raw memory — immutable, append-only episodes | ✅ built (immutable by trigger) |
-| Working memory as a re-derivable cache | ⚠️ exists, but rebuild replays the event log, not the raw record |
-| Write-time surprise detection (echo / novelty / contradiction) | ✅ built — but binary, write-only |
-| Continuous, stored, reused prediction error | ❌ the core gap (deferred "how") |
-| Surprise-driven fragment boundaries | ⚠️ wrapper built (`core/scan.py`, measure()-iterator on `nearest_sim`), not wired — `encode.py` still sentence-splits |
-| Spreading activation (associative recall) | ✅ built |
-| Query decomposition | ⚠️ wrapper built (`core/scan.py`, shared with segment), not wired into `recall.py` |
-| Value-of-information / token-budget stopping | ⚠️ wrapper built (`core/assembly.py`, measure()-iterator: greedy max-marginal-`residual` + STOP), not wired — `recall.py` still a `k` limit |
-| Retrieval → consolidation signal loop | ❌ consolidation sees writes only |
-| Batch consolidation, idempotent | ✅ built |
-| Real forgetting / pruning | ❌ only relabels active→stale→dormant, never removes |
-| Reconstruction-residual rule (safe merge + safe forget) | ⚠️ wrapper built (`core/guard.py`, measure()-iterator on `z`: forget=LOO, merge=losers-vs-survivors), not wired — `consolidate.py` MERGE still averages centroids |
-| Belief reconciliation & versioning | ❌ no schema for status / version / qualifier |
-| Bridge candidacy (non-obvious cross-theme links) | ⚠️ surfaced in MCP (`list_bridges`) but no consolidation step produces them via the residual band |
-| Store-integrity check (derived claim vs source episode) | ❌ not built — PRD §40 scopes it inside consolidation |
-| Run-level rollback of a bad consolidation | ❌ events append-only; replay reproduces the bug |
-| Re-derivation from the raw record (true firewall) | ❌ only event-log replay exists |
-| Deletion / redaction path (privacy) | ❌ episodes immutable, no exception |
-| Cold-start behaviour | ❌ empty store → everything maximally surprising |
-| External eval harness (recall ground truth) | ❌ **critical-path, build first** |
+| R1 decompose | default **OFF** |
+| R2 value_floor stop | per calibration |
+| R3 borrow cross-theme | default **OFF** |
+| R4 budget alloc | on |
+| R5 VOI stop (`GAIN_FLOOR`) | on |
+| R6 prioritise | on |
+| R7 triage | on |
+| R8 emit signals (`signals=True`) | **on** — committed in MCP, feeds C13 |
 
-## Concrete gaps found in code (file pointers)
+---
 
-- **Firewall is weaker than the PRD's safety story assumes.** `rebuild` truncates the semantic layer and replays the **event log** (`consolidate.py:198-206`); a bad MERGE/SPLIT is itself an event, so replay reproduces it deterministically. True re-derivation must re-run consolidation from the immutable episodes, bypassing the log. Not built.
-- **No run-level rollback.** Events are append-only with no compensating/revert concept. Fix: tag every event with its `run_id` (runs already tracked in `consolidation_runs`); rollback = drop run N's events and rebuild to N−1; escalate to full re-derivation when the log baked in the bad decision.
-- **Forgetting only relabels.** Decay transitions active→stale→dormant (`consolidate.py:571-593`); dormant rows live forever. No pruning, no compression.
-- **MERGE averages.** Concept centroid is a normalized mean of member vectors (`store.py:631-647`); a merge folds the loser's nuance into the mean. Needs the reconstruction-residual guard before committing.
-- **Versioning has no schema home.** `claims` has no status/version column; `relations` has no `superseded_by` type; there is no qualifier/condition field (`store.py:88-133`). This is a schema migration.
-- **Contradiction link is fragile.** Stance is classified at write (`encode.py:129`) but the `contradicts` relation is only materialized in consolidation via a "first claim in cluster" heuristic (`consolidate.py:497-503`) — the link to the actual contradicting sentence isn't preserved.
-- **Event-log payload versioning.** Adding prediction-error magnitude and retrieval-signal events changes payload shape; old ENCODED/CANONICALIZED events lack the new keys. `apply_event` reads fixed keys — rebuild over a mixed-version log must backfill or null-default.
-- **NLI label order is hard-coded.** `encode.py:70` assumes `["contradiction","entailment","neutral"]`; a model swap (config-overridable, `config.py:32`) would silently mislabel every contradiction — the highest-surprise event the whole spine relies on.
-- **Multi-user is real but unstated in design.** Every row partitions by `user_id` (`store.py`); `delete_user` leaves the corpus behind (`store.py:292-296`) — no redaction path.
+## Code vs the plan
 
-## Predictor wrappers (context, mechanism)
-The three §0 wrappers are **thin iterators over `predict.measure()`** — the spine — not modules that re-derive residual geometry. Each is a choice of X, Y and which measurement FIELD to read. Built + validated, **not yet wired into any stage**.
+| Area | Plan says | Code does |
+|---|---|---|
+| Fragments → retrieve | P2.5: "orphan branch closed" | ✅ **Now true.** `assemble_context` → `hybrid` reads the fragment path via `retrieve.assemble_context`. |
+| Live budget B | assembly stops at the VOI-maximising size | ✅ **Now live.** Fragment path runs the VOI stop; budget split by `concept_share` (each path still char-bounded). |
+| C13 signals | retrieval signals close the loop | ✅ **Now closed.** Fragment path emits R8 (`signals=True`), MCP commits, C13 consumes. |
+| Consolidate input | predictor spine reshapes working memory | Claims still re-extracted by an **LLM blueprint over `raw_text`** each run; fragments aren't a consolidation input. |
+| R1 / R3 | decompose query · borrow cross-theme nuance | Coded in the now-live fragment path but **still default-OFF** pending tuning. |
+| C12 calibration | "fitted at consolidation and pushed down" | `compute_baselines()` **still not called** in `consolidate()`. Fit is a separate offline script. |
+| Per-stage logic | measure/decide + 3 wrappers, magnitude-not-direction | **Faithful.** Write W1–W8 and Consolidate C1–C11 reach the predictor as described. |
 
-`measure()` was expanded to make this possible:
-- `x` accepts `str` | `list[str]` | `list[dict]` (a dict carries its own embedding → reused, no re-embed).
-- `exclude_self` — leave-one-out when X ⊆ Y (scan, guard), matched by exact self-similarity.
-- **scale-aware** — `WARMUP_MIN_CORPUS` dropped 12→2; the top-k operators already cap `k` at pool size, so `SPAN_K`/`STAT_K` degrade to "use all available" on a small Y. This lets one `measure()` serve a within-note corpus AND the full memory; the large-corpus Write path is unchanged.
+**Net:** the topology now matches the intent — retrieval is a hybrid over both the
+LLM-blueprinted claims/concepts graph and the predictor-native fragment layer, and the R8→C13
+signal loop is closed. Remaining gaps are tuning (R1/R3 default-OFF; C12 fitted offline rather than
+in a run) plus cross-cutting §4 work (redaction, multi-user isolation leak at `store.py:292`,
+write-during-consolidate snapshot, cost gate).
+
+---
+
+## Predictor wrappers (mechanism)
+
+The three wrappers are **thin iterators over `predict.measure()`** — the spine — not modules that
+re-derive residual geometry. Each is a choice of X, Y and which measurement FIELD to read.
 
 | Wrapper | X vs Y (via measure) | reads | loop shape |
 |---|---|---|---|
-| `core/scan.py` — segment / decompose | X = each sentence, Y = the note's own **causal prefix** | **`nearest_sim`** (cosine field; residual is a weak boundary signal at sentence scale) | one measure() per sentence |
-| `core/guard.py` — merge / forget | `forget`: X=Y=cluster members (LOO); `merge`: X=losers, Y=survivors | **`z`** (residual vs the region's own spread) | one measure() call |
+| `core/scan.py` — segment / decompose | X = each sentence, Y = the note's own **causal prefix** | **`nearest_sim`** (residual is a weak boundary signal at sentence scale) | one measure() per sentence |
+| `core/guard.py` — merge / forget | `forget`: X=Y=cluster (LOO); `merge`: X=losers, Y=survivors | **`z`** (residual vs the region's own spread) | one measure() call |
 | `core/assembly.py` — stop / allocate / dedupe | X = candidates, Y = query + growing assembly | `residual` | loops measure() per greedy step (Y grows) |
 
-Cut/forget thresholds are SPREAD-RELATIVE (the region's own cohesion sets the bar) and live in a scopeable JSON **calibration profile** (each module's `DEFAULT_CALIBRATION`), resolved by `predict.calib_value(profile, key, default, scope)` — fitted at consolidation and pushed down, never baked as constants. Note guard's `z` scale depends on Y's cohesion, so `z_forget` is genuinely per-scope calibration, validated ≈−0.5 on real clusters. Tests: `tests/test_wrappers.py` (14, synthetic + near-threshold + overlapping-topic) and the LLM-judged real-corpus probes in `tests/manual/`.
+`measure()` is scale-aware (`x` accepts `str` | `list[str]` | `list[dict]` carrying its own
+embedding; `exclude_self` for leave-one-out; top-k operators cap `k` at pool size), so one
+`measure()` serves a within-note corpus and the full memory unchanged. Cut/forget thresholds are
+SPREAD-RELATIVE and live in a scopeable JSON calibration profile (each module's
+`DEFAULT_CALIBRATION`, resolved by `predict.calib_value`), fitted offline and pushed down — never
+baked as constants. Tests: `tests/test_wrappers.py` (synthetic + near-threshold + overlapping-topic)
+plus LLM-judged real-corpus probes in `tests/manual/`.
 
 ## Storage (context)
-SQLite + sqlite-vec (L2-normalized kNN), single `engine.db`, WAL. Embeddings 384-dim all-MiniLM-L6-v2 — HF Inference API in prod (no torch on the 1GB host), local SentenceTransformer in dev. FTS5 over episodes. Schema version 2 (multi-user).
+
+SQLite + sqlite-vec (L2-normalized kNN), single `engine.db`, WAL. Embeddings 384-dim
+all-MiniLM-L6-v2 — HF Inference API in prod (no torch on the 1GB host), local SentenceTransformer
+in dev. FTS5 over episodes. Schema version 2 (multi-user).

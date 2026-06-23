@@ -67,19 +67,25 @@ def hybrid_context(conn, user_id: str, topic: str, max_chars: int = 6000, *,
     concept_budget = int(max_chars * concept_share)
     frag_budget = max_chars - concept_budget
 
+    # Concept path first (knn, emits no R8 signals). If it comes back empty the fragment
+    # path takes the WHOLE budget — so we size the fragment assembly ONCE up front rather
+    # than running it at frag_budget and re-running it at full budget. The old re-run not
+    # only wasted the heavier assembly pass, it emitted R8 signals TWICE (signals default
+    # ON), inflating C13's exposure counts. Fragments now run exactly once.
     concept = recall.assemble_context(conn, user_id, topic, max_chars=concept_budget)
-    frag = retrieve.assemble_context(conn, user_id, topic, max_chars=frag_budget,
+    c_empty = _is_empty(concept)
+
+    frag = retrieve.assemble_context(conn, user_id, topic,
+                                     max_chars=(max_chars if c_empty else frag_budget),
                                      calibration=calibration)
-    c_empty, f_empty = _is_empty(concept), _is_empty(frag)
+    f_empty = _is_empty(frag)
 
     if c_empty and f_empty:
         return f"_Slate has nothing stored about “{topic}” yet._"
-    # One path empty → re-run the other at the FULL budget (cheap, all-local) so the
-    # empty path's slice isn't lost.
     if c_empty:
-        return retrieve.assemble_context(conn, user_id, topic, max_chars=max_chars,
-                                         calibration=calibration)
+        return frag                       # already assembled at the full budget
     if f_empty:
+        # Concept path carries it alone; re-run at the full budget (cheap knn, no signals).
         return recall.assemble_context(conn, user_id, topic, max_chars=max_chars)
 
     # Both present: synthesis first (frames + protects the tail under a final cut),

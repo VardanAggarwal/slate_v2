@@ -321,14 +321,31 @@ def recall(query: str, k: int = 8) -> list[dict]:
 
 @mcp.tool
 def assemble_context(topic: str) -> str:
-    """Pull the user's full prior thinking on a topic as compact markdown,
-    grouped by concept with claims + provenance (which note, which date).
+    """Pull the user's full prior thinking on a topic as compact markdown:
+    synthesis from concepts/claims PLUS verbatim source spans, with provenance
+    (which note, which date).
 
     Call when you're about to write something substantive on a topic the user
     has history with, or after recall() surfaces a hit worth expanding. Output
-    is budgeted (~1-2K tokens, most-relevant-first) for direct injection."""
-    from core.recall import assemble_context as _ac
-    return _ac(_conn(), _user_id(), topic)
+    is budgeted (most-relevant-first) for direct injection."""
+    # HYBRID retrieve (plan §2 P4): blends the concept/claim path (the tail —
+    # synthesis across notes) with the fragment path (specificity — verbatim
+    # spans), the best Slate variant on the SR@B eval. Degrades to the pure
+    # concept path when no fragments are materialized yet, so this is a safe
+    # superset of the old recall.assemble_context. Calibration (concept_share,
+    # value_floor, …) is the user's fitted profile over the in-code defaults.
+    # Commit before close: the fragment path emits R8 retrieval signals
+    # (fetched/dropped) for consolidation C13, which append_event does NOT commit.
+    from core import calibration as calib, hybrid, retrieve
+    conn = _conn()
+    user_id = _user_id()
+    try:
+        cal = calib.merged(conn, retrieve.DEFAULT_CALIBRATION, user_id)
+        out = hybrid.hybrid_context(conn, user_id, topic, calibration=cal)
+        conn.commit()
+        return out
+    finally:
+        conn.close()
 
 
 @mcp.tool

@@ -394,8 +394,41 @@ def _existing_canon(conn, user_id: str, episode_id: str) -> list[tuple[str, str]
 
 
 # ── Step 3: claim canonicalization ────────────────────────────────────────────
+def _anchor_concept_prior(conn, user_id: str, episode_id: str | None, claim_emb) -> str | None:
+    """Fragment→consolidate PRIOR (plan §3): the concept the claim's Write-time source
+    span anchored to. Bridges claim → nearest same-episode fragment (cosine over the
+    medoid vectors Write already built — NO new embedding) → that fragment's AMBIGUOUS
+    `anchor_id` (a prior memory fragment) → the anchor's episode → its claims → their
+    concept.
+
+    Raw stays source-of-truth: this is a HINT the predictor (C2) / LLM (C3) may use, not
+    a decision. Returns None whenever fragments are absent (Write async / no refine yet)
+    or the source span was NOVEL/unanchored — so a corpus without materialized fragments
+    behaves EXACTLY as before. Never a network call (all reads are stored vectors)."""
+    if not episode_id:
+        return None
+    frags = store.episode_fragments(conn, user_id, episode_id)
+    if not frags:
+        return None
+    import numpy as np
+    q = np.asarray(claim_emb, dtype=np.float32)
+    q = q / (float(np.linalg.norm(q)) or 1.0)
+    best = max(frags, key=lambda f: float(q @ f["embedding"]))
+    anchor = best.get("anchor_id")
+    if not anchor:                                  # NOVEL span → no anchored concept
+        return None
+    anchor_ep = store.fragment_episode(conn, user_id, anchor)
+    if not anchor_ep:
+        return None
+    from collections import Counter
+    counts = Counter(
+        cid for cl in store.claims_for_episode(conn, user_id, anchor_ep)
+        if (cid := _claim_concept(conn, user_id, cl)))
+    return counts.most_common(1)[0][0] if counts else None
+
+
 def _dedup_route(conn, user_id: str, raw_claims: list[dict], embs,
-                 calibration: dict) -> tuple[list[tuple], list[tuple]]:
+                 calibration: dict, episode_id: str | None = None) -> tuple[list[tuple], list[tuple]]:
     """C2 — route each new claim same / uncertain / new against its neighbourhood
     of existing canonical claims, via the predictor spine (measure → decide),
     replacing the raw-cosine CANON_AUTO_SAME/CANON_LLM_BAND cuts.
@@ -409,12 +442,25 @@ def _dedup_route(conn, user_id: str, raw_claims: list[dict], embs,
     A neighbourhood too small to estimate a spread falls back to the absolute
     cosine bands (the cold-start stance of C11). Returns (decided, uncertain),
     same shape the caller consumed before."""
+    import numpy as np
     decided, uncertain = [], []
     for c, emb in zip(raw_claims, embs):
         hits = store.knn_claims(conn, user_id, emb, k=predict.STAT_K)
-        if not hits:
+        # C2 fragment prior: the source span's anchored concept may hold a canonical
+        # claim that global knn under-ranked (the LLM paraphrase drifted from the
+        # verbatim span). Widen the dedup neighbourhood with that concept's members —
+        # the predictor still routes below; an absent prior leaves this loop unchanged.
+        prior_cid = _anchor_concept_prior(conn, user_id, episode_id, emb)
+        seen = {h["claim_id"] for h in hits}
+        extra = ([cid for cid in store.concept_member_ids(conn, user_id, prior_cid)
+                  if cid not in seen] if prior_cid else [])
+        if not hits and not extra:
             decided.append((c, "new", None))
             continue
+        qn = np.asarray(emb, dtype=np.float32)
+        qn = qn / (float(np.linalg.norm(qn)) or 1.0)
+        cands = [{"claim_id": h["claim_id"], "text": h["text"],
+                  "similarity": h["similarity"]} for h in hits]
         corpus = []
         for h in hits:
             he = store.claim_embedding(conn, user_id, h["claim_id"])
@@ -422,8 +468,16 @@ def _dedup_route(conn, user_id: str, raw_claims: list[dict], embs,
                 corpus.append({"id": h["claim_id"], "text": h["text"],
                                "embedding": he,
                                "cluster": _claim_concept(conn, user_id, h["claim_id"])})
-        best = {"claim_id": hits[0]["claim_id"], "text": hits[0]["text"],
-                "similarity": hits[0]["similarity"]}
+        for cid in extra:                              # prior concept's members
+            he = store.claim_embedding(conn, user_id, cid)
+            if he is None:
+                continue
+            row = store.get_claim(conn, user_id, cid) or {"text": ""}
+            corpus.append({"id": cid, "text": row["text"], "embedding": he,
+                           "cluster": _claim_concept(conn, user_id, cid)})
+            cands.append({"claim_id": cid, "text": row["text"],
+                          "similarity": float(qn @ np.asarray(he, dtype=np.float32))})
+        best = max(cands, key=lambda x: x["similarity"])
         # A spread-relative z is only meaningful over a populated neighbourhood:
         # at canonicalization claims carry no concept yet, so the per-cluster
         # baselines are empty and the region spread comes from `corpus_prior`,
@@ -476,7 +530,7 @@ def _canonicalize_episode(conn, user_id: str, run_id: str, episode, bp: dict,
                                  normalize_embeddings=True, show_progress_bar=False)
 
     decided, uncertain = _dedup_route(conn, user_id, raw_claims, embs,
-                                      DEDUP_CALIBRATION)
+                                      DEDUP_CALIBRATION, episode_id=episode["id"])
 
     cost = 0.0
     for start in range(0, len(uncertain), CANON_CHUNK):
@@ -612,6 +666,17 @@ def _concept_pass_chunk(conn, user_id: str, run_id: str, new_claim_ids: list[str
                     else (hit["similarity"] >= CONCEPT_MEMBERSHIP_SIM)
                 if plausible:
                     nearby[hit["id"]] = hit
+            # C3 fragment prior: surface the concept the claim's source span anchored
+            # to as an attach candidate, even when global knn under-ranked it — this
+            # is what cuts concept fragmentation. The LLM below still attaches/splits;
+            # an absent prior (no fragments / NOVEL span) adds nothing.
+            for ep in store.claim_source_episodes(conn, user_id, cid):
+                pc = _anchor_concept_prior(conn, user_id, ep, emb)
+                if pc and pc not in nearby:
+                    crow = store.get_concept(conn, user_id, pc)
+                    if crow:
+                        nearby[pc] = {"id": pc, "label": crow["label"],
+                                      "canonical": crow["canonical"], "similarity": 0.0}
 
     concepts_ctx = []
     for c in nearby.values():

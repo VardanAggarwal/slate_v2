@@ -59,7 +59,13 @@ BORROW_MIN_REL = 0.25
 DEFAULT_CALIBRATION = {"gain_floor": assembly.GAIN_FLOOR, "max_items": MAX_ITEMS,
                        "value_floor": assembly.VALUE_FLOOR,
                        "triage_min_rel": TRIAGE_MIN_REL,
-                       "borrow_min_rel": BORROW_MIN_REL, "per_cluster": {}}
+                       "borrow_min_rel": BORROW_MIN_REL,
+                       # `concept_share` is the hybrid budget split (concepts vs fragments;
+                       # mirrors `hybrid.CONCEPT_SHARE`). Declared here so the single fitted
+                       # profile can carry/push it like `value_floor` — it's a C12 fit-target,
+                       # not pre-tuned. hybrid falls back to its own const if a caller omits it.
+                       "concept_share": 0.4,
+                       "per_cluster": {}}
 
 
 def _embed_query(query: str):

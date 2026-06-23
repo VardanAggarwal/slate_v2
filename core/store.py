@@ -733,6 +733,29 @@ def claim_support_count(conn: sqlite3.Connection, user_id: str, claim_id: str) -
         (claim_id, user_id)).fetchone()["n"]
 
 
+def claim_source_episodes(conn: sqlite3.Connection, user_id: str, claim_id: str) -> list[str]:
+    """Episodes that support a claim (the reverse of `claims_for_episode`). Used by
+    consolidation's fragment→concept prior to find a claim's Write-time source note."""
+    return [r["episode_id"] for r in conn.execute(
+        "SELECT DISTINCT episode_id FROM claim_support WHERE claim_id = ? AND user_id = ?",
+        (claim_id, user_id))]
+
+
+def episode_fragments(conn: sqlite3.Connection, user_id: str, episode_id: str) -> list[dict]:
+    """Fragments of ONE episode as {id, route, anchor_id, cluster, embedding} — the
+    medoid vector REFERENCED from vec_sentences (no duplicate stored), same join as
+    `fragment_pool` but scoped + carrying route/anchor. Empty when the episode hasn't
+    been refined yet (Write async), so consolidation's prior degrades to a no-op."""
+    rows = conn.execute(
+        """SELECT f.id, f.route, f.anchor_id, f.cluster, v.embedding FROM fragments f
+           JOIN vec_sentences v ON v.sent_key = f.episode_id || ':' || f.medoid_idx
+           WHERE f.user_id = ? AND f.episode_id = ? AND f.medoid_idx IS NOT NULL""",
+        (user_id, episode_id)).fetchall()
+    return [{"id": r["id"], "route": r["route"], "anchor_id": r["anchor_id"],
+             "cluster": r["cluster"], "embedding": _deserialize(r["embedding"])}
+            for r in rows]
+
+
 def fragment_episode(conn: sqlite3.Connection, user_id: str, frag_id: str) -> str | None:
     """The source episode of a fragment — the C13 bridge from a retrieval signal
     (which keys on fragment ids) to the claims derived from the same episode."""
