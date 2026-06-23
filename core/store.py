@@ -768,6 +768,22 @@ def episode_fragments(conn: sqlite3.Connection, user_id: str, episode_id: str) -
             for r in rows]
 
 
+def episode_fragment_spans(conn: sqlite3.Connection, user_id: str,
+                           episode_id: str) -> list[dict]:
+    """Materialized fragments of ONE episode as verbatim spans for claim genesis
+    (PRD §178: claims are minted from the fragment layer, never by re-processing raw):
+    {text, cluster, is_centre} ordered by position. Only `medoid_idx IS NOT NULL`
+    (referable / materialized) rows — same filter as `episode_fragments`. PREDICTED
+    fragments are never stored, so these rows are exactly the NOVEL/AMBIGUOUS residual
+    content. Empty when the episode is unrefined (Write async) → caller skips it."""
+    rows = conn.execute(
+        """SELECT text, cluster, is_centre FROM fragments
+           WHERE user_id = ? AND episode_id = ? AND medoid_idx IS NOT NULL
+           ORDER BY sent_start""", (user_id, episode_id)).fetchall()
+    return [{"text": r["text"], "cluster": r["cluster"],
+             "is_centre": bool(r["is_centre"])} for r in rows]
+
+
 def fragment_episode(conn: sqlite3.Connection, user_id: str, frag_id: str) -> str | None:
     """The source episode of a fragment — the C13 bridge from a retrieval signal
     (which keys on fragment ids) to the claims derived from the same episode."""

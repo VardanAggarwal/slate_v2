@@ -4,7 +4,7 @@ from core.consolidate import consolidate, emit
 from core.encode import encode
 from core.reconstruct import bridges, reconstruct, synthesize
 from tests.conftest import UID
-from tests.test_consolidate import S1, S2, fake_llm  # noqa: F401
+from tests.test_consolidate import S1, S2, _seed, fake_llm  # noqa: F401
 
 TS = "2026-06-11T00:00:00+00:00"
 
@@ -37,7 +37,7 @@ def test_reconstruct_requires_blueprint(conn, fake_gen_llm):
 
 
 def test_reconstruct_scores_fidelity_and_compression(conn, fake_gen_llm):
-    receipt = encode(conn, UID, S1, source="test", title="memory")
+    receipt = _seed(conn, UID, S1, title="memory")
     consolidate(conn, UID)
     result = reconstruct(conn, UID, receipt["episode_id"])
     assert result["fidelity"] == 8

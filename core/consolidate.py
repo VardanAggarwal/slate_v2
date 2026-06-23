@@ -41,9 +41,13 @@ CANON_LLM_BAND = 0.75    # [band, auto) : ask the LLM; below: new claim
 # cut is a small POSITIVE z (reconstructs about as tightly as the region's own
 # members), not the Write path's strongly-negative Z_ECHO. The wide gap makes the
 # exact value robust anywhere in ~[0.5, 4.5]; the rest escalates to the LLM.
+# PRD §178: "dedup = the PREDICTED route. Replaces the cosine bands." So dedup is
+# predictor-only by default — anything the predictor can't call an echo (AMBIGUOUS)
+# routes NEW rather than escalating to the PROMPT_CANON LLM band. `canon_llm` re-arms
+# that band (off by default); kept reversible, not deleted.
 DEDUP_Z_ECHO = 1.0
 DEDUP_CALIBRATION = {"z_echo": DEDUP_Z_ECHO, "prox_margin": predict.PROX_MARGIN,
-                     "per_cluster": {}}
+                     "per_cluster": {}, "canon_llm": False}
 
 # Bridge candidate band — C5 now a medoid-vs-region RESIDUAL band (predictor
 # spine), not a centroid cosine: close enough to relate (residual not too high),
@@ -355,6 +359,53 @@ def _blueprint_local(text: str) -> dict:
             "clusters": clusters, "assumptions": [], "spine": [], "_method": "local"}
 
 
+def blueprint_from_fragments(conn, user_id: str, episode_id: str) -> dict | None:
+    """PRD-scoped claim genesis: mint claims from the FRAGMENT layer Write already
+    built, NOT by re-processing raw_text (PRD §21 — raw is stored, never processed;
+    §159 — only claim-text distillation is sanctioned LLM work; chunking, membership,
+    centre and relations are the predictor's, and Write has already done them).
+
+    Each materialized fragment IS a predictor-isolated verbatim span, so it serves as
+    BOTH the distilled `claim` and its `representative_sentence` — no LLM call. Spans
+    are grouped by their `cluster` (the region Write/consolidation assigned); the note
+    centre (`is_centre`) supplies the essence. The result is the SAME dict shape the
+    LLM `blueprint()` produced, so `_canonicalize_episode`/`_concept_pass`/`_relations`
+    consume it unchanged.
+
+    Returns None when the episode has no materialized fragments yet (Write async / not
+    refined) — the caller SKIPS the episode (handoff policy), never falling back to
+    re-processing raw, which would reintroduce the gap."""
+    spans = store.episode_fragment_spans(conn, user_id, episode_id)
+    if not spans:
+        return None
+    from collections import OrderedDict
+    groups: "OrderedDict[str, list[str]]" = OrderedDict()
+    centre_text = None
+    for s in spans:
+        groups.setdefault(s["cluster"] or "", []).append(s["text"])
+        if s["is_centre"]:
+            centre_text = s["text"]
+    clusters = []
+    for label, texts in groups.items():
+        kernel = texts[0]
+        clusters.append({
+            "label": label or " ".join(kernel.split()[:4]).rstrip(".,;:") + "…",
+            "kernel": kernel, "claims": list(texts),
+            "representative_sentences": list(texts)})
+    # Fragments carry no note-level essence; use the centre fragment (note medoid),
+    # else the first claim. Off the answer path — retrieval doesn't read essence.
+    essence = centre_text or clusters[0]["claims"][0]
+    # spine/assumptions stay empty: relations are predictor-detected + LLM-confirmed
+    # (PRD §186), a follow-up — _relations does correspondingly less for now.
+    return {"title": " ".join(essence.split()[:6]).rstrip(".,;:?!"),
+            "essence": essence, "clusters": clusters,
+            "assumptions": [], "spine": [], "_method": "frag"}
+
+
+# Legacy LLM claim genesis. The main consolidate() path no longer calls blueprint()
+# — claims come from blueprint_from_fragments (PRD §21/§178). Kept (with PROMPT_BLUEPRINT
+# / _blueprint_local) as a gated, no-fragment fallback only; the handoff forbids
+# SILENTLY falling back to it, so consolidate() skips unrefined episodes instead.
 def blueprint(text: str) -> tuple[dict, float]:
     """LLM blueprint; local KMeans fallback only where sklearn exists (dev).
     On the slim server image the LLMError propagates instead — the caller
@@ -541,6 +592,13 @@ def _canonicalize_episode(conn, user_id: str, run_id: str, episode, bp: dict,
                                       DEDUP_CALIBRATION, episode_id=episode["id"])
 
     cost = 0.0
+    if uncertain and not DEDUP_CALIBRATION.get("canon_llm"):
+        # PRD §178 default: dedup is predictor-only. The predictor merges echoes via
+        # the PREDICTED route; whatever it couldn't call an echo is a genuinely distinct
+        # claim → NEW. No PROMPT_CANON LLM band (it exploded on verbatim fragments —
+        # see handoff). md5 ids keep replayed NEW decisions idempotent.
+        decided.extend((c, "new", None) for c, _best in uncertain)
+        uncertain = []
     for start in range(0, len(uncertain), CANON_CHUNK):
         chunk = uncertain[start:start + CANON_CHUNK]
         pairs = "\n".join(
@@ -1265,18 +1323,18 @@ def consolidate(conn, user_id: str, max_episodes: int = 50) -> dict:
             if bp is not None:  # retry of a failed run — reuse, don't re-extract
                 episode_claims = _existing_canon(conn, user_id, ep["id"])
             else:
-                try:
-                    bp, bp_cost = blueprint(ep["raw_text"])  # LLM, no txn
-                except llm.LLMError:
-                    # One stubborn note must not kill the night: leave it
-                    # unconsolidated; the next run retries it.
+                # PRD §21/§178: claims are minted from the fragment layer, never by
+                # re-processing raw. No materialized fragments yet (Write async / not
+                # refined) → skip; the next run retries once Write has refined it.
+                # NEVER fall back to LLM-blueprint over raw (reintroduces the gap).
+                bp = blueprint_from_fragments(conn, user_id, ep["id"])
+                if bp is None:
                     skipped.append(ep["id"])
                     continue
-                cost += bp_cost
                 episode_claims, canon_cost = _canonicalize_episode(
                     conn, user_id, run_id, ep, bp,
                     {"episode_id": ep["id"], "blueprint": bp,
-                     "method": bp.get("_method"), "ts": ts})
+                     "method": "frag", "fragment_sourced": True, "ts": ts})
                 cost += canon_cost
             new_claim_ids.extend(cid for _, cid in episode_claims)
             per_episode.append((ep, bp, episode_claims))

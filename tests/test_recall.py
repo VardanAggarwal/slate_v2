@@ -4,7 +4,7 @@ from core.encode import encode
 from core.recall import (assemble_context, get_claim, get_concept,
                          get_episode, list_episodes, recall)
 from tests.conftest import UID
-from tests.test_consolidate import S1, S2, S3, fake_llm  # noqa: F401
+from tests.test_consolidate import S1, S2, S3, _seed, fake_llm  # noqa: F401
 
 TS = "2026-06-11T00:00:00+00:00"
 
@@ -16,8 +16,8 @@ def _emit_claim(conn, cid, text, user_id=UID):
 
 
 def test_recall_finds_seeded_claim(conn, fake_llm):
-    encode(conn, UID, S1, source="test")
-    encode(conn, UID, S3, source="test")
+    _seed(conn, UID, S1)
+    _seed(conn, UID, S3)
     consolidate(conn, UID)
     hits = recall(conn, UID, "how do I remember things long term", k=5)
     assert hits
@@ -45,7 +45,7 @@ def test_recall_two_hop_via_bridge(conn):
 
 
 def test_read_api_episode_claims_and_provenance(conn, fake_llm):
-    encode(conn, UID, S1, source="test", title="memory note")
+    _seed(conn, UID, S1, title="memory note")
     consolidate(conn, UID)
 
     eps = list_episodes(conn, UID)
@@ -67,8 +67,8 @@ def test_read_api_episode_claims_and_provenance(conn, fake_llm):
 
 
 def test_assemble_context_markdown(conn, fake_llm):
-    encode(conn, UID, S1, source="test", title="memory note")
-    encode(conn, UID, S2, source="test", title="sleep note")
+    _seed(conn, UID, S1, title="memory note")
+    _seed(conn, UID, S2, title="sleep note")
     consolidate(conn, UID)
     md = assemble_context(conn, UID, "memory and sleep")
     assert md.startswith("## Slate context")

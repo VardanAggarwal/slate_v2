@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from core import store
+from core import store, write
 from core.consolidate import (_apply_concept_decisions, _decay_strengthen,
                               _prune_safely, apply_event, consolidate, emit,
                               rebuild, rollback_run)
@@ -13,6 +13,16 @@ from tests.conftest import UID
 S1 = "Spaced repetition is the most reliable way to retain knowledge over many years."
 S2 = "Memory consolidation happens during sleep when the brain replays recent experiences."
 S3 = "Constraints often increase creativity rather than limiting what can be made."
+
+
+def _seed(conn, uid, text, source="test", title=None):
+    """Encode a note AND materialize its fragments (W2–W8 refine), in one step.
+    consolidate() now sources claims from the FRAGMENT layer (PRD §21/§178), so an
+    episode that was only encoded (refine is async) yields no claims. Seeding notes
+    in order makes a later echo a write-time PREDICTED reinforce, not a stored frag."""
+    receipt = encode(conn, uid, text, source=source, title=title)
+    write.refine_episode(conn, uid, receipt["episode_id"])
+    return receipt
 
 
 @pytest.fixture
@@ -68,8 +78,12 @@ def _dump_semantic(conn):
 
 
 def test_consolidate_dedupes_claims(conn, fake_llm):
-    encode(conn, UID, S1, source="test")
-    encode(conn, UID, f"{S1} {S2}", source="test")  # repeats S1, adds S2
+    # Predictor-only dedup (PRD §178): the exact S1 repeat canonicalizes onto the
+    # first via the PREDICTED route — no canon LLM — leaving 2 claims, S1 supported
+    # by both episodes and its strength bumped by the re-encounter.
+    _seed(conn, UID, S1)
+    _seed(conn, UID, S1)          # exact repeat → dedup target
+    _seed(conn, UID, S2)
     report = consolidate(conn, UID)
     assert report["status"] == "ok"
     n_claims = conn.execute("SELECT COUNT(*) FROM claims").fetchone()[0]
@@ -84,7 +98,7 @@ def test_consolidate_dedupes_claims(conn, fake_llm):
 
 
 def test_consolidate_creates_concept_and_marks_episodes(conn, fake_llm):
-    encode(conn, UID, S1, source="test")
+    _seed(conn, UID, S1)
     consolidate(conn, UID)
     concepts = store.all_concepts(conn, UID)
     assert len(concepts) == 1
@@ -94,8 +108,8 @@ def test_consolidate_creates_concept_and_marks_episodes(conn, fake_llm):
 
 
 def test_rebuild_reproduces_semantic_store(conn, fake_llm):
-    encode(conn, UID, S1, source="test")
-    encode(conn, UID, f"{S2} {S3}", source="test")
+    _seed(conn, UID, S1)
+    _seed(conn, UID, f"{S2} {S3}")
     consolidate(conn, UID)
     before = _dump_semantic(conn)
     assert before["claims"]       # non-trivial store
@@ -104,7 +118,10 @@ def test_rebuild_reproduces_semantic_store(conn, fake_llm):
 
 
 def test_split_applier(conn, fake_llm):
-    encode(conn, UID, f"{S1} {S2}", source="test")
+    # Two single-sentence notes → two fragments → two claims the fake concept pass
+    # groups into one concept (a multi-sentence note fragments into one coarse span).
+    _seed(conn, UID, S1)
+    _seed(conn, UID, S2)
     consolidate(conn, UID)
     parent = store.all_concepts(conn, UID)[0]
     members = store.concept_member_ids(conn, UID, parent["id"])
@@ -149,7 +166,7 @@ def test_merge_applier_keeps_history(conn, fake_llm):
 
 
 def test_decay_transitions_state(conn, fake_llm):
-    encode(conn, UID, S1, source="test")
+    _seed(conn, UID, S1)
     consolidate(conn, UID)
     concept = store.all_concepts(conn, UID)[0]
     with conn:
@@ -166,16 +183,16 @@ def test_failed_run_leaves_episodes_unconsolidated(conn, monkeypatch):
         raise LLMError("forced failure")
     monkeypatch.setattr("core.llm.call", always_fail)
 
-    encode(conn, UID, S1, source="test")
+    _seed(conn, UID, S1)  # refine of a NOVEL note makes no LLM call
     with pytest.raises(LLMError):
-        consolidate(conn, UID)  # blueprint falls back local; concept pass raises
+        consolidate(conn, UID)  # frag genesis is LLM-free; the concept pass raises
     assert len(store.unconsolidated_episodes(conn, UID)) == 1
     run = conn.execute("SELECT status FROM consolidation_runs").fetchone()
     assert run["status"] == "failed"
 
 
 def test_retry_reuses_blueprint_and_canon_events(conn, fake_llm, monkeypatch):
-    encode(conn, UID, S1, source="test")
+    _seed(conn, UID, S1)
     import core.consolidate as consolidate_mod
 
     real_chunk = consolidate_mod._concept_pass_chunk
@@ -191,13 +208,15 @@ def test_retry_reuses_blueprint_and_canon_events(conn, fake_llm, monkeypatch):
     with pytest.raises(LLMError):
         consolidate(conn, UID)
 
-    blueprints_before = fake_llm["blueprint"]
+    blueprinted_before = len(store.events_since(conn, UID, 0, types=["BLUEPRINTED"]))
     canon_events = len(store.events_since(conn, UID, 0, types=["CANONICALIZED"]))
     claims_before = conn.execute("SELECT COUNT(*) FROM claims").fetchone()[0]
 
     report = consolidate(conn, UID)  # retry succeeds
     assert report["status"] == "ok"
-    assert fake_llm["blueprint"] == blueprints_before          # no re-extraction
+    # _existing_blueprint reuses the failed run's frag-blueprint + canon events instead
+    # of re-deriving — so no new BLUEPRINTED/CANONICALIZED events, no new claims.
+    assert len(store.events_since(conn, UID, 0, types=["BLUEPRINTED"])) == blueprinted_before
     assert len(store.events_since(conn, UID, 0, types=["CANONICALIZED"])) == canon_events
     assert conn.execute("SELECT COUNT(*) FROM claims").fetchone()[0] == claims_before
     assert store.unconsolidated_episodes(conn, UID) == []
@@ -207,11 +226,11 @@ def test_retry_reuses_blueprint_and_canon_events(conn, fake_llm, monkeypatch):
 def test_rollback_fully_reverses_a_run(conn, fake_llm):
     """A bad run is undoable: the semantic store returns to its exact pre-run
     state (PRD §Consolidation: bad runs must be undoable)."""
-    encode(conn, UID, S1, source="test")
+    _seed(conn, UID, S1)
     consolidate(conn, UID)               # run A — the keeper
     before = _dump_semantic(conn)
 
-    encode(conn, UID, S3, source="test")
+    _seed(conn, UID, S3)
     run_b = consolidate(conn, UID)["run_id"]   # run B — to be undone
     assert _dump_semantic(conn) != before      # B did change the store
 
@@ -223,7 +242,7 @@ def test_rollback_fully_reverses_a_run(conn, fake_llm):
 
 def test_rollback_keeps_events_on_disk_but_unmaterialized(conn, fake_llm):
     """Rolled-back events survive for audit; they are simply not re-applied."""
-    encode(conn, UID, S1, source="test")
+    _seed(conn, UID, S1)
     run = consolidate(conn, UID)["run_id"]
     n_all = len(store.events_since(conn, UID, 0))                 # full log
     n_active = len(store.events_since(conn, UID, 0, include_rolled_back=False))
@@ -239,25 +258,27 @@ def test_rollback_keeps_events_on_disk_but_unmaterialized(conn, fake_llm):
 
 
 def test_rollback_then_reconsolidate_rederives_from_raw(conn, fake_llm):
-    """Re-derivation bypasses a poisoned log: after rollback the freed episode
-    is re-blueprinted from its raw text — the rolled-back BLUEPRINTED/CANONICALIZED
-    events do NOT short-circuit the `_existing_*` guards."""
-    encode(conn, UID, S1, source="test")
+    """Re-derivation bypasses a poisoned log: after rollback the freed episode is
+    re-derived from its fragments — the rolled-back BLUEPRINTED/CANONICALIZED events
+    do NOT short-circuit the `_existing_*` guards (ACTIVE_RUN_PREDICATE excludes them),
+    so a fresh BLUEPRINTED event is emitted under the new run."""
+    _seed(conn, UID, S1)
     run_b = consolidate(conn, UID)["run_id"]
     assert store.unconsolidated_episodes(conn, UID) == []   # consolidated
 
     rollback_run(conn, run_b)
     assert len(store.unconsolidated_episodes(conn, UID)) == 1   # freed
 
-    bp_before = fake_llm["blueprint"]
     run_c = consolidate(conn, UID)
     assert run_c["status"] == "ok" and run_c["run_id"] != run_b
-    assert fake_llm["blueprint"] > bp_before                # re-derived, not reused
+    # a NEW BLUEPRINTED event under run_c (re-derived), not the rolled-back one reused.
+    bp_events = store.events_since(conn, UID, 0, types=["BLUEPRINTED"])
+    assert any(e["run_id"] == run_c["run_id"] for e in bp_events)
     assert conn.execute("SELECT COUNT(*) FROM claims").fetchone()[0] == 1  # S1 back
 
 
 def test_rollback_unknown_run_is_noop(conn, fake_llm):
-    encode(conn, UID, S1, source="test")
+    _seed(conn, UID, S1)
     consolidate(conn, UID)
     before = _dump_semantic(conn)
     res = rollback_run(conn, "run_does_not_exist")
@@ -707,46 +728,34 @@ def test_llm_calls_never_hold_a_write_transaction(conn, fake_llm, monkeypatch):
         return inner(prompt, **kw)
 
     monkeypatch.setattr("core.llm.call", guarded)
-    encode(conn, UID, S1, source="test")
-    encode(conn, UID, f"{S2} {S3}", source="test")
+    _seed(conn, UID, S1)
+    _seed(conn, UID, f"{S2} {S3}")
     report = consolidate(conn, UID)
     assert report["status"] == "ok"
-    assert fake_llm["blueprint"] >= 2 and fake_llm["concept"] >= 1  # guard exercised
+    assert fake_llm["concept"] >= 1  # the concept pass (LLM) ran under the txn guard
 
 
-def test_stubborn_episode_is_skipped_not_fatal(conn, fake_llm, monkeypatch):
-    """A note whose blueprint fails on all providers must not kill the run."""
-    import core.llm as llm_mod
-    inner = llm_mod.call
-
-    def poisoned(prompt, **kw):
-        if prompt.startswith("Extract semantic structure") and S3 in prompt:
-            raise LLMError("malformed JSON from every provider")
-        return inner(prompt, **kw)
-
-    monkeypatch.setattr("core.llm.call", poisoned)
-    # Simulate the slim server image: no sklearn, so no local fallback
-    def no_sklearn(text):
-        raise ImportError("No module named 'sklearn'")
-    monkeypatch.setattr("core.consolidate._blueprint_local", no_sklearn)
-
-    encode(conn, UID, S1, source="test")
-    encode(conn, UID, S3, source="test")  # the poisoned note
+def test_unrefined_episode_is_skipped_not_fatal(conn, fake_llm):
+    """An episode Write hasn't refined yet has no materialized fragments, so claim
+    genesis has nothing to read. It must be SKIPPED (PRD §21: never fall back to
+    re-processing raw), left unconsolidated for the next run — not crash the night."""
+    _seed(conn, UID, S1)                       # refined → has fragments
+    encode(conn, UID, S3, source="test")        # NOT refined → no fragments
 
     report = consolidate(conn, UID)
     assert report["status"] == "ok"
     assert report["episodes"] == 1
     assert len(report["skipped"]) == 1
     remaining = store.unconsolidated_episodes(conn, UID)
-    assert len(remaining) == 1       # picked up by the next run
+    assert len(remaining) == 1       # picked up by the next run, once refined
     assert S3 in remaining[0]["raw_text"]
 
 
 def test_consolidate_all_users_covers_each_corpus(conn, fake_llm):
     from core.consolidate import consolidate_all_users
     from tests.conftest import UID_B
-    encode(conn, UID, S1, source="test")
-    encode(conn, UID_B, S3, source="test")
+    _seed(conn, UID, S1)
+    _seed(conn, UID_B, S3)
     reports = consolidate_all_users(conn)
     by_user = {r["user_id"]: r for r in reports}
     assert by_user[UID]["status"] == "ok" and by_user[UID]["episodes"] == 1
@@ -835,6 +844,50 @@ def test_c2_dedup_route_collapses_dup_keeps_distinct(conn):
     far_emb = [_topic(999)]                               # orthogonal topic
     decided2, _ = Cmod._dedup_route(conn, UID, far, far_emb, Cmod.DEDUP_CALIBRATION)
     assert decided2 and decided2[0][1] == "new"          # genuinely distinct → new
+
+
+# ── Fragment-sourced claim genesis: dict-shape contract (PRD §21/§178) ────────
+def test_blueprint_from_fragments_matches_blueprint_shape(conn, fake_llm):
+    """blueprint_from_fragments emits the SAME dict shape the LLM blueprint did, so
+    _canonicalize_episode / _concept_pass / _relations consume it unchanged. And the
+    claim text IS its representative sentence (verbatim span, no distillation)."""
+    ep = _seed(conn, UID, f"{S1} {S2}")["episode_id"]
+    bp = Cmod.blueprint_from_fragments(conn, UID, ep)
+    assert bp is not None
+    assert set(bp) >= {"title", "essence", "clusters", "assumptions", "spine", "_method"}
+    assert bp["_method"] == "frag"
+    assert bp["clusters"]
+    for cl in bp["clusters"]:
+        assert set(cl) >= {"label", "kernel", "claims", "representative_sentences"}
+        assert cl["claims"] == cl["representative_sentences"]   # verbatim, not distilled
+        assert all(c.strip() for c in cl["claims"])
+    # an unrefined episode has no fragments → None (caller skips it)
+    bare = encode(conn, UID, S3, source="test")["episode_id"]
+    assert Cmod.blueprint_from_fragments(conn, UID, bare) is None
+
+
+def test_predictor_only_dedup_routes_uncertain_to_new_without_canon_llm(conn, monkeypatch):
+    """PRD §178: dedup is the PREDICTED route — predictor-only. With canon_llm OFF
+    (default) an AMBIGUOUS/uncertain pair routes NEW and PROMPT_CANON is never called."""
+    ep = _seed(conn, UID, S1)
+    # Force one uncertain pair out of the predictor route.
+    monkeypatch.setattr(Cmod, "_dedup_route", lambda *a, **k: (
+        [], [({"text": S1, "verbatim": None, "cluster": ""},
+              {"claim_id": "clm_existing", "text": S1})]))
+    calls = []
+    monkeypatch.setattr("core.llm.call",
+                        lambda prompt, **k: calls.append(prompt) or {"json": {}, "cost": 0.0})
+
+    bp = Cmod.blueprint_from_fragments(conn, UID, ep["episode_id"])
+    claims, cost = Cmod._canonicalize_episode(
+        conn, UID, "run_test", {"id": ep["episode_id"], "ts": "2026-01-01T00:00:00Z"},
+        bp, {"episode_id": ep["episode_id"], "blueprint": bp, "method": "frag", "ts": "x"})
+
+    assert not any(p.startswith("You deduplicate") for p in calls)  # no canon LLM band
+    assert cost == 0.0
+    actions = [json.loads(e["payload_json"])["action"]
+               for e in store.events_since(conn, UID, 0, types=["CANONICALIZED"])]
+    assert "new" in actions and "support" not in actions       # uncertain → NEW
 
 
 # ── C3: nearest-cluster membership — in-topic plausible, off-topic not ────────
