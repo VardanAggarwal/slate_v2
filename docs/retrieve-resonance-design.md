@@ -204,8 +204,31 @@ What the ablations attribute:
   retrieval mechanism lifts this; consolidation must mint those clusters first.
 
 Net: resonance is worth keeping as the best Slate path, but the headline gain is the
-**PE-gated navigation + concept-frame**, not confluence. The confluence test is
-deferred until a paragraph-query benchmark exists.
+**PE-gated navigation + concept-frame**, not confluence.
+
+### Confluence in its native regime — REFUTED (paragraph gold, `eval/gold_paragraph.jsonl`)
+
+Built an 8-query paragraph gold: each query is a 3-sentence paragraph converging on
+ONE answer region (key_facts reused verbatim from `gold.jsonl` → controlled
+sum-vs-max). Real sentence boundaries give 4 probes/query, confluence up to 4 — the
+critical note's exact "long paragraph, each sentence lights up a part" regime.
+
+| aggregation | SR@B | tail |
+|---|---|---|
+| `max` (confluence OFF, recall.py behaviour) | **87.5%** | **75%** |
+| `sum` (confluence ON) | 62.5% | 50% |
+
+**`max` wins even here.** Summing across sentence-probes conflates *genuine*
+convergence with *shared-generic-vocabulary* grazing: a paragraph's sentences share
+filler ("I keep thinking…", "it seems…", "the system…"), so generic hub nodes get
+hit by all 4 probes and their summed activation buries the one sharply-relevant node
+a single probe hits hard. The inverse-degree distinctiveness prior dampens but does
+not cancel it. `max` is immune — each node scores on its single best probe. Evidence
+(p05): `sum` used MORE context (1972 vs 1793 tok) yet covered FEWER facts (1/3 vs
+3/3) — the over-injection/dilution signature. **Recommendation: `res_sum_probes=False`
+permanently.** True confluence would need probe *independence* (orthogonalised
+sentences) and convergence weighted by that independence — a much harder mechanism
+than summation, and not worth it on this evidence.
 
 ## Open risks
 - **R0 still bites the seed.** If no probe seeds near the answer node, navigation
