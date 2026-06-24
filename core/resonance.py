@@ -313,15 +313,22 @@ def activate(conn, user_id: str, query: str, *, calibration: dict | None = None)
 
 # ── materialise bright nodes → verbatim fragments → assembly ────────────────────
 def resonance_recall(conn, user_id: str, query: str, *,
-                     calibration: dict | None = None) -> dict:
-    """Returns {nodes, fragments, probes}: `nodes` = the scored activation field,
-    `fragments` = the assembled verbatim spans (most-informative first)."""
+                     calibration: dict | None = None, signals: bool = False,
+                     run_id: str | None = None) -> dict:
+    """Returns {nodes, fragments, frame, probes}: `nodes` = the scored activation
+    field, `fragments` = the assembled verbatim spans (most-informative first).
+
+    `signals` (R8): log fetched/dropped fragments for consolidation C13 (PRD §Retrieve
+    — every retrieval leaves signals). Off for speculative/eval reads, ON in prod."""
     calibration = calibration or calib.merged(
         conn, {**retrieve.DEFAULT_CALIBRATION, **DEFAULT_CALIBRATION}, user_id)
     field = activate(conn, user_id, query, calibration=calibration)
     nodes, q_emb = field["nodes"], field["q_emb"]
     if not nodes or field["top_sim"] < float(calibration.get("res_triage_min_rel", TRIAGE_MIN_REL)):
-        return {"nodes": nodes, "fragments": [], "probes": field["probes"]}
+        if signals:
+            retrieve.record_retrieval_signal(conn, user_id, query, fetched=[],
+                                             seed=[], truncated=False, run_id=run_id)
+        return {"nodes": nodes, "fragments": [], "frame": [], "probes": field["probes"]}
 
     ranked = sorted(nodes.items(), key=lambda kv: -kv[1]["salience"])
     top = ranked[: int(calibration.get("res_materialize_nodes", MATERIALIZE_NODES))]
@@ -395,6 +402,9 @@ def resonance_recall(conn, user_id: str, query: str, *,
                 cand[c["frag_id"]] = {**c, "_sal": float(c["similarity"]), "_depth": False}
 
     if not cand:
+        if signals:
+            retrieve.record_retrieval_signal(conn, user_id, query, fetched=[],
+                                             seed=[], truncated=False, run_id=run_id)
         return {"nodes": nodes, "fragments": [], "frame": frame, "probes": field["probes"]}
 
     candidates = list(cand.values())
@@ -408,6 +418,13 @@ def resonance_recall(conn, user_id: str, query: str, *,
         c = candidates[idx]
         out.append({**c, "rank": pos, "gain": res["gains"][pos],
                     "salience": round(c["_sal"], 4)})
+    if signals:
+        # R8: chosen = fetched, the rest of the candidate pool = dropped (C13 maps
+        # frag → episode → claims; demotes salient-but-never-fetched).
+        retrieve.record_retrieval_signal(conn, user_id, query, fetched=out,
+                                         seed=candidates,
+                                         truncated=not res.get("stopped", False),
+                                         run_id=run_id)
     return {"nodes": nodes, "fragments": out, "frame": frame,
             "probes": field["probes"]}
 
@@ -430,13 +447,15 @@ def _concept_members(conn, user_id: str, concept_id: str, n: int) -> list[dict]:
 
 
 def resonance_context(conn, user_id: str, topic: str, max_chars: int = 6000, *,
-                      calibration: dict | None = None) -> str:
+                      calibration: dict | None = None, signals: bool = False,
+                      run_id: str | None = None) -> str:
     """Answerer entrypoint — verbatim spans from the brightest graph regions, grouped
-    by source episode, sized to the char budget. Signals OFF (clean A/B; the loop-
-    closing R8 write is a separate concern from the retrieval comparison)."""
+    by source episode, sized to the char budget. `signals` (R8) default OFF for eval/
+    speculative reads; the prod MCP flow passes signals=True to close the C13 loop."""
     calibration = calibration or calib.merged(
         conn, {**retrieve.DEFAULT_CALIBRATION, **DEFAULT_CALIBRATION}, user_id)
-    res = resonance_recall(conn, user_id, topic, calibration=calibration)
+    res = resonance_recall(conn, user_id, topic, calibration=calibration,
+                           signals=signals, run_id=run_id)
     frags, frame = res["fragments"], res.get("frame", [])
     if not frags and not frame:
         return f"_Slate has nothing stored about “{topic}” yet._"

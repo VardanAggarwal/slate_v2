@@ -328,20 +328,18 @@ def assemble_context(topic: str) -> str:
     Call when you're about to write something substantive on a topic the user
     has history with, or after recall() surfaces a hit worth expanding. Output
     is budgeted (most-relevant-first) for direct injection."""
-    # HYBRID retrieve (plan §2 P4): blends the concept/claim path (the tail —
-    # synthesis across notes) with the fragment path (specificity — verbatim
-    # spans), the best Slate variant on the SR@B eval. Degrades to the pure
-    # concept path when no fragments are materialized yet, so this is a safe
-    # superset of the old recall.assemble_context. Calibration (concept_share,
-    # value_floor, …) is the user's fitted profile over the in-code defaults.
-    # Commit before close: the fragment path emits R8 retrieval signals
-    # (fetched/dropped) for consolidation C13, which append_event does NOT commit.
-    from core import calibration as calib, hybrid, retrieve
+    # RESONANCE retrieve: navigate the consolidated graph (PE-gated, fan-out-
+    # normalised spread) → materialise the brightest regions as a distilled concept
+    # frame + verbatim depth/breadth spans. Best Slate variant on the SR@B eval
+    # (narrow 85.7 / tail 80, paragraph 100, broad at its 33% ceiling — beats the old
+    # hybrid 64/60/33). Calibration is the user's fitted profile over the in-code
+    # defaults. signals=True emits R8 (fetched/dropped) for consolidation C13; commit
+    # before close since append_event does NOT commit. See docs/retrieve-resonance-design.md.
+    from core import resonance
     conn = _conn()
     user_id = _user_id()
     try:
-        cal = calib.merged(conn, retrieve.DEFAULT_CALIBRATION, user_id)
-        out = hybrid.hybrid_context(conn, user_id, topic, calibration=cal)
+        out = resonance.resonance_context(conn, user_id, topic, signals=True)
         conn.commit()
         return out
     finally:
