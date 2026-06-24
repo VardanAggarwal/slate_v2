@@ -87,6 +87,17 @@ PEAKS_PER_NODE = 2      # cap on cosine-independent peak/centre picks per node
 DEEP_TOP_N = 1          # read this many of the brightest notes deeply
 DEEP_FRAGS = 8          # fragment cap for a deep-read note (vs FRAGS_PER_NODE)
 BREADTH_FRAGS_PER_NODE = 1  # fragments per non-deep node (one each → coverage)
+# Coverage layer: the breadth slice draws from graph-bright NODES, so a query-relevant
+# note that isn't a bright node is missed (Mode-3 broad: e.g. the debugging note for an
+# AI-memory query, the seed-savers note for a work query — both at fragment-rank ~20 by
+# query cosine, just outside the navigated window). This layer unions the top distinct
+# EPISODES by raw query cosine into the breadth pool, so reachable-but-not-bright notes
+# get a slot. Bounded; breadth-tagged (draws the breadth budget, never depth). Cannot
+# reach R0-wall notes (rank ~250+, vocabulary-disjoint) — those need consolidation.
+# DEFAULT OFF (0): reach is confirmed (the rank-~20 Mode-3 notes enter the context),
+# but SR@B + narrow-regression are NOT yet validated (LLM judge was provider-down).
+# Set to 12 and re-run all gold sets to validate before making it the default.
+COVERAGE_NOTES = 0
 # Budget-partition (Path 1): depth (deep-read+peaks of the top note) and breadth
 # (coverage across many notes) each get a reserved slice of the specifics budget, so
 # deep-read can't starve breadth (the broad-query regression) nor vice versa. Leftover
@@ -112,6 +123,7 @@ DEFAULT_CALIBRATION = {
     "res_include_peaks": INCLUDE_PEAKS, "res_peaks_per_node": PEAKS_PER_NODE,
     "res_deep_top_n": DEEP_TOP_N, "res_deep_frags": DEEP_FRAGS,
     "res_breadth_frags_per_node": BREADTH_FRAGS_PER_NODE, "res_depth_share": DEPTH_SHARE,
+    "res_coverage_notes": COVERAGE_NOTES,
     "gain_floor": ASSEMBLE_GAIN_FLOOR, "max_items": ASSEMBLE_MAX_ITEMS,
     "value_floor": None, "per_cluster": {},
     # ablation switches — flip to isolate each mechanism (see design doc test plan)
@@ -363,6 +375,23 @@ def resonance_recall(conn, user_id: str, query: str, *,
             prev = cand.get(f["frag_id"])
             if prev is None or sc["salience"] > prev["_sal"]:
                 cand[f["frag_id"]] = {**f, "_sal": sc["salience"], "_depth": is_depth}
+    # Coverage layer: union the top distinct EPISODES by raw query cosine into the
+    # breadth pool, so query-relevant notes that aren't graph-bright nodes still get a
+    # slot (the reachable Mode-3 fact-notes at fragment-rank ~20). Breadth-tagged.
+    cov_notes = int(calibration.get("res_coverage_notes", COVERAGE_NOTES))
+    if cov_notes:
+        seen_ep = {c["episode_id"] for c in cand.values()}
+        best_per_ep: dict[str, dict] = {}
+        for c in store.fragment_candidates(conn, user_id, q_emb, k=cov_notes * 6):
+            ep = c["episode_id"]
+            if ep in seen_ep:
+                continue
+            if ep not in best_per_ep or c["similarity"] > best_per_ep[ep]["similarity"]:
+                best_per_ep[ep] = c
+        for c in sorted(best_per_ep.values(), key=lambda x: -x["similarity"])[:cov_notes]:
+            if c["frag_id"] not in cand:
+                cand[c["frag_id"]] = {**c, "_sal": float(c["similarity"]), "_depth": False}
+
     if not cand:
         return {"nodes": nodes, "fragments": [], "frame": frame, "probes": field["probes"]}
 
