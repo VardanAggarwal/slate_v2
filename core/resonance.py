@@ -76,6 +76,28 @@ ASSEMBLE_MAX_ITEMS = 24
 FRAME_CONCEPTS = 3      # brightest concept nodes to enumerate as the frame
 FRAME_CLAIMS_PER = 4    # member claims per framed concept
 FRAME_BUDGET_CAP = 0.35 # max share of B the frame may take (rest → verbatim nuance)
+# Gap-2 (within-theme nuance reach): once navigation lands on a bright region, the
+# query-cosine slice misses the answer-relevant-but-query-DISSIMILAR nuance (e.g. the
+# "religion is a crutch" analogy — flagged is_novel_peak but cut by FRAGS_PER_NODE).
+# Two fixes: (a) always include a bright node's is_novel_peak/is_centre fragments
+# regardless of query cosine; (b) read the single brightest note(s) DEEPLY (more
+# fragments) — "navigate, then read the note", the depth grep wins the tail on.
+INCLUDE_PEAKS = True    # surface bright nodes' novel-peak / centre fragments
+PEAKS_PER_NODE = 2      # cap on cosine-independent peak/centre picks per node
+DEEP_TOP_N = 1          # read this many of the brightest notes deeply
+DEEP_FRAGS = 8          # fragment cap for a deep-read note (vs FRAGS_PER_NODE)
+BREADTH_FRAGS_PER_NODE = 1  # fragments per non-deep node (one each → coverage)
+# Budget-partition (Path 1): depth (deep-read+peaks of the top note) and breadth
+# (coverage across many notes) each get a reserved slice of the specifics budget, so
+# deep-read can't starve breadth (the broad-query regression) nor vice versa. Leftover
+# from one slice flows to the other, so it self-balances WITHOUT classifying the query
+# deep-vs-broad (which query geometry can't separate on this corpus — R0 + saturated
+# concepts). A deep query has few real breadth notes → depth takes the leftover; a
+# broad query fills breadth → coverage.
+DEPTH_SHARE = 0.30      # share of specifics reserved for depth. 0.30 measured best:
+                        # narrow 85.7/tail80 AND broad recovers to its 33% ceiling;
+                        # 0.5 over-reserves depth and starves broad coverage (16.7%);
+                        # 0.0 loses the narrow-tail deep-read win (78.6%).
 
 DEFAULT_CALIBRATION = {
     "res_seed_claims": SEED_CLAIMS, "res_seed_concepts": SEED_CONCEPTS,
@@ -87,6 +109,9 @@ DEFAULT_CALIBRATION = {
     "res_frags_per_node": FRAGS_PER_NODE,
     "res_frame_concepts": FRAME_CONCEPTS, "res_frame_claims_per": FRAME_CLAIMS_PER,
     "res_frame_budget_cap": FRAME_BUDGET_CAP,
+    "res_include_peaks": INCLUDE_PEAKS, "res_peaks_per_node": PEAKS_PER_NODE,
+    "res_deep_top_n": DEEP_TOP_N, "res_deep_frags": DEEP_FRAGS,
+    "res_breadth_frags_per_node": BREADTH_FRAGS_PER_NODE, "res_depth_share": DEPTH_SHARE,
     "gain_floor": ASSEMBLE_GAIN_FLOOR, "max_items": ASSEMBLE_MAX_ITEMS,
     "value_floor": None, "per_cluster": {},
     # ablation switches — flip to isolate each mechanism (see design doc test plan)
@@ -308,8 +333,13 @@ def resonance_recall(conn, user_id: str, query: str, *,
 
     # bright node → its source episodes → verbatim fragments; tag each fragment with
     # the MAX salience of any bright node that reached it (its budget weight).
+    include_peaks = bool(calibration.get("res_include_peaks", INCLUDE_PEAKS))
+    peaks_per = int(calibration.get("res_peaks_per_node", PEAKS_PER_NODE))
+    deep_top_n = int(calibration.get("res_deep_top_n", DEEP_TOP_N))
+    deep_frags = int(calibration.get("res_deep_frags", DEEP_FRAGS))
+    breadth_frags = int(calibration.get("res_breadth_frags_per_node", BREADTH_FRAGS_PER_NODE))
     cand: dict[str, dict] = {}
-    for node, sc in top:
+    for rank_i, (node, sc) in enumerate(top):
         if node.startswith("cpt_"):
             eps = store.concept_episode_ids(conn, user_id, node)
         else:
@@ -318,10 +348,21 @@ def resonance_recall(conn, user_id: str, query: str, *,
             continue
         frs = store.fragments_for_episodes(conn, user_id, eps, q_emb)
         frs.sort(key=lambda f: -f["similarity"])
-        for f in frs[:n_frags]:
+        # DEPTH nodes (the brightest deep_top_n) get a deep read; BREADTH nodes (the
+        # rest) contribute few fragments each → coverage across many notes. The slice a
+        # fragment lands in (`_depth`) decides which reserved budget it draws from.
+        is_depth = rank_i < deep_top_n
+        cap = deep_frags if is_depth else breadth_frags
+        picks = frs[:cap]
+        # plus the node's DISTINCTIVE fragments (novel-peak / centre) the cosine slice
+        # dropped — the answer-relevant-but-query-dissimilar nuance (Gap-2 fix).
+        if include_peaks:
+            picks = picks + [f for f in frs[cap:]
+                             if f.get("is_novel_peak") or f.get("is_centre")][:peaks_per]
+        for f in picks:
             prev = cand.get(f["frag_id"])
             if prev is None or sc["salience"] > prev["_sal"]:
-                cand[f["frag_id"]] = {**f, "_sal": sc["salience"]}
+                cand[f["frag_id"]] = {**f, "_sal": sc["salience"], "_depth": is_depth}
     if not cand:
         return {"nodes": nodes, "fragments": [], "frame": frame, "probes": field["probes"]}
 
@@ -392,26 +433,53 @@ def resonance_context(conn, user_id: str, topic: str, max_chars: int = 6000, *,
         lines.extend(frame_lines)
         lines.append("")
 
-    groups: dict[str, list[dict]] = {}
-    order: list[str] = []
-    for f in frags:
-        ep = f["episode_id"]
-        if ep not in groups:
-            groups[ep] = []
-            order.append(ep)
-        groups[ep].append(f)
+    # ── SPECIFICS: depth/breadth budget partition (Path 1) ──
+    # The frame already consumed some budget; the rest splits between a DEPTH slice
+    # (deep-read of the brightest note) and a BREADTH slice (coverage across notes).
+    # Reserve breadth FIRST, then give depth everything left — so a deep query (few
+    # real breadth notes) hands its leftover to depth, while a broad query keeps its
+    # breadth coverage. No deep-vs-broad classification needed.
+    def _emit(frag_list, budget):
+        """Render frags grouped by source episode within `budget` chars. Returns
+        (lines, chars_used). Episode order follows assembly rank (most-informative)."""
+        groups: dict[str, list[dict]] = {}
+        order: list[str] = []
+        for f in frag_list:
+            ep = f["episode_id"]
+            if ep not in groups:
+                groups[ep] = []
+                order.append(ep)
+            groups[ep].append(f)
+        rendered, used = [], 0
+        for ep in order:
+            head = groups[ep][0]
+            title = head.get("title") or "untitled"
+            when = (head.get("ts") or "")[:10]
+            block = [f"### {title} _({when})_"]
+            for f in groups[ep]:
+                flag = " ⚠️ contested" if f.get("direction") == "contradict" else ""
+                block.append(f"- {f['text']}{flag}")
+            block.append("")
+            blen = sum(len(x) + 1 for x in block)
+            if used + blen > budget and rendered:
+                break
+            rendered += block
+            used += blen
+        return rendered, used
 
-    if frags:
+    frame_chars = sum(len(l) + 1 for l in lines)
+    specifics_budget = max(0, max_chars - frame_chars)
+    depth_share = float(calibration.get("res_depth_share", DEPTH_SHARE))
+    breadth_budget = int(specifics_budget * (1.0 - depth_share))
+
+    depth_f = [f for f in frags if f.get("_depth")]
+    breadth_f = [f for f in frags if not f.get("_depth")]
+    breadth_lines, breadth_used = _emit(breadth_f, breadth_budget)
+    depth_lines, _ = _emit(depth_f, specifics_budget - breadth_used)  # depth gets the rest
+
+    if depth_lines or breadth_lines:
         lines.append("### Specifics")
-    for ep in order:
-        head = groups[ep][0]
-        title = head.get("title") or "untitled"
-        when = (head.get("ts") or "")[:10]
-        lines.append(f"### {title} _({when})_")
-        for f in groups[ep]:
-            flag = " ⚠️ contested" if f.get("direction") == "contradict" else ""
-            lines.append(f"- {f['text']}{flag}")
-        lines.append("")
+        lines += depth_lines + breadth_lines  # focused depth first, then coverage
 
     out, total = [], 0
     for line in lines:

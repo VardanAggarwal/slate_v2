@@ -755,7 +755,8 @@ def fragments_for_episodes(conn: sqlite3.Connection, user_id: str,
     ph = ",".join("?" * len(episode_ids))
     rows = conn.execute(
         f"""SELECT f.id, f.episode_id, f.medoid_idx, f.text, f.route, f.strength,
-                   f.cluster, f.weight, e.title, e.ts, v.embedding
+                   f.cluster, f.weight, f.is_centre, f.is_novel_peak, f.direction,
+                   e.title, e.ts, v.embedding
             FROM fragments f JOIN episodes e ON e.id = f.episode_id
             JOIN vec_sentences v ON v.sent_key = f.episode_id || ':' || f.medoid_idx
             WHERE f.user_id = ? AND f.medoid_idx IS NOT NULL
@@ -771,7 +772,9 @@ def fragments_for_episodes(conn: sqlite3.Connection, user_id: str,
                     "embedding": emb, "episode_id": r["episode_id"],
                     "title": r["title"], "ts": r["ts"], "cluster": r["cluster"],
                     "route": r["route"], "strength": r["strength"],
-                    "weight": r["weight"], "similarity": round(sim, 4)})
+                    "weight": r["weight"], "is_centre": r["is_centre"],
+                    "is_novel_peak": r["is_novel_peak"], "direction": r["direction"],
+                    "similarity": round(sim, 4)})
     return out
 
 
