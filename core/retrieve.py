@@ -187,7 +187,9 @@ def _seed_pool(conn, user_id: str, query: str, *, seed_k: int,
 def fragment_recall(conn, user_id: str, query: str, *, seed_k: int = SEED_K,
                     k: int | None = None, calibration: dict | None = None,
                     decompose: bool | None = None, borrow: bool | None = None,
-                    signals: bool = False, run_id: str | None = None) -> list[dict]:
+                    signals: bool = False, run_id: str | None = None,
+                    extra_seed: list[dict] | None = None,
+                    extra_candidates: list[dict] | None = None) -> list[dict]:
     """Rank + select fragments for a query via the assembly wrapper.
 
     Returns the CHOSEN fragments in assembly order (most-informative first), each
@@ -200,7 +202,14 @@ def fragment_recall(conn, user_id: str, query: str, *, seed_k: int = SEED_K,
     `decompose` (R1) seeds from independent sub-queries; `borrow` (R3) appends one
     cross-theme nuance; `signals` (R8) logs fetched/dropped for consolidation.
     `decompose`/`borrow` default to the calibration profile (ON by default — see
-    DEFAULT_CALIBRATION); pass an explicit bool to override the profile for one call."""
+    DEFAULT_CALIBRATION); pass an explicit bool to override the profile for one call.
+
+    `extra_seed` (hierarchical retrieve): rows prepended to the assembly's initial
+    context Y alongside the query — e.g. the BACKGROUND concept centroids. A fragment
+    that merely restates what the background already covers then reads residual≈0 and
+    is suppressed, so only fragments that DEEPEN beyond the background survive (the
+    'define concepts, ignore as background, focus on the novel' rule). Triage/borrow
+    still measure relevance against the bare query, not the augmented seed."""
     # C12: a caller override wins; otherwise load the user's fitted profile over
     # the in-code defaults (just the defaults until a fit is pushed).
     calibration = calibration or calib.merged(conn, DEFAULT_CALIBRATION, user_id)
@@ -217,17 +226,45 @@ def fragment_recall(conn, user_id: str, query: str, *, seed_k: int = SEED_K,
     # R7 answerability triage: if the best candidate doesn't clear the anchor floor,
     # the query is off-corpus — return nothing instead of padding (PRD §Retrieve).
     triage = calibration.get("triage_min_rel", TRIAGE_MIN_REL)
-    if max(c["similarity"] for c in cand) < triage:
+    top_sim = max(c["similarity"] for c in cand)
+    if top_sim < triage:
         if signals:
             record_retrieval_signal(conn, user_id, query, fetched=[], seed=cand,
                                     truncated=False, run_id=run_id)
         return []
 
+    # Spread-relative relevance floor (R2 per-candidate "drop-if-echo"): keep only
+    # candidates at least `rel_keep_frac` as relevant as the best, so the VOI loop's
+    # max-marginal-RESIDUAL operates WITHIN the on-topic set instead of padding with
+    # novel-but-irrelevant spans. On broad queries relevance is uniformly low (the R0
+    # symmetric-encoder limit), so without this the diversity term pulls in garbage.
+    # Off (None) → no filtering, the legacy whole-pool behaviour. Calibration-owned.
+    rel_keep = calibration.get("rel_keep_frac")
+    if rel_keep:
+        floor = max(triage, top_sim * float(rel_keep))
+        kept = [c for c in cand if c["similarity"] >= floor]
+        if kept:
+            cand = kept
+
+    # Graph-reached candidates (the bridge-walk): union AFTER the relevance filter so
+    # they survive it — they were chosen by GRAPH connectivity, not query cosine, and
+    # are exactly the lexically-distant notes the query knn under-ranks (R0 fix). Dedup
+    # by frag_id, keep the higher similarity.
+    if extra_candidates:
+        have = {c["frag_id"] for c in cand}
+        for xc in extra_candidates:
+            if xc["frag_id"] not in have:
+                cand.append({**xc, "via_graph": True})
+                have.add(xc["frag_id"])
+
     query_row = {"id": "__query__", "text": query, "embedding": emb}
     weights = [c["similarity"] for c in cand]  # relevance; assemble clips ≥0
+    # Seed Y = the query, plus any BACKGROUND rows (concept centroids) so fragments
+    # already covered by the background are suppressed (hierarchical retrieve).
+    seed_rows = [query_row] + list(extra_seed or [])
     # k=None lets assemble read `max_items` from the calibration profile (the
     # item ceiling); the gain floor (saturation) or the char budget stops earlier.
-    res = assembly.assemble(cand, seed=[query_row], weights=weights, k=k,
+    res = assembly.assemble(cand, seed=seed_rows, weights=weights, k=k,
                             calibration=calibration)
 
     out = []

@@ -702,6 +702,91 @@ def claim_embedding(conn: sqlite3.Connection, user_id: str, claim_id: str):
     return _deserialize(row["embedding"]) if row else None
 
 
+def concept_embedding(conn: sqlite3.Connection, user_id: str, concept_id: str):
+    """A concept's centroid vector (normalized mean of member claims), or None.
+    Used by hierarchical retrieve as the BACKGROUND frame to subtract from a query."""
+    row = conn.execute(
+        "SELECT embedding FROM vec_concepts WHERE concept_id = ? AND user_id = ?",
+        (concept_id, user_id)).fetchone()
+    return _deserialize(row["embedding"]) if row else None
+
+
+def related_concepts(conn: sqlite3.Connection, user_id: str,
+                     concept_ids: list[str]) -> list[dict]:
+    """Concept→concept graph neighbours of `concept_ids` via the relations table —
+    the substrate the residual-VOI bridge-walk hops over (replacing recall.py's
+    fixed-decay spreading activation). Returns {concept_id, relation, weight, bridge}
+    for each edge whose OTHER endpoint is a concept not already in the seed set.
+    `bridge` flags a non-obvious link (relation == 'bridges')."""
+    if not concept_ids:
+        return []
+    seed = set(concept_ids)
+    ph = ",".join("?" * len(concept_ids))
+    rows = conn.execute(
+        f"""SELECT from_id, to_id, relation, weight FROM relations
+            WHERE user_id = ? AND (from_id IN ({ph}) OR to_id IN ({ph}))""",
+        (user_id, *concept_ids, *concept_ids)).fetchall()
+    out, best = [], {}
+    for r in rows:
+        other = r["to_id"] if r["from_id"] in seed else r["from_id"]
+        if not other.startswith("cpt_") or other in seed:
+            continue
+        w = min(1.0, r["weight"] or 1.0)
+        bridge = r["relation"] == "bridges"
+        # a bridge counts for more — it's the non-obvious cross-theme link
+        score = w * (1.3 if bridge else 1.0)
+        if other not in best or score > best[other][0]:
+            best[other] = (score, r["relation"], w, bridge)
+    for cid, (score, rel, w, bridge) in best.items():
+        out.append({"concept_id": cid, "relation": rel, "weight": w,
+                    "bridge": bridge, "edge_score": round(score, 4)})
+    out.sort(key=lambda d: -d["edge_score"])
+    return out
+
+
+def fragments_for_episodes(conn: sqlite3.Connection, user_id: str,
+                           episode_ids: list[str], embedding) -> list[dict]:
+    """Fragments belonging to the given episodes, shaped like `fragment_candidates`
+    (with medoid embedding + provenance + cosine `similarity` to `embedding`). Lets
+    the bridge-walk inject fragments from graph-reached notes the query knn missed —
+    the R0 fix: a topically-linked but lexically-distant note becomes reachable."""
+    if not episode_ids:
+        return []
+    ph = ",".join("?" * len(episode_ids))
+    rows = conn.execute(
+        f"""SELECT f.id, f.episode_id, f.medoid_idx, f.text, f.route, f.strength,
+                   f.cluster, f.weight, e.title, e.ts, v.embedding
+            FROM fragments f JOIN episodes e ON e.id = f.episode_id
+            JOIN vec_sentences v ON v.sent_key = f.episode_id || ':' || f.medoid_idx
+            WHERE f.user_id = ? AND f.medoid_idx IS NOT NULL
+              AND f.episode_id IN ({ph})""",
+        (user_id, *episode_ids)).fetchall()
+    import numpy as np
+    q = np.asarray(embedding, dtype=float)
+    out = []
+    for r in rows:
+        emb = _deserialize(r["embedding"])
+        sim = float(np.asarray(emb, dtype=float) @ q)
+        out.append({"id": r["id"], "frag_id": r["id"], "text": r["text"],
+                    "embedding": emb, "episode_id": r["episode_id"],
+                    "title": r["title"], "ts": r["ts"], "cluster": r["cluster"],
+                    "route": r["route"], "strength": r["strength"],
+                    "weight": r["weight"], "similarity": round(sim, 4)})
+    return out
+
+
+def concept_episode_ids(conn: sqlite3.Connection, user_id: str,
+                        concept_id: str) -> list[str]:
+    """Distinct source episodes of a concept's member claims — the path from a
+    graph-reached concept to its verbatim fragments."""
+    return [r["episode_id"] for r in conn.execute(
+        """SELECT DISTINCT cs.episode_id FROM concept_members cm
+           JOIN claim_support cs ON cs.claim_id = cm.claim_id
+             AND cs.user_id = cm.user_id
+           WHERE cm.concept_id = ? AND cm.user_id = ?""",
+        (concept_id, user_id))]
+
+
 def claim_in_any_concept(conn: sqlite3.Connection, user_id: str, claim_id: str) -> bool:
     return conn.execute(
         "SELECT 1 FROM concept_members WHERE claim_id = ? AND user_id = ? LIMIT 1",

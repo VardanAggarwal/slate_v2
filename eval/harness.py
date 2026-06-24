@@ -28,6 +28,7 @@ import statistics
 from pathlib import Path
 
 from core import config, llm, store
+from core.hierarchical import hierarchical_context
 from core.hybrid import hybrid_context
 from core.recall import assemble_context, list_episodes
 from core.retrieve import assemble_context as fragment_context
@@ -116,8 +117,18 @@ def hybrid_answer(conn, user_id: str, query: str, budget_tok: int) -> dict:
     return {"system": "hybrid", **_answer_from_context(query, ctx)}
 
 
+def hier_answer(conn, user_id: str, query: str, budget_tok: int) -> dict:
+    """Slate, HIERARCHICAL: background concept frame + verbatim nuance fragments that
+    survive background subtraction (core/hierarchical.py). Replaces the fixed-split
+    hybrid + spreading-activation walk — the concept layer is the BACKGROUND and the
+    fragment assembly carries the NUANCE, the split emergent from the residual."""
+    ctx = hierarchical_context(conn, user_id, query,
+                               max_chars=budget_tok * CHARS_PER_TOKEN)
+    return {"system": "hier", **_answer_from_context(query, ctx)}
+
+
 _ANSWERERS = {"slate": slate_answer, "grep": grep_answer, "frag": frag_answer,
-              "hybrid": hybrid_answer}
+              "hybrid": hybrid_answer, "hier": hier_answer}
 
 
 # ── the judge (single; binary; against the pre-registered checklist) ───────────
