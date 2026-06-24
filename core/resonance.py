@@ -90,7 +90,9 @@ DEFAULT_CALIBRATION = {
     "gain_floor": ASSEMBLE_GAIN_FLOOR, "max_items": ASSEMBLE_MAX_ITEMS,
     "value_floor": None, "per_cluster": {},
     # ablation switches — flip to isolate each mechanism (see design doc test plan)
-    "res_sum_probes": True,      # False → max across probes (the recall.py behaviour)
+    "res_sum_probes": False,     # confluence: REFUTED on both narrow + paragraph gold
+                                 # (sum buries the sharp node under generic-vocab grazing;
+                                 # max wins 87.5 vs 62.5 on paragraph gold). True → sum.
     "res_pe_gate": True,         # False → fixed conductance (no PE de-noising)
     "res_distinctiveness": True, # False → drop the inverse-degree node prior
     "res_clause_probes": True,   # False → only sentence-level probes (confluence rarely fires)
