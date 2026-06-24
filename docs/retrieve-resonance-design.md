@@ -230,6 +230,36 @@ permanently.** True confluence would need probe *independence* (orthogonalised
 sentences) and convergence weighted by that independence — a much harder mechanism
 than summation, and not worth it on this evidence.
 
+### Gap-2 (within-theme nuance reach) + budget-partition — DONE
+
+Two within-retrieval fixes for the gaps, no consolidation change:
+- **Nuance reach** — include a bright node's `is_novel_peak`/`is_centre` fragments
+  regardless of query cosine (the answer-relevant-but-query-DISSIMILAR nuance, e.g.
+  "religion is a crutch" — a novel_peak the cosine slice dropped), and **deep-read**
+  the brightest note ("navigate, then read it").
+- **Budget-partition** — depth slice (deep-read+peaks) and breadth slice (coverage
+  across notes) each get a reserved share of the specifics budget; breadth reserved
+  first, depth takes the remainder. `res_depth_share=0.30` measured best.
+
+| gold set | pre-Gap2 | + Gap2 (0.5 share) | **final (0.30 share)** |
+|---|---|---|---|
+| narrow | 78.6 / tail 40 | 85.7 / tail 80 | **85.7 / tail 80** |
+| paragraph | 87.5 | 100 | 100¹ |
+| broad | 33.3 | 16.7 | **33.3** |
+
+¹ paragraph re-confirm at 0.30 pending (LLM provider was degraded); the drivers
+(peak-inclusion for p11, breadth for p13) are ~depth_share-independent. Narrow now
+**ties grep (86)** while also doing broad+paragraph, which grep can't.
+
+**Deep-vs-broad routing is NOT recoverable from query geometry here** (4 spine
+signals tested — residual-locality, concept-concentration, fragment-episode-spread,
+assembly-saturation — all overlap). R0 + the saturated concept layer erase the
+"one region vs many" structure. So budget-partition self-balances *without*
+classifying: a deep query has few real breadth notes → depth takes the leftover; a
+broad query fills the breadth slice. Clean routing unlocks only after consolidation
+splits the mega-hub clusters (employer mentions fall in 176- and 53-member generic
+anchor-clusters, not a "career" cluster — the saturation problem, concrete).
+
 ## Open risks
 - **R0 still bites the seed.** If no probe seeds near the answer node, navigation
   can't reach it. Confluence + hops *widen* reach vs flat knn, but a fully
