@@ -94,9 +94,11 @@ BREADTH_FRAGS_PER_NODE = 1  # fragments per non-deep node (one each → coverage
 # EPISODES by raw query cosine into the breadth pool, so reachable-but-not-bright notes
 # get a slot. Bounded; breadth-tagged (draws the breadth budget, never depth). Cannot
 # reach R0-wall notes (rank ~250+, vocabulary-disjoint) — those need consolidation.
-# DEFAULT OFF (0): reach is confirmed (the rank-~20 Mode-3 notes enter the context),
-# but SR@B + narrow-regression are NOT yet validated (LLM judge was provider-down).
-# Set to 12 and re-run all gold sets to validate before making it the default.
+# DEFAULT OFF (0) — VALIDATED net-negative (2026-06-24, self-judged ON vs OFF on broad
+# gold). It does NOT beat Mode 3 and HURTS entity-aggregation queries: the top-cosine
+# distinct episodes it adds are generic high-similarity notes that DISPLACE the sparse
+# fact-notes (b_work 1/4→0/4). The genuinely-missing facts are R0 rank-250+ unreachable.
+# Keep off; left as a flag for experiments. Mode 3 needs consolidation, not retrieval.
 COVERAGE_NOTES = 0
 # Budget-partition (Path 1): depth (deep-read+peaks of the top note) and breadth
 # (coverage across many notes) each get a reserved slice of the specifics budget, so
