@@ -235,6 +235,11 @@ def apply_event(conn, user_id: str, type_: str, payload: dict) -> None:
         # now stands for it, so its standalone retrieval pull is demoted.
         store.set_claim_background(conn, user_id, p["claim_id"], 1)
 
+    elif type_ == "UNBACKGROUNDED":
+        # C13b — explicit relevance feedback rescued this claim; restore its
+        # standalone retrieval pull. The exact inverse of BACKGROUNDED (C9).
+        store.set_claim_background(conn, user_id, p["claim_id"], 0)
+
     elif type_ == "PRUNED":
         # C7 safe-forget: the guard confirmed the surviving members reconstruct
         # this claim, so dropping it loses no nuance. Remove it from the concept;
@@ -1038,6 +1043,73 @@ def _medoid_vec(V):
     return V[int(np.argmax((V @ V.T).sum(axis=1)))]
 
 
+# ── Step 6b: contrastive re-anchor (squish + push) ────────────────────────────
+# A concept's stored vector is its REPRESENTATIVE. The per-event default
+# (store.recompute_concept_embedding) is the MEDOID — central to its own members
+# (squishy) but blind to neighbours, so adjacent concepts crowd in cosine space.
+# Once the run's create/merge/split have settled, re-anchor every concept to the
+# member that is BOTH central to self AND distinct from neighbours:
+#     argmax_m ( r_nbr(m) − λ·r_own(m) )
+# where r_own = residual of m vs its OWN members (low ⇒ central; the squish term)
+# and r_nbr = residual of m vs the J nearest concepts' members (high ⇒ distinct;
+# the push term). Validated: medoid (λ→∞, squish-only) ties; pure push (λ=0) drags
+# the anchor to the cluster boundary and tanks broad recall; the MARGIN keeps
+# centrality while sharpening separation (paragraph Coverage@B 62.5→75.0).
+# Raw residuals are correct here: each term is measured against a FIXED pool, so the
+# per-concept argmax is already comparably scaled. Density z-scoring (compute_baselines,
+# as Write does) is only needed once this margin feeds a cross-concept THRESHOLD
+# (merge/split distinct-enough), not for picking the representative. Deterministic
+# given the settled member sets + (λ, J), so event-log rebuild reproduces it.
+REANCHOR_LAMBDA = 1.0   # push/squish weight in (r_nbr − λ·r_own). 0 = pure push (bad);
+                        # λ=2 over-squishes back toward the medoid and loses the paragraph
+                        # win. Coverage@B is flat (79/33/75) across λ∈[0.5,1.0] — robust.
+REANCHOR_J = 3          # nearest concepts forming the push-against pool. J=3 (closest
+                        # neighbours only) edges J=5/8 on Reach@B; Coverage unchanged.
+REANCHOR_POOL_CAP = 60  # cap the neighbour pool (speed)
+
+
+def _reanchor_concepts(conn, user_id: str,
+                       lam: float = REANCHOR_LAMBDA, j: int = REANCHOR_J) -> None:
+    import numpy as np
+    concepts = store.all_concepts(conn, user_id)
+    mem, med = {}, {}
+    for c in concepts:
+        rows = _members_with_emb(conn, user_id,
+                                 store.concept_member_ids(conn, user_id, c["id"]))
+        if rows:
+            V = np.vstack([r["embedding"] for r in rows])
+            mem[c["id"]] = V
+            med[c["id"]] = _medoid_vec(V)
+    if not med:
+        return
+    ids = list(med)
+    M = np.vstack([med[i] for i in ids])
+    M = M / np.clip(np.linalg.norm(M, axis=1, keepdims=True), 1e-9, None)
+    S = M @ M.T  # medoid-cosine, for a strategy-stable neighbourhood
+    for k, cid in enumerate(ids):
+        own = mem[cid]
+        if own.shape[0] == 1:
+            v = own[0]
+        else:
+            r_own = np.array([predict.residual_against(own[i], np.delete(own, i, axis=0))
+                              for i in range(own.shape[0])])
+            nbr_ids = [ids[t] for t in np.argsort(-S[k]) if ids[t] != cid][:j]
+            nbr = np.vstack([mem[t] for t in nbr_ids])[:REANCHOR_POOL_CAP] if nbr_ids else None
+            if nbr is None or nbr.shape[0] == 0:
+                v = own[int(np.argmin(r_own))]              # no neighbours → squish only
+            else:
+                r_nbr = np.array([predict.residual_against(own[i], nbr)
+                                  for i in range(own.shape[0])])
+                v = own[int(np.argmax(r_nbr - lam * r_own))]
+        n = float(np.linalg.norm(v))
+        if n > 0:
+            v = v / n
+        conn.execute("DELETE FROM vec_concepts WHERE concept_id = ?", (cid,))
+        conn.execute(
+            "INSERT INTO vec_concepts (user_id, concept_id, embedding) VALUES (?,?,?)",
+            (user_id, cid, store.serialize_float32([float(x) for x in v])))
+
+
 def _bridges(conn, user_id: str, run_id: str, ts: str) -> float:
     """C5 — propose bridges between concepts whose MEDOIDS sit in a RESIDUAL band:
     close enough to relate (the one's core is partly reconstructable from the
@@ -1205,12 +1277,70 @@ def _consume_retrieval_signals(conn, user_id: str, run_id: str, ts: str) -> None
             claim_seed[cid] += n
             claim_fetched[cid] += fetched_ep.get(ep, 0)
 
+    votes = _relevance_net(conn, user_id)   # explicit feedback overrides usage inference
     for cid, seen in claim_seed.items():
-        if seen >= RETRIEVAL_EXPOSURE_MIN and claim_fetched[cid] == 0:
+        # A claim the user explicitly called relevant (net-positive) is exempt — never
+        # auto-demote it for being quiet (and don't churn against C13b's un-demote).
+        if (seen >= RETRIEVAL_EXPOSURE_MIN and claim_fetched[cid] == 0
+                and votes.get(cid, 0) <= 0):
             claim = store.get_claim(conn, user_id, cid)
             if claim and not claim["background"]:
                 emit(conn, user_id, run_id, "BACKGROUNDED",
                      {"claim_id": cid, "reason": "exposed_never_fetched", "ts": ts})
+
+
+# C13b — explicit relevance feedback. A single explicit "irrelevant" vote (net) is a
+# strong enough signal to demote standalone pull (reversible; theme still carries it).
+RELEVANCE_DEMOTE_MARGIN = 1
+
+
+def _feedback_claims(conn, user_id: str, node_id: str) -> list[str]:
+    """Normalise a feedback target id to the claim layer C13/C13b operate on:
+    claim → itself, concept → its members, episode → its derived claims."""
+    if node_id.startswith("clm_"):
+        return [node_id]
+    if node_id.startswith("cpt_"):
+        return store.concept_member_ids(conn, user_id, node_id)
+    if node_id.startswith("ep_"):
+        return store.claims_for_episode(conn, user_id, node_id)
+    return []
+
+
+def _relevance_net(conn, user_id: str):
+    """Net explicit-relevance vote per claim across ALL RELEVANCE_FEEDBACK events
+    (relevant +1 / irrelevant −1), target ids normalised to claims. Recomputed from
+    the whole log → deterministic on replay."""
+    from collections import Counter
+    votes = Counter()
+    for s in store.events_since(conn, user_id, 0, types=["RELEVANCE_FEEDBACK"]):
+        p = json.loads(s["payload_json"])
+        for nid in p.get("relevant", []):
+            for cid in _feedback_claims(conn, user_id, nid):
+                votes[cid] += 1
+        for nid in p.get("irrelevant", []):
+            for cid in _feedback_claims(conn, user_id, nid):
+                votes[cid] -= 1
+    return votes
+
+
+def _consume_relevance_feedback(conn, user_id: str, run_id: str, ts: str) -> None:
+    """Fold explicit relevance feedback into salience — the 'needed' signal C13
+    deferred for lack of (usage alone can't tell rare-but-correct from noise, so
+    promotion waited on a gold signal; explicit judgments are it).
+
+    Per claim, net = relevant − irrelevant across ALL feedback. Net-positive →
+    UNBACKGROUND (rescue from C9/C13 demotion); net ≤ −MARGIN → BACKGROUND. SET-style
+    appliers guarded by current state → idempotent across nightly replays."""
+    for cid, net in _relevance_net(conn, user_id).items():
+        claim = store.get_claim(conn, user_id, cid)
+        if not claim:
+            continue
+        if net > 0 and claim["background"]:
+            emit(conn, user_id, run_id, "UNBACKGROUNDED",
+                 {"claim_id": cid, "reason": "felt_relevant", "ts": ts})
+        elif net <= -RELEVANCE_DEMOTE_MARGIN and not claim["background"]:
+            emit(conn, user_id, run_id, "BACKGROUNDED",
+                 {"claim_id": cid, "reason": "felt_irrelevant", "ts": ts})
 
 
 # C7 — safe forget. Floor below which the guard returns cold_start anyway; an
@@ -1353,10 +1483,18 @@ def consolidate(conn, user_id: str, max_episodes: int = 50) -> dict:
         with conn:
             _demote_background(conn, user_id, run_id, new_claim_ids, ts)
             _consume_retrieval_signals(conn, user_id, run_id, ts)
+            # C13b: explicit relevance feedback — last word over usage inference.
+            _consume_relevance_feedback(conn, user_id, run_id, ts)
         cost += _bridges(conn, user_id, run_id, ts)
         with conn:
             _decay_strengthen(conn, user_id, run_id, episodes, ts)
             _prune_safely(conn, user_id, run_id, ts)
+
+        # Step 6b: concepts are now settled — re-anchor each to its contrastive
+        # representative (central to self, distinct from neighbours), refining the
+        # per-event medoid now that the neighbourhood is final.
+        with conn:
+            _reanchor_concepts(conn, user_id)
 
         # C12: regions are now settled — re-cluster fragments onto them and push the
         # recomputed cohesion baselines down to Write (measurement half of calibration).

@@ -159,6 +159,22 @@ def record_retrieval_signal(conn, user_id: str, query: str, *, fetched: list[dic
     }, run_id=run_id)
 
 
+def record_relevance_feedback(conn, user_id: str, query: str, *,
+                              relevant: list[str], irrelevant: list[str],
+                              run_id: str | None = None) -> None:
+    """Explicit relevance feedback from the host after it USED recalled context:
+    `relevant` / `irrelevant` are claim/concept/episode ids the assistant judged
+    helped (or didn't) answer `query`. Append-only RELEVANCE_FEEDBACK event,
+    consumed by consolidation C13b — the explicit 'needed' signal usage logging
+    (RETRIEVAL_SIGNAL / C13) cannot provide, so promotion was deferred without it.
+    Not materialized into the semantic store directly; read straight from the log."""
+    store.append_event(conn, user_id, "RELEVANCE_FEEDBACK", {
+        "query": query,
+        "relevant": list(relevant or []),
+        "irrelevant": list(irrelevant or []),
+    }, run_id=run_id)
+
+
 def _seed_pool(conn, user_id: str, query: str, *, seed_k: int,
                decompose: bool, calibration: dict | None):
     """Seed candidate fragments for `query`. With R1 decompose ON, union the seeds
@@ -336,5 +352,5 @@ def assemble_context(conn, user_id: str, topic: str, max_chars: int = 6000,
 
 
 __all__ = ["fragment_recall", "assemble_context", "decompose_query",
-           "record_retrieval_signal", "SEED_K", "MAX_ITEMS", "TRIAGE_MIN_REL",
-           "BORROW_MIN_REL", "DEFAULT_CALIBRATION"]
+           "record_retrieval_signal", "record_relevance_feedback", "SEED_K",
+           "MAX_ITEMS", "TRIAGE_MIN_REL", "BORROW_MIN_REL", "DEFAULT_CALIBRATION"]

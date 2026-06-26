@@ -1,0 +1,29 @@
+{
+  "system": "res_k1",
+  "user_id": "usr_01KTXAYR20J4R6F7PT3DP10W3W",
+  "budget_tokens": 2000,
+  "n": 1,
+  "sr_at_b": 0.0,
+  "n_hard": 1,
+  "sr_tail": 0.0,
+  "mean_context_tokens": 496.0,
+  "total_cost": 0.0,
+  "per_query": [
+    {
+      "id": "b_work",
+      "query": "Summarise my professional work experience across the companies and ventures I've been part of.",
+      "hard": true,
+      "pass": false,
+      "covered": [
+        false,
+        false,
+        false,
+        false
+      ],
+      "answer": "\"I don't know.\"",
+      "context_tokens": 496,
+      "notes": "The candidate answer 'I don't know' does not cover any of the key facts.",
+      "cost": 0.0
+    }
+  ]
+}

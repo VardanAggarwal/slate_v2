@@ -1,4 +1,4 @@
-"""FastMCP + OAuth 2.1. Tools: save_note, recall, assemble_context, get_note, list_recent_notes, get_concept, timeline, digest. SlateOAuthProvider ported from v1 engine/mcp_server.py. See PLAN.md §5 MCP usage pattern + Phase 4, AUTH.md §2.
+"""FastMCP + OAuth 2.1. Tools: save_note, recall, assemble_context, mark_relevance, get_note, list_recent_notes, get_concept, timeline, digest. SlateOAuthProvider ported from v1 engine/mcp_server.py. See PLAN.md §5 MCP usage pattern + Phase 4, AUTH.md §2.
 
 Two-stage retrieval: `recall` returns ~50-token headlines so the model can
 call it speculatively; `assemble_context` / `get_concept` are the escalation.
@@ -174,7 +174,10 @@ mcp = FastMCP(
         "said. Never save AI-generated summaries, analysis, or paraphrases — the "
         "corpus must stay in the user's voice. When in doubt, ask before saving. "
         "After save_note, relay the receipt to the user — echoes and contradictions "
-        "with their past notes are the product, not metadata."
+        "with their past notes are the product, not metadata. "
+        "FEEDBACK: after you use recalled items to compose a response, when some "
+        "clearly helped and others were noise, call `mark_relevance` with their ids "
+        "— it tunes future recall. Only when you have a clear judgment."
     ),
     auth=slate_auth,
 )
@@ -310,10 +313,11 @@ def recall(query: str, k: int = 8) -> list[dict]:
     Also for: "what do I think about X?", "have I written about X?".
 
     Returns compact headlines (~50 tokens each): claims and concepts ranked by
-    spreading activation, with why-now signals (🌉 bridged concepts, 🔁
-    recurring claims, 🕰️ long-dormant thinking resurfacing, 2-hop = non-obvious
+    graph navigation, with why-now signals (🌉 bridged concepts, 🔁 recurring
+    claims, 🕰️ long-dormant thinking resurfacing, 2-hop = non-obvious
     connection). Escalate with assemble_context or get_concept when a hit
-    deserves the full picture.
+    deserves the full picture. After you use the results, mark_relevance() tells
+    Slate which ones helped.
     """
     from core.recall import recall as _recall
     return _recall(_conn(), _user_id(), query, k=k)
@@ -342,6 +346,34 @@ def assemble_context(topic: str) -> str:
         out = resonance.resonance_context(conn, user_id, topic, signals=True)
         conn.commit()
         return out
+    finally:
+        conn.close()
+
+
+@mcp.tool
+def mark_relevance(query: str, relevant: list[str] | None = None,
+                   irrelevant: list[str] | None = None) -> dict:
+    """Report which recalled items actually helped answer `query` and which were
+    noise — explicit feedback that tunes future recall.
+
+    Call AFTER you've used recalled context to compose a response, only when you
+    have a clear judgment. `relevant` / `irrelevant` take ids straight from
+    recall() headlines (claim or concept ids) or note ids (get_note /
+    list_recent_notes) — pass only the ids you're confident about, omit the rest.
+    Consolidation keeps the relevant ones in the foreground and demotes the
+    irrelevant ones, so the next recall on a similar query ranks better."""
+    rel = [i for i in (relevant or []) if i]
+    irr = [i for i in (irrelevant or []) if i]
+    if not rel and not irr:
+        return {"status": "noop", "message": "no ids provided"}
+    from core.retrieve import record_relevance_feedback
+    conn = _conn()
+    user_id = _user_id()
+    try:
+        record_relevance_feedback(conn, user_id, query, relevant=rel, irrelevant=irr)
+        conn.commit()
+        return {"status": "recorded", "query": query,
+                "relevant": len(rel), "irrelevant": len(irr)}
     finally:
         conn.close()
 

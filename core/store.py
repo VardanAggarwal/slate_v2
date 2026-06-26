@@ -995,8 +995,13 @@ def set_fragment_clusters(conn: sqlite3.Connection, user_id: str,
 
 def recompute_concept_embedding(conn: sqlite3.Connection, user_id: str,
                                 concept_id: str) -> None:
-    """Concept vector = normalized mean of member claim vectors (deterministic,
-    so event-log rebuild reproduces it exactly)."""
+    """Concept vector = MEDOID member (the member nearest all others, max summed
+    cosine), not the centroid mean. A mean is pulled toward the crowded global
+    centre — averaging members of an already-saturated claim-space collapses every
+    concept toward the same point, so the concept layer ends up LESS separable than
+    the claims. The medoid is a real member vector, on-manifold, so concepts keep
+    their natural spread (the de-collapse the consolidation layer is for).
+    Deterministic (argmax over stored vectors), so event-log rebuild reproduces it."""
     import numpy as np
     members = concept_member_ids(conn, user_id, concept_id)
     vecs = [claim_embedding(conn, user_id, c) for c in members]
@@ -1004,12 +1009,13 @@ def recompute_concept_embedding(conn: sqlite3.Connection, user_id: str,
     conn.execute("DELETE FROM vec_concepts WHERE concept_id = ?", (concept_id,))
     if not vecs:
         return
-    mean = np.mean(vecs, axis=0)
-    norm = np.linalg.norm(mean)
+    V = np.vstack(vecs)
+    medoid = V[0] if V.shape[0] == 1 else V[int(np.argmax((V @ V.T).sum(axis=1)))]
+    norm = np.linalg.norm(medoid)
     if norm > 0:
-        mean = mean / norm
+        medoid = medoid / norm
     conn.execute("INSERT INTO vec_concepts (user_id, concept_id, embedding) VALUES (?, ?, ?)",
-                 (user_id, concept_id, serialize_float32([float(x) for x in mean])))
+                 (user_id, concept_id, serialize_float32([float(x) for x in medoid])))
 
 
 def knn_concepts(conn: sqlite3.Connection, user_id: str, embedding, k: int = 5) -> list[dict]:

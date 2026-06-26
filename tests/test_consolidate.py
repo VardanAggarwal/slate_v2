@@ -574,7 +574,9 @@ def test_revisit_order_puts_surprise_first():
 
 
 # ── C13: consume retrieval signals — demote exposed-but-never-fetched ─────────
-from core.consolidate import _consume_retrieval_signals, RETRIEVAL_EXPOSURE_MIN  # noqa: E402
+from core.consolidate import (_consume_retrieval_signals,  # noqa: E402
+                              _consume_relevance_feedback, RETRIEVAL_EXPOSURE_MIN)
+from core.retrieve import record_relevance_feedback  # noqa: E402
 
 
 def _seed_frag(conn, frag_id, episode_id):
@@ -629,6 +631,46 @@ def test_retrieval_signal_spares_rare_quiet_claim(conn, fake_llm):
     with conn:
         _consume_retrieval_signals(conn, UID, "run_s", ts)
     assert store.get_claim(conn, UID, "clm_r")["background"] == 0
+
+
+# ── C13b: explicit relevance feedback ─────────────────────────────────────────
+def test_relevance_feedback_demotes_irrelevant(conn, fake_llm):
+    """An explicit 'irrelevant' vote backgrounds the claim (even if it was fetched)."""
+    ts = "2026-01-01T00:00:00+00:00"
+    with conn:
+        _claim_on_episode(conn, "clm_i", "ep_i", ts)
+        record_relevance_feedback(conn, UID, "q", relevant=[], irrelevant=["clm_i"])
+    with conn:
+        _consume_relevance_feedback(conn, UID, "run_f", ts)
+    assert store.get_claim(conn, UID, "clm_i")["background"] == 1
+
+
+def test_relevance_feedback_rescues_relevant(conn, fake_llm):
+    """An explicit 'relevant' vote un-backgrounds a demoted claim (the deferred promote)."""
+    ts = "2026-01-01T00:00:00+00:00"
+    with conn:
+        _claim_on_episode(conn, "clm_p", "ep_p", ts)
+        store.set_claim_background(conn, UID, "clm_p", 1)   # previously demoted
+        record_relevance_feedback(conn, UID, "q", relevant=["clm_p"], irrelevant=[])
+    with conn:
+        _consume_relevance_feedback(conn, UID, "run_f", ts)
+    assert store.get_claim(conn, UID, "clm_p")["background"] == 0
+
+
+def test_relevance_feedback_overrides_never_fetched(conn, fake_llm):
+    """A claim C13 would demote (exposed, never fetched) but marked relevant stays
+    foreground — and C13 itself no longer demotes it (no oscillation)."""
+    ts = "2026-01-01T00:00:00+00:00"
+    with conn:
+        _seed_frag(conn, "frg_o", "ep_o")
+        _claim_on_episode(conn, "clm_o", "ep_o", ts)
+        for _ in range(RETRIEVAL_EXPOSURE_MIN):
+            _signal(conn, fetched=[], dropped=["frg_o"])
+        record_relevance_feedback(conn, UID, "q", relevant=["clm_o"], irrelevant=[])
+    with conn:
+        _consume_retrieval_signals(conn, UID, "run_f", ts)    # would demote, but exempt
+        _consume_relevance_feedback(conn, UID, "run_f", ts)
+    assert store.get_claim(conn, UID, "clm_o")["background"] == 0
 
 
 def test_retrieval_demote_survives_rebuild(conn, fake_llm):

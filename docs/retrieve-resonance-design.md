@@ -260,6 +260,53 @@ broad query fills the breadth slice. Clean routing unlocks only after consolidat
 splits the mega-hub clusters (employer mentions fall in 176- and 53-member generic
 anchor-clusters, not a "career" cluster — the saturation problem, concrete).
 
+## Coverage@B — a deterministic second instrument (2026-06-26)
+
+`eval/coverage.py`: replace the LLM answerer+judge with embedding cosine of the
+pre-registered `key_facts` against retrieved context (max-cosine over chunks; a query
+passes iff every fact clears τ). τ calibrated ONCE against the logged judge runs
+(`baseline_*.json`): over 82 (fact, answer) pairs the judge labeled, covered facts
+score **0.67** vs uncovered **0.40** (clean separation) and **τ\*=0.54** reproduces the
+judge at **86% balanced accuracy** (1 FP, 13 FN). No LLM at eval time.
+
+Coverage@B (τ=0.54, B=2000, eval DB), SR@B / tail:
+
+| system | narrow | broad | paragraph |
+|---|---|---|---|
+| grep | 86 / 80 | 17 / 17 | 88 / 75 |
+| slate | 21 / 20 | 17 / 17 | 50 / 50 |
+| frag | 57 / 40 | 17 / 17 | 50 / 25 |
+| hybrid | 50 / 40 | 33 / 33 | 62 / 50 |
+| hier | 50 / 20 | 33 / 33 | 50 / 25 |
+| resonance | 71 / 80 | 33 / 33 | 50 / 50 |
+
+**What it confirms:** the broad **33% ceiling reproduces under an independent,
+deterministic instrument** (resonance/hybrid/hier 33, grep 17). The
+consolidation-completeness diagnosis (mega-hubs, §gaps) is *not* a judge artefact.
+
+**What it must NOT be used for — the verbatim bias (validated):** Coverage@B is a
+SAME-PATH A/B tool, *not* a judge replacement and *not* cross-path-fair.
+- It rewards **lexical surface overlap**: grep's 2000-token raw dump matches
+  hand-authored key_facts by surface area, not by "finding" anything. The judge,
+  reading a *synthesized answer*, is not fooled — so the judge credits Slate for
+  surfacing the right memory in different words; cosine does not.
+- It **under-credits distilled paths**: grep Coverage@B (86) == its judge SR (86), but
+  slate (21 vs judge 43) and resonance (71 vs judge 86) read far lower. The single τ,
+  fit on answer-vs-fact pairs, does not transfer to context-vs-fact where distilled
+  context has lower surface overlap.
+- **Binary all-or-nothing flattens partial wins.** On `b_work`, resonance scores
+  `[0.34,0.54,0.47,0.33]` vs grep `[0.27,0.30,0.31,0.28]` — navigation surfaced
+  materially closer memories, yet neither clears τ on all 4 facts, so BOTH read
+  "fail". This is exactly why lived experience (Slate pinpoints the right memory where
+  grep fails on broad) diverges from the grep-favouring narrow numbers here.
+
+**So:** keep the **LLM judge as the faithful absolute / cross-path metric**. Use
+Coverage@B only for **same-path consolidation A/B deltas** (the verbatim bias cancels
+when the path is fixed). For "did we surface the RIGHT memory" — what grep fails at
+broad — build **Reach@B at *selection* granularity** (is the gold answer node in the
+system's ranked set?), reported **graded, not binary**, so partial wins like resonance's
+`b_work` aren't flattened. grep can't game node-selection by dumping raw text.
+
 ## Open risks
 - **R0 still bites the seed.** If no probe seeds near the answer node, navigation
   can't reach it. Confluence + hops *widen* reach vs flat knn, but a fully

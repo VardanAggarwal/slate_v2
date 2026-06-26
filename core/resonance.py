@@ -240,13 +240,16 @@ def activate(conn, user_id: str, query: str, *, calibration: dict | None = None)
             return True
         return False
 
+    seeded: set[str] = set()  # nodes injected directly (vs reached by spread) — the via signal
     for pi, pe in enumerate(p_embs):
         for h in store.knn_claims(conn, user_id, pe, k=int(C("res_seed_claims", SEED_CLAIMS))):
             if h["similarity"] > float(C("res_seed_floor", SEED_FLOOR)):
                 deposit(h["claim_id"], pi, h["similarity"])
+                seeded.add(h["claim_id"])
         for h in store.knn_concepts(conn, user_id, pe, k=int(C("res_seed_concepts", SEED_CONCEPTS))):
             if h["similarity"] > float(C("res_seed_floor", SEED_FLOOR)):
                 deposit(h["id"], pi, h["similarity"])
+                seeded.add(h["id"])
 
     def strength(node: str) -> float:
         vals = act[node].values()
@@ -308,7 +311,8 @@ def activate(conn, user_id: str, query: str, *, calibration: dict | None = None)
         sal = st * (1.0 + math.log(conf)) * dist
         nodes[node] = {"strength": round(st, 4), "confluence": conf,
                        "distinctiveness": round(dist, 4), "salience": round(sal, 6)}
-    return {"nodes": nodes, "q_emb": q_emb, "probes": probes, "top_sim": top_sim}
+    return {"nodes": nodes, "q_emb": q_emb, "probes": probes,
+            "top_sim": top_sim, "seeded": seeded}
 
 
 # ── materialise bright nodes → verbatim fragments → assembly ────────────────────

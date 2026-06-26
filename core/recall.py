@@ -1,7 +1,15 @@
-"""Spreading-activation retrieval: vector seed over claims/concepts, graph hops via relations, why-now ranking. 100% local. See PLAN.md §5.
+"""The cheap headline read: rank claims/concepts for a query with why-now signals
+(~50 tok each), so callers can call speculatively before composing. 100% local.
+See PLAN.md §5.
+
+Navigation is SHARED with assemble_context: `recall()` runs `resonance.activate()`
+(the denoised navigate stage — probe confluence + PE-gated, fan-out-normalised
+spread) and stops at the activation field, rendering headlines. assemble_context
+runs the same `activate()` then continues into verbatim materialisation. One engine,
+two heads (docs/retrieve-resonance-design.md).
 
 Also hosts the read/browse API (§5): get_episode, list_episodes, get_concept,
-get_claim, assemble_context — plain SQL, no LLM, no network.
+get_claim — plain SQL, no LLM, no network.
 
 Every function takes an explicit user_id and every query filters on it
 (AUTH.md §1/§3) — graph hops must never cross into another user's corpus.
@@ -10,16 +18,8 @@ import json
 from datetime import datetime, timezone
 
 from core import config, store
-from core.encode import get_embedder
 
-# Activation transfer per edge type (per hop)
-SPREAD_CLAIM_TO_CONCEPT = 0.7
-SPREAD_CONCEPT_TO_CLAIM = 0.6
-SPREAD_RELATION = 0.6
-HOPS = 2
-SEED_CLAIMS = 12
-SEED_CONCEPTS = 6
-MIN_ACTIVATION = 0.05
+SCORE_POOL = 40           # score this many brightest nodes (bounds _score_node SQL)
 
 FREQUENT_STRENGTH = 2.0   # 🔁 claim re-encountered (1.0 + 2×SUPPORT_BUMP)
 TIME_GAP_DAYS = 45        # 🕰️ resurfacing after this long
@@ -38,64 +38,30 @@ def _days_since(iso_ts: str | None) -> int:
         return 999
 
 
-# ── Spreading activation ──────────────────────────────────────────────────────
+# ── Headline ranking — navigation shared with assemble_context ────────────────
 def recall(conn, user_id: str, query: str, k: int = 8) -> list[dict]:
     """Rank claims + concepts for a query. Returns compact headline dicts —
-    ~50 tokens each — so callers (MCP `recall`) can call speculatively."""
-    emb = get_embedder().encode([query], normalize_embeddings=True,
-                                show_progress_bar=False)[0]
+    ~50 tokens each — so callers (MCP `recall`) can call speculatively.
 
-    activation: dict[str, float] = {}
-    via: dict[str, str] = {}  # node -> how it was reached (for "non-obvious" signal)
+    Navigation is the resonance navigate stage (`resonance.activate`): probe
+    confluence + PE-gated, fan-out-normalised spread over the consolidated graph.
+    recall stops at the scored activation field and renders headlines; the heavy
+    `assemble_context` runs the same `activate()` then materialises verbatim spans."""
+    from core import resonance
+    field = resonance.activate(conn, user_id, query)
+    nodes, seeded = field["nodes"], field["seeded"]
+    if not nodes:
+        return []
 
-    for hit in store.knn_claims(conn, user_id, emb, k=SEED_CLAIMS):
-        if hit["similarity"] > 0:
-            activation[hit["claim_id"]] = max(activation.get(hit["claim_id"], 0),
-                                              hit["similarity"])
-            via[hit["claim_id"]] = "seed"
-    for hit in store.knn_concepts(conn, user_id, emb, k=SEED_CONCEPTS):
-        if hit["similarity"] > 0:
-            activation[hit["id"]] = max(activation.get(hit["id"], 0), hit["similarity"])
-            via[hit["id"]] = "seed"
-
-    frontier = dict(activation)
-    for _ in range(HOPS):
-        next_frontier: dict[str, float] = {}
-
-        def push(node: str, value: float, source: str):
-            if value < MIN_ACTIVATION:
-                return
-            if value > activation.get(node, 0):
-                activation[node] = value
-                via.setdefault(node, source)
-                next_frontier[node] = max(next_frontier.get(node, 0), value)
-
-        for node, act in frontier.items():
-            if node.startswith("clm_"):
-                for r in conn.execute(
-                        "SELECT concept_id FROM concept_members WHERE claim_id = ? AND user_id = ?",
-                        (node, user_id)):
-                    push(r["concept_id"], act * SPREAD_CLAIM_TO_CONCEPT, node)
-            elif node.startswith("cpt_"):
-                for r in conn.execute(
-                        "SELECT claim_id FROM concept_members WHERE concept_id = ? AND user_id = ?",
-                        (node, user_id)):
-                    push(r["claim_id"], act * SPREAD_CONCEPT_TO_CLAIM, node)
-            for r in conn.execute(
-                    """SELECT from_id, to_id, relation, weight FROM relations
-                       WHERE (from_id = ? OR to_id = ?) AND user_id = ?""",
-                    (node, node, user_id)):
-                other = r["to_id"] if r["from_id"] == node else r["from_id"]
-                w = min(1.0, r["weight"] or 1.0)
-                bridge_tag = f"bridge:{node}" if r["relation"] == "bridges" else node
-                push(other, act * SPREAD_RELATION * w, bridge_tag)
-        frontier = next_frontier
-        if not frontier:
-            break
-
+    # Score the brightest nodes (by navigation salience) with why-now signals.
+    # Pre-trim to a bounded pool so _score_node's per-node SQL stays cheap on a wide
+    # field. via = "seed" (direct hit, no tag) vs "spread" (reached by a hop → the
+    # "2-hop" non-obvious signal); bridge-bearing concepts are flagged 🌉 in _score_node.
+    ranked = sorted(nodes.items(), key=lambda kv: -kv[1]["salience"])
     results = []
-    for node, act in activation.items():
-        entry = _score_node(conn, user_id, node, act, via.get(node, "seed"))
+    for node, sc in ranked[:SCORE_POOL]:
+        via = "seed" if node in seeded else "spread"
+        entry = _score_node(conn, user_id, node, sc["salience"], via)
         if entry:
             results.append(entry)
     results.sort(key=lambda r: -r["score"])
