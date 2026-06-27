@@ -410,13 +410,13 @@ title = "HF-only embeddings"</div>
 <pre>[
  {<span class="key">"type"</span>:<span class="s">"concept"</span>, <span class="key">"id"</span>:<span class="s">"cpt_…"</span>,
   <span class="key">"text"</span>:<span class="s">"Remote work"</span>,
-  <span class="key">"score"</span>:0.78, <span class="key">"signals"</span>:[<span class="s">"🌉 bridge"</span>]},
+  <span class="key">"score"</span>:0.78, <span class="key">"signals"</span>:[<span class="s">"2-hop"</span>]},
  {<span class="key">"type"</span>:<span class="s">"claim"</span>, <span class="key">"text"</span>:<span class="s">"I ship more without
    commute interruptions"</span>, <span class="key">"score"</span>:0.71,
   <span class="key">"signals"</span>:[<span class="s">"🔁 recurring"</span>], <span class="key">"n_episodes"</span>:3}
 ]</pre></div>
     </div>
-    <div class="value" style="margin-top:8px"><span class="ic">★</span><div>recall renders these headlines straight from the activation field below, then <b>stops</b> — no quoting, no verbatim pull. Compact, ranked, with why-now tags (🌉 bridge / 🔁 recurring / 🕰️ dormant / ⚖️ contested). The assistant reads them and decides whether the full <code>assemble_context</code> pull is worth it.</div></div>
+    <div class="value" style="margin-top:8px"><span class="ic">★</span><div>recall renders these headlines straight from the activation field below, then <b>stops</b> — no quoting, no verbatim pull. Compact, ranked, with why-now tags (🔁 recurring / 🕰️ dormant / ⚖️ contested / 2-hop). The assistant reads them and decides whether the full <code>assemble_context</code> pull is worth it.</div></div>
   </div>
 
   <h3 class="section" style="font-size:18px;margin:26px 0 4px">The shared engine — <code style="font-family:var(--mono);font-size:13px;color:var(--accent)">activate()</code> <span style="font-family:var(--mono);font-size:13px;color:var(--accent)">core/resonance.py</span></h3>
@@ -451,7 +451,7 @@ title = "HF-only embeddings"</div>
       <div class="scol">
         <div class="hop"><span class="dot"></span>② HOP · only if new</div>
         <div class="edge">cross the link? → <span style="color:#7ee787">does it add something?</span></div>
-        <div class="gnode"><div class="lab">concept · "Team trust" (via 🌉 bridge)</div><div class="act"><span style="color:#7ee787">new</span> — isolation quietly erodes trust → <b>kept</b></div><div class="via via-hop">non-obvious link</div></div>
+        <div class="gnode"><div class="lab">concept · "Team trust" (via link hop)</div><div class="act"><span style="color:#7ee787">new</span> — isolation quietly erodes trust → <b>kept</b></div><div class="via via-hop">non-obvious link</div></div>
         <div style="font-size:11px;color:var(--muted);margin-top:4px">A neighbour that just repeats what's already lit → blocked. One that adds a new angle → crosses.</div>
       </div>
       <div class="scol">
@@ -466,7 +466,7 @@ title = "HF-only embeddings"</div>
         <div style="font-size:11px;color:var(--muted);margin-top:4px">Reached by both "productive" and "isolated" → ranked top. Generic ideas sink.</div>
       </div>
     </div>
-    <div class="touches" style="margin-top:12px"><span class="seg"><span class="h rh">READS</span> <code>vec_claims</code> <code>vec_concepts</code> <code>concept_members</code> <code>relations</code> <span style="color:var(--muted);font-size:11px">(idea links + bridges)</span></span></div>
+    <div class="touches" style="margin-top:12px"><span class="seg"><span class="h rh">READS</span> <code>vec_claims</code> <code>vec_concepts</code> <code>concept_members</code> <span style="color:var(--muted);font-size:11px">(primary + channel-code redundant — a query on a concept can recover a claim homed elsewhere)</span> <code>relations</code> <span style="color:var(--muted);font-size:11px">(idea links)</span></span></div>
   </div>
 
   <!-- FORK: recall stops, assemble_context continues -->
@@ -484,7 +484,7 @@ title = "HF-only embeddings"</div>
       <!-- frame -->
       <div class="hcol s1">
         <div class="hh"><span class="n">1</span> OVERVIEW</div>
-        <p style="font-size:12.5px;color:#cdd6e0;margin:0 0 9px">The brightest <b>handful of concepts</b> give a one-line summary + their top member claims — the at-a-glance picture a "what do I think about X?" question needs. The walk (not raw similarity) picks which concepts. Capped at <b>~35%</b> of the budget.</p>
+        <p style="font-size:12.5px;color:#cdd6e0;margin:0 0 9px">The brightest <b>handful of concepts</b> give a one-line summary + their top member claims (<b>including channel-code redundant attaches</b> — the parity bits that patch a concept's coverage holes) — the at-a-glance picture a "what do I think about X?" question needs. The walk (not raw similarity) picks which concepts. Capped at <b>~35%</b> of the budget.</p>
         <div class="gnode seed">
           <div class="lab">concept · "Remote work"</div>
           <div class="act">summary + top claims</div>
@@ -565,7 +565,6 @@ title = "HF-only embeddings"</div>
   <div class="legend3" style="margin:0 0 8px">
     <span><b>From the walk:</b></span>
     <span><b style="color:var(--accent)">2-hop</b> — reached by a hop, not a direct match → a non-obvious connection</span>
-    <span><b style="color:var(--accent)">🌉 bridge</b> — the idea sits on a non-obvious cross-topic link</span>
   </div>
   <div class="legend3" style="margin:0 0 18px">
     <span><b>From the note's own record:</b></span>
@@ -670,12 +669,32 @@ title = "HF-only embeddings"</div>
     <div class="arrow">↓</div>
 
     <div class="step">
-      <span class="tag">BRIDGES · C5 · the primitive</span>
-      <h3>Latent links between concepts — <span class="fn">_bridges()</span></h3>
-      <p>Concept pairs whose medoids sit in a <b>residual band</b> — close enough to relate, far enough that the link is non-obvious — are proposed; the LLM confirms each.</p>
+      <span class="tag">BRIDGES · C5 · REMOVED 2026-06-27</span>
+      <h3>Latent concept-pair bridges — <span class="fn">_bridges()</span> <b>deleted</b></h3>
+      <p>Was: concept pairs in a medoid residual band, LLM-confirmed → <code>BRIDGED</code> events. <b>Removed</b> — proven retrieval-inert (no Coverage@B change at B or 2B, concept- or claim-edge wiring); the <code>BRIDGE_BOOST</code> retrieval weight and <code>list_bridges</code> MCP went with it. The structural lever that <i>does</i> pay is channel-code redundancy (Step 6c, below) — a claim multi-attached to a far-but-reachable concept it spans into.</p>
+    </div>
+    <div class="arrow">↓</div>
+
+    <div class="step">
+      <span class="tag">CONCEPT REPRESENTATION · Step 6b · the primitive</span>
+      <h3>Re-anchor each concept to its contrastive representative — <span class="fn">_reanchor_concepts()</span></h3>
+      <p>A concept's stored vector is one <b>real member</b> (the medoid), never the mean — averaging members in an already-saturated claim-space drags every concept toward the same global centre and the layer <b>collapses</b>. Once the run's create/merge/split have settled, each concept is re-anchored to the member that is <b>both central to its own cluster <i>and</i> distinct from its neighbours</b>: <code style="font-family:var(--mono)">argmax<sub>m</sub>(r_nbr − λ·r_own)</code> — same residual primitive, now scoring members against own-cluster (squish) vs the J=3 nearest concepts (push). λ=1.</p>
+      <div class="value"><span class="ic">★</span><div><b>Critical value:</b> de-collapses the concept layer (pair-cosine 0.24→0.13) so the retrieve walk can tell concepts apart — lifted paragraph Coverage@B 62→75. Deterministic given settled members + (λ,J), so <code>rebuild()</code> reproduces it. Pure-push (λ=0) drags the anchor to the boundary and tanks broad recall; the <i>margin</i> keeps centrality while sharpening separation.</div></div>
       <div class="touches">
-        <span class="seg"><span class="h rh">READS</span> <code>concepts</code> <code>concept_members</code> <code>claims</code> <code>relations</code> <span style="color:var(--muted);font-size:11px">(skip existing pairs)</span></span>
-        <span class="seg"><span class="h wh">WRITES</span> <code>events:<em>BRIDGED</em></code> → <code>relations</code></span>
+        <span class="seg"><span class="h rh">READS</span> <code>concepts</code> <code>concept_members</code> <code>vec_claims</code> <span style="color:var(--muted);font-size:11px">(member vectors + nearest concepts)</span></span>
+        <span class="seg"><span class="h wh">WRITES</span> <code>vec_concepts</code> <span style="color:var(--muted);font-size:11px">(representative vector, in place)</span></span>
+      </div>
+    </div>
+    <div class="arrow">↓</div>
+
+    <div class="step">
+      <span class="tag">CHANNEL-CODE REDUNDANCY · Step 6c · the primitive</span>
+      <h3>Patch coverage holes with scarce parity attaches — <span class="fn">_channel_redundancy()</span></h3>
+      <p>Retrieval is a <b>channel-coding</b> problem, not compression: a query that lands on concept <i>k</i> should still recover a claim whose home is elsewhere when <i>k</i>'s own members can't reconstruct it. For each claim, among its nearest non-home concepts, a <code style="font-family:var(--mono)">(claim, k)</code> pair is an eligible <b>hole</b> iff it is <b>reachable</b> (cosine to <i>k</i>'s centre ≥ 0.55 — a query on <i>k</i> could want it) <i>yet</i> <b>uncovered</b> (reconstruction-z vs <i>k</i>'s members in [1,3] — <i>k</i> can't already rebuild it, but it isn't noise). Rank globally by <code style="font-family:var(--mono)">cos·z</code>, keep the top ~33 (budget 80, ≤1 per claim) — <b>parity bits</b>, not blanket duplication. Written as <code>kind='redundant'</code> members, after the centres are settled.</p>
+      <div class="value"><span class="ic">★</span><div><b>Critical value:</b> lifted paragraph Coverage@B 0.78→0.89 with no narrow/broad cost and no partition collapse. Redundant rows feed <b>retrieval</b> (activation spread + concept enumeration) but are <b>excluded from every centre / baseline / membership computation</b> (primary-only reads), so they never corrupt the concept vector or drift across runs. One <code>CHANNEL_REDUNDANCY</code> event carries the full set, replacing all prior redundant rows → idempotent, <code>rebuild()</code>-reproducible, rollback-reversible. Master switch <code style="font-family:var(--mono)">CHANNEL_REDUNDANCY</code>.</div></div>
+      <div class="touches">
+        <span class="seg"><span class="h rh">READS</span> <code>concept_members</code> <span style="color:var(--muted);font-size:11px">(primary partition)</span> <code>vec_claims</code> <code>vec_concepts</code></span>
+        <span class="seg"><span class="h wh">WRITES</span> <code>events:<em>CHANNEL_REDUNDANCY</em></code> → <code>concept_members</code> <span style="color:var(--muted);font-size:11px">(kind='redundant')</span></span>
       </div>
     </div>
     <div class="arrow">↓</div>
@@ -700,8 +719,6 @@ title = "HF-only embeddings"</div>
 <span class="cm"># "what's new in my notes?"</span></pre></div>
       <div class="col out"><div class="k">◂ OUTPUT · markdown, ready to relay</div>
 <pre>## What emerged overnight
-🌉 New bridge: <span class="s">"Deployment constraints"</span>
-   ↔ <span class="s">"Cost discipline"</span>
 ⚡ Contradiction reconciled: HF vs OpenAI
    embeddings — HF kept (current)
 🔁 Strengthened: <span class="s">"1GB host limit"</span> (×3)
@@ -764,7 +781,7 @@ title = "HF-only embeddings"</div>
           <div class="f"><span class="fn2">type</span><span class="fd">the decision kind — dispatches to its applier</span></div>
           <div class="f"><span class="fn2">payload_json</span><span class="fd">the frozen decision; carries <em>references</em> (ids, spans) not copied text/vectors</span></div>
         </div>
-        <div class="meta" style="margin-top:9px">types: <b>ENCODED</b> (W1) · <b>FRAGMENTED</b> (W8) · <b>RETRIEVAL_SIGNAL</b> (R8) · <b>CANONICALIZED · CONCEPT_CREATED · ATTACHED · MERGED · SPLIT · RELATED · BRIDGED · STRENGTHENED · DECAYED · BACKGROUNDED · VERSIONED · PRUNED · RECLUSTERED</b> (consolidation).</div></div>
+        <div class="meta" style="margin-top:9px">types: <b>ENCODED</b> (W1) · <b>FRAGMENTED</b> (W8) · <b>RETRIEVAL_SIGNAL</b> (R8) · <b>CANONICALIZED · CONCEPT_CREATED · ATTACHED · MERGED · SPLIT · RELATED · STRENGTHENED · DECAYED · BACKGROUNDED · VERSIONED · PRUNED · RECLUSTERED</b> (consolidation).</div></div>
     </div>
   </div>
 
@@ -814,16 +831,17 @@ title = "HF-only embeddings"</div>
           <div class="f"><span class="fn2">state</span><span class="fd"><em>grounded / active / stale / dormant</em> — health/decay stage</span></div>
           <div class="f"><span class="fn2">strength, last_activity</span><span class="fd">salience + when it was last touched (drives decay)</span></div>
         </div>
-        <div class="meta" style="margin-top:8px">vec_concepts vector = recomputed from member claims on every change.</div></div>
+        <div class="meta" style="margin-top:8px">vec_concepts vector = a real member (the <b>medoid</b>, not the mean — the mean collapses the layer), refined to a contrastive representative end-of-run (Step 6b).</div></div>
       <div class="tbl"><div class="nm">concept_members <span class="w w-cons">CONSOLIDATE</span></div>
         <div class="fields">
           <div class="f"><span class="fn2 pk">concept_id, claim_id</span><span class="fd">which claims belong to which concept (the clustering)</span></div>
           <div class="f"><span class="fn2">weight</span><span class="fd">how central the claim is to the concept</span></div>
+          <div class="f"><span class="fn2">kind</span><span class="fd"><em>primary</em> = the claim's home (exactly one) · <em>redundant</em> = a channel-code parity attach (Step 6c). Retrieval reads both; centres/baselines/membership read <em>primary</em> only</span></div>
         </div></div>
       <div class="tbl"><div class="nm">relations <span class="w w-cons">CONSOLIDATE</span></div>
         <div class="fields">
           <div class="f"><span class="fn2 pk">from_id, to_id, relation</span><span class="fd">a directed link; from/to are claim or concept ids</span></div>
-          <div class="f"><span class="fn2">relation</span><span class="fd"><em>leads_to / contradicts / supports / bridges</em> — bridges = the non-obvious latent link (C5)</span></div>
+          <div class="f"><span class="fn2">relation</span><span class="fd"><em>leads_to / contradicts / supports</em></span></div>
           <div class="f"><span class="fn2">weight</span><span class="fd">link strength / confidence</span></div>
           <div class="f"><span class="fn2">evidence_episode_id</span><span class="fd">the note that justified the link</span></div>
         </div></div>
@@ -891,15 +909,15 @@ title = "HF-only embeddings"</div>
       <tr><th>vec_sentences</th><td><span class="op ins">INSERT</span></td><td><span class="rd">read</span><small>medoid ref</small></td><td><span class="rd">read</span><small>query kNN</small></td><td><span class="rd">read</span></td></tr>
 
       <tr class="grp"><td colspan="5">② Event log — backbone</td></tr>
-      <tr><th>events</th><td><span class="op ins">INSERT</span><small>ENCODED</small></td><td><span class="op ins">INSERT</span><small>FRAGMENTED</small></td><td><span class="op ins">INSERT</span><small>RETRIEVAL_SIGNAL</small></td><td><span class="op ins">INSERT</span><small>11 types ↓</small></td></tr>
+      <tr><th>events</th><td><span class="op ins">INSERT</span><small>ENCODED</small></td><td><span class="op ins">INSERT</span><small>FRAGMENTED</small></td><td><span class="op ins">INSERT</span><small>RETRIEVAL_SIGNAL</small></td><td><span class="op ins">INSERT</span><small>12 types ↓</small></td></tr>
 
       <tr class="grp"><td colspan="5">③ Semantic store — derived</td></tr>
       <tr><th>fragments</th><td><span class="dash">—</span></td><td><span class="op ins">INSERT</span> <span class="op upd">UPDATE</span><small>rows + reinforce strength</small></td><td><span class="rd">read</span><small>seed/assemble</small></td><td><span class="op upd">UPDATE</span><small>cluster (RECLUSTERED)</small></td></tr>
       <tr><th>claims · vec_claims</th><td><span class="dash">—</span></td><td><span class="dash">—</span></td><td><span class="rd">read</span></td><td><span class="op ins">INSERT</span> <span class="op upd">UPDATE</span> <span class="op del">DELETE</span><small>canon / strength·status / prune</small></td></tr>
       <tr><th>claim_support</th><td><span class="dash">—</span></td><td><span class="dash">—</span></td><td><span class="dash">—</span></td><td><span class="op ins">INSERT</span><small>provenance</small></td></tr>
       <tr><th>concepts · vec_concepts</th><td><span class="dash">—</span></td><td><span class="dash">—</span></td><td><span class="rd">read</span></td><td><span class="op ins">INSERT</span> <span class="op upd">UPDATE</span> <span class="op del">DELETE</span><small>create/merge/split/decay</small></td></tr>
-      <tr><th>concept_members</th><td><span class="dash">—</span></td><td><span class="dash">—</span></td><td><span class="rd">read</span></td><td><span class="op ins">INSERT</span> <span class="op del">DELETE</span><small>attach / fold / prune</small></td></tr>
-      <tr><th>relations</th><td><span class="dash">—</span></td><td><span class="dash">—</span></td><td><span class="rd">read</span><small>spreading activation</small></td><td><span class="op ins">INSERT</span><small>RELATED / BRIDGED</small></td></tr>
+      <tr><th>concept_members</th><td><span class="dash">—</span></td><td><span class="dash">—</span></td><td><span class="rd">read</span><small>primary + redundant</small></td><td><span class="op ins">INSERT</span> <span class="op del">DELETE</span><small>attach / fold / prune / channel-code</small></td></tr>
+      <tr><th>relations</th><td><span class="dash">—</span></td><td><span class="dash">—</span></td><td><span class="rd">read</span><small>spreading activation</small></td><td><span class="op ins">INSERT</span><small>RELATED</small></td></tr>
 
       <tr class="grp"><td colspan="5">④ Config &amp; bookkeeping — survives rebuild</td></tr>
       <tr><th>calibration_profiles</th><td><span class="dash">—</span></td><td><span class="rd">read</span></td><td><span class="rd">read</span></td><td><span class="op upd">WRITE</span><small>C12 fit</small></td></tr>
@@ -921,12 +939,13 @@ title = "HF-only embeddings"</div>
     <div class="ev"><div class="et">ATTACHED</div><div class="tl"><span class="op ins">INS</span> <code>concept_members</code> · <span class="op upd">UPD</span> <code>concepts.last_activity</code>,<code>vec_concepts</code></div></div>
     <div class="ev"><div class="et">MERGED</div><div class="tl"><span class="op ins">INS</span>/<span class="op del">DEL</span> <code>concept_members</code> · <span class="op upd">UPD</span> winner / <span class="op del">DEL</span> loser <code>concepts</code></div></div>
     <div class="ev"><div class="et">SPLIT</div><div class="tl"><span class="op del">DEL</span> parent + <span class="op ins">INS</span> children <code>concepts</code>,<code>concept_members</code></div></div>
-    <div class="ev"><div class="et">RELATED / BRIDGED</div><div class="tl"><span class="op ins">INS</span> <code>relations</code> (<code>bridges</code> for the latter)</div></div>
+    <div class="ev"><div class="et">RELATED</div><div class="tl"><span class="op ins">INS</span> <code>relations</code></div></div>
     <div class="ev"><div class="et">STRENGTHENED</div><div class="tl"><span class="op upd">UPD</span> <code>claims.strength</code> and/or <code>concepts.strength</code></div></div>
     <div class="ev"><div class="et">DECAYED</div><div class="tl"><span class="op upd">UPD</span> <code>concepts.state</code> (active→stale→dormant)</div></div>
     <div class="ev"><div class="et">BACKGROUNDED · C9</div><div class="tl"><span class="op upd">UPD</span> <code>claims.background</code> = 1</div></div>
     <div class="ev"><div class="et">VERSIONED · C8</div><div class="tl"><span class="op upd">UPD</span> <code>claims.status</code>,<code>version_group</code>,<code>superseded_by</code></div></div>
-    <div class="ev"><div class="et">PRUNED · C7</div><div class="tl"><span class="op del">DEL</span> <code>concept_members</code>; if orphaned <span class="op del">DEL</span> <code>claims</code></div></div>
+    <div class="ev"><div class="et">PRUNED · C7</div><div class="tl"><span class="op del">DEL</span> <code>concept_members</code>; if no <em>primary</em> home left <span class="op del">DEL</span> <code>claims</code></div></div>
+    <div class="ev"><div class="et">CHANNEL_REDUNDANCY · 6c</div><div class="tl"><span class="op del">DEL</span> all <code>kind='redundant'</code> + <span class="op ins">INS</span> the new set into <code>concept_members</code> (replace-whole → idempotent)</div></div>
     <div class="ev"><div class="et">RECLUSTERED · C12</div><div class="tl"><span class="op upd">UPD</span> <code>fragments.cluster</code> → nearest concept</div></div>
     <div class="ev"><div class="et">FRAGMENTED</div><div class="tl">re-applied on rebuild → <code>write.apply_fragmented()</code> (see flow ①)</div></div>
     <div class="ev"><div class="et">ENCODED · INTEGRITY_FLAGGED</div><div class="tl">log-only — nothing materialized (episodic-side / review signal)</div></div>
@@ -936,7 +955,7 @@ title = "HF-only embeddings"</div>
 <div class="note">
   Generated from the <code>v3-changes</code> branch · <code>core/encode.py</code>, <code>write.py</code>, <code>predict.py</code>, <code>resonance.py</code>, <code>retrieve.py</code>, <code>assembly.py</code>, <code>consolidate.py</code>.
   Route legend: <span class="badge b-pred">PREDICTED</span> reinforce · <span class="badge b-amb">AMBIGUOUS</span> store + NLI direction · <span class="badge b-nov">NOVEL</span> store · <span class="badge b-con">CONTRADICT</span> held strong.
-  <br><b>Model-call legend:</b> <b>NLI</b> = discriminative stance check (write-time direction, encode-time contradiction) · <b>LLM</b> = generative call, reserved for consolidation (claim dedup, concept pass, bridges).
+  <br><b>Model-call legend:</b> <b>NLI</b> = discriminative stance check (write-time direction, encode-time contradiction) · <b>LLM</b> = generative call, reserved for consolidation (claim dedup, concept pass).
 </div>
 </div>
 

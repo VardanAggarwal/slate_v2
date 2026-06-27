@@ -51,7 +51,7 @@ AMBIGUOUS route.
 
 ---
 
-## CONSOLIDATE — 13 of 14 active in a run
+## CONSOLIDATE — 13 of 14 PRD steps active in a run, + the channel-code redundancy add-on (6c)
 
 Offline batch (CLI `consolidate` / nightly cron). Since **P6** (`5592016`) it **mints claims
 from the fragment layer** (`blueprint_from_fragments`, `consolidate.py:362` → returns the same
@@ -71,7 +71,7 @@ Reached in `consolidate()`'s main loop, in order:
 | C2 | Dedup claims | predictor-only: `measure()`/`decide()` vs neighbourhood, uncertain→NEW (`canon_llm=False`); CANON_* only when cold | `_dedup_route:397` · `_canonicalize:1163` |
 | C3 | Concept membership | spread-relative z gate (≤ `CONCEPT_MEMBERSHIP_Z`), cosine fallback | `_membership_z:610` · `_concept_pass:1171` |
 | C4 | Split / re-anchor | bimodal spread flags SPLIT candidates; LLM decides | `_spread_is_bimodal` · `_concept_geometry:626` |
-| C5 | Relations & bridges | residual band → bridge candidates; LLM confirms | `_relations:1174` · `_bridges:1185` |
+| C5 | Relations | spine/contradiction relations from blueprints; LLM confirms. **Latent bridges REMOVED 2026-06-27** (generation + `BRIDGE_BOOST` retrieval weight) — proven retrieval-inert at B and 2B, concept- and claim-edge level. | `_relations:1174` |
 | C6 | Merge safely | `guard.merge` partitions loser into FOLD vs KEEP at the merge | `guard.merge:725` |
 | C7 | Forget / prune | dormant concepts only; leave-one-out drops reconstructable members | `_prune_safely:1090` |
 | C8 | Reconcile & version | `contradiction_pairs` → supersede/scope/version; margin-before-flip | `_reconcile:1177` · `_resolve_conflict:790` |
@@ -79,8 +79,21 @@ Reached in `consolidate()`'s main loop, in order:
 | C10 | Integrity check | claim vs source episode; ungrounded → `INTEGRITY_FLAGGED` (log-only) | `_check_integrity:1179` |
 | C11 | Cold-start fallback | `CANON_*` cosine path when a neighbourhood ≤ `SPAN_K` | `_dedup_route:435` |
 | C13 | Consume retrieval signals | active — now fed by the live fragment path's R8 (committed in MCP) | `_consume_retrieval_signals:1040` |
+| 6b | Re-anchor (contrastive) | end-of-run: each concept vector → the member central to self AND distinct from neighbours (`argmax r_nbr−λ·r_own`) | `_reanchor_concepts:1079` |
+| 6c | Channel-code redundancy | scarce coverage-hole parity attaches: reachable (cos≥0.55) ∧ unreconstructable (recon-z∈[1,3]), top-budget by `cos·z`, written `kind='redundant'` | `_channel_holes:1144` · `_channel_redundancy:1218` |
 
 **In a normal run (added):**
+
+- **6c — channel-code redundancy (shipped 2026-06-27, flag `CHANNEL_REDUNDANCY`).** After the
+  centres settle (6b), `_channel_redundancy` adds ~33 scarce redundant `concept_members`
+  (`kind='redundant'`) that patch coverage holes — a query landing on concept *k* can then recover
+  a claim homed elsewhere that *k* couldn't reconstruct. Emitted as one `CHANNEL_REDUNDANCY` event
+  (replace-whole → idempotent, rebuild-reproducible, rollback-reversible). Redundant rows feed
+  **retrieval** (activation spread + concept enumeration) but every centre/baseline/membership read
+  is **primary-only**, so they never corrupt the concept vector or drift across runs. Net effect:
+  paragraph Coverage@B 0.78→0.89 (38q), narrow/broad held, no partition collapse; 220/220 tests
+  pass. Validation harness: `scratchpad/verify_channel_prod.py`. Not yet backfilled onto live
+  `engine.db` (affects future runs only).
 
 - **C12 — fit baselines + push down.** `_fit_baselines` runs at the end of `consolidate()`:
   re-clusters every fragment onto its nearest consolidated concept (`RECLUSTERED` event →

@@ -262,7 +262,7 @@ def fragment_recall(conn, user_id: str, query: str, *, seed_k: int = SEED_K,
         if kept:
             cand = kept
 
-    # Graph-reached candidates (the bridge-walk): union AFTER the relevance filter so
+    # Graph-reached candidates (the graph-walk): union AFTER the relevance filter so
     # they survive it — they were chosen by GRAPH connectivity, not query cosine, and
     # are exactly the lexically-distant notes the query knn under-ranks (R0 fix). Dedup
     # by frag_id, keep the higher similarity.

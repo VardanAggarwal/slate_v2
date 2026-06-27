@@ -56,7 +56,7 @@ def recall(conn, user_id: str, query: str, k: int = 8) -> list[dict]:
     # Score the brightest nodes (by navigation salience) with why-now signals.
     # Pre-trim to a bounded pool so _score_node's per-node SQL stays cheap on a wide
     # field. via = "seed" (direct hit, no tag) vs "spread" (reached by a hop → the
-    # "2-hop" non-obvious signal); bridge-bearing concepts are flagged 🌉 in _score_node.
+    # "2-hop" non-obvious signal).
     ranked = sorted(nodes.items(), key=lambda kv: -kv[1]["salience"])
     results = []
     for node, sc in ranked[:SCORE_POOL]:
@@ -71,7 +71,7 @@ def recall(conn, user_id: str, query: str, k: int = 8) -> list[dict]:
 def _score_node(conn, user_id: str, node: str, activation: float, via: str) -> dict | None:
     signals = []
     if via != "seed":
-        signals.append("2-hop" if not via.startswith("bridge:") else "🌉 via bridge")
+        signals.append("2-hop")
 
     if node.startswith("clm_"):
         c = store.get_claim(conn, user_id, node)
@@ -110,12 +110,6 @@ def _score_node(conn, user_id: str, node: str, activation: float, via: str) -> d
             return None
         state_mult = config.HEALTH_SCORES.get(c["state"], 1.0)
         score = activation * state_mult
-        has_bridge = conn.execute(
-            """SELECT 1 FROM relations WHERE relation = 'bridges'
-               AND (from_id = ? OR to_id = ?) AND user_id = ? LIMIT 1""",
-            (node, node, user_id)).fetchone()
-        if has_bridge:
-            signals.append("🌉 bridged")
         gap = _days_since(c["last_activity"])
         if gap >= TIME_GAP_DAYS:
             signals.append(f"🕰️ dormant {gap}d")

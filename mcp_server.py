@@ -313,9 +313,9 @@ def recall(query: str, k: int = 8) -> list[dict]:
     Also for: "what do I think about X?", "have I written about X?".
 
     Returns compact headlines (~50 tokens each): claims and concepts ranked by
-    graph navigation, with why-now signals (🌉 bridged concepts, 🔁 recurring
-    claims, 🕰️ long-dormant thinking resurfacing, 2-hop = non-obvious
-    connection). Escalate with assemble_context or get_concept when a hit
+    graph navigation, with why-now signals (🔁 recurring claims, 🕰️ long-dormant
+    thinking resurfacing, 2-hop = non-obvious connection). Escalate with
+    assemble_context or get_concept when a hit
     deserves the full picture. After you use the results, mark_relevance() tells
     Slate which ones helped.
     """
@@ -401,7 +401,7 @@ def list_recent_notes(limit: int = 10) -> list[dict]:
 def get_concept(concept_id: str) -> dict:
     """Fetch one concept in full: label, canonical description, state/strength,
     member claims with provenance (episodes + verbatim sentences), and its
-    relations including bridges. Use after recall surfaces a concept hit."""
+    relations. Use after recall surfaces a concept hit."""
     from core.recall import get_concept as _gc
     result = _gc(_conn(), _user_id(), concept_id)
     if not result:
@@ -412,7 +412,7 @@ def get_concept(concept_id: str) -> dict:
 @mcp.tool
 def timeline(concept_id: str, limit: int = 50) -> list[dict]:
     """How the user's thinking on a concept evolved: every consolidation event
-    that touched it (created, claims attached, merged, split, bridged, decayed),
+    that touched it (created, claims attached, merged, split, decayed),
     oldest first. Use for "how did my thinking on X change?"."""
     conn = _conn()
     rows = conn.execute(
@@ -432,7 +432,7 @@ def timeline(concept_id: str, limit: int = 50) -> list[dict]:
 
 @mcp.tool
 def digest(since_hours: int = 36) -> str:
-    """What emerged from recent consolidation: new bridges, contradictions,
+    """What emerged from recent consolidation: contradictions,
     strengthened claims, concepts going dormant. Call when the user asks
     "what's new in my notes?" or each morning. Markdown, ready to relay."""
     from core.digest import digest as _digest
@@ -454,21 +454,12 @@ def reconstruct_note(episode_id: str) -> dict:
 @mcp.tool
 def synthesize(concept_a: str, concept_b: str) -> dict:
     """Draft a NEW short document from the intersection of two concepts —
-    Slate's 'create new docs from emerging learnings'. Best on bridged pairs
-    (see list_bridges); uses the stored bridge rationale automatically."""
+    Slate's 'create new docs from emerging learnings'. Pass two concept ids."""
     from core.reconstruct import synthesize as _syn
     try:
         return _syn(_conn(), _user_id(), concept_a, concept_b)
     except ValueError as e:
         raise ToolError(str(e))
-
-
-@mcp.tool
-def list_bridges(limit: int = 20) -> list[dict]:
-    """List discovered bridges between concept pairs (newest first) — the
-    non-obvious connections consolidation surfaced. Entry point for synthesize."""
-    from core.reconstruct import bridges
-    return bridges(_conn(), _user_id(), limit=limit)
 
 
 @mcp.tool

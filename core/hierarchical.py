@@ -62,8 +62,8 @@ NUANCE_VALUE_FLOOR = 0.25
 # (drops the frame's own instances). OFF by default — the frame carries breadth; the
 # assembly's own dedup against CHOSEN fragments is enough to avoid intra-nuance repeats.
 SUPPRESS_BACKGROUND = False
-# Bridge-walk (replaces recall.py's SPREAD_*/MIN_ACTIVATION fixed-decay graph walk):
-# from the seed concepts, hop one step over the concept/bridge graph and ADD a
+# Graph-walk (replaces recall.py's SPREAD_*/MIN_ACTIVATION fixed-decay graph walk):
+# from the seed concepts, hop one step over the concept relation graph and ADD a
 # neighbour only when it is BOTH well-connected (edge weight) AND novel vs the
 # background already selected (residual-VOI — not fixed decay). Its fragments enter
 # the nuance seed even though the query knn under-ranked them (R0 fix for lexically-
@@ -96,7 +96,7 @@ DEFAULT_CALIBRATION = {"seed_concepts": SEED_CONCEPTS,
                        # so diversity operates within the on-topic set (kills the
                        # broad-query over-injection). Spread-relative; calibration-owned.
                        "rel_keep_frac": 0.5,
-                       # bridge-walk knobs (residual-VOI graph hop; retires SPREAD_*)
+                       # graph-walk knobs (residual-VOI graph hop; retires SPREAD_*)
                        "walk_concepts": WALK_CONCEPTS,
                        "walk_max_expand": WALK_MAX_EXPAND,
                        "walk_voi_floor": WALK_VOI_FLOOR,
@@ -153,9 +153,9 @@ def _concept_members(conn, user_id: str, concept_id: str, n: int) -> list[dict]:
 
 def _walk_expand(conn, user_id: str, seed_bg: list[dict], q_emb, *,
                  calibration: dict) -> list[dict]:
-    """Residual-VOI bridge-walk — the predictor-native replacement for SPREAD_*.
+    """Residual-VOI graph-walk — the predictor-native replacement for SPREAD_*.
 
-    One hop from the seed concepts over the concept/bridge graph. A neighbour is
+    One hop from the seed concepts over the concept relation graph. A neighbour is
     ADDED only when `edge_score × novelty` clears the VOI floor, where novelty is the
     neighbour centroid's residual against the already-selected background — so a
     strongly-connected but REDUNDANT neighbour is skipped (the fixed-decay walk could
@@ -192,8 +192,7 @@ def _walk_expand(conn, user_id: str, seed_bg: list[dict], q_emb, *,
         frs.sort(key=lambda f: -f["similarity"])
         added.append({"id": nb["concept_id"], "label": c["label"],
                       "canonical": c["canonical"] or "", "state": c["state"],
-                      "similarity": None, "via": nb["relation"],
-                      "bridge": nb["bridge"], "claims": [],
+                      "similarity": None, "via": nb["relation"], "claims": [],
                       "embedding": emb, "frags": frs[:n_frags]})
         selected.append(emb)
     return added
@@ -211,7 +210,7 @@ def hierarchical_recall(conn, user_id: str, query: str, *,
         conn, {**retrieve.DEFAULT_CALIBRATION, **DEFAULT_CALIBRATION}, user_id)
     q_emb = retrieve._embed_query(query)
     bg = _background_concepts(conn, user_id, q_emb, calibration=calibration)
-    # Bridge-walk: expand the background along the concept graph (residual-VOI). The
+    # Graph-walk: expand the background along the concept graph (residual-VOI). The
     # reached concepts enrich the frame AND inject their fragments into the nuance seed
     # — the lexically-distant notes the query knn missed (R0 fix).
     walked = _walk_expand(conn, user_id, bg, q_emb, calibration=calibration)
@@ -265,11 +264,10 @@ def hierarchical_context(conn, user_id: str, topic: str, max_chars: int = 6000, 
                 used += len(row) + 1
             if stop:
                 break
-        # bridged concepts reached by the walk — the non-obvious cross-theme links
+        # concepts reached by the walk — the non-obvious cross-theme links
         for w in walked:
             if w.get("canonical"):
-                tag = "🌉 " if w.get("bridge") else ""
-                row = f"- {tag}**{w['label']}** — {w['canonical']}"
+                row = f"- **{w['label']}** — {w['canonical']}"
                 if used + len(row) <= bg_budget:
                     frame.append(row)
                     used += len(row) + 1

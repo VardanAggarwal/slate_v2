@@ -1,8 +1,8 @@
 """Resonance retrieve — navigation by activation over the consolidated graph.
 
 The critical-note path (docs/retrieve-resonance-design.md). Retrieval-only: reads
-the graph consolidation already builds (claims/concepts + membership + relations/
-bridges) and changes nothing upstream. It is the concept path's (`recall.recall`)
+the graph consolidation already builds (claims/concepts + membership +
+relations) and changes nothing upstream. It is the concept path's (`recall.recall`)
 successor, fixing its three structural gaps:
 
   1. CONFLUENCE — a query is decomposed into probes; each probe lights up the graph
@@ -62,7 +62,6 @@ VOI_EPS = 0.05          # stop a hop when new salience < eps × salience-so-far
 # ── Scoring ───────────────────────────────────────────────────────────────────
 DIST_GAMMA = 0.5        # distinctiveness = 1/(1+ln(1+degree))**gamma  (denoiser #3)
 MEMBERSHIP_W = 1.0      # claim↔concept edge weight (PE conductance does the gating)
-BRIDGE_BOOST = 1.3      # a 'bridges' relation is the non-obvious cross-theme link
 
 # ── Materialise ───────────────────────────────────────────────────────────────
 MATERIALIZE_NODES = 12  # how many bright nodes to pull verbatim fragments from
@@ -192,7 +191,7 @@ class _Graph:
                 """SELECT from_id, to_id, relation, weight FROM relations
                    WHERE user_id=? AND (from_id=? OR to_id=?)""", (uid, node, node)):
             other = r["to_id"] if r["from_id"] == node else r["from_id"]
-            w = min(1.0, r["weight"] or 1.0) * (BRIDGE_BOOST if r["relation"] == "bridges" else 1.0)
+            w = min(1.0, r["weight"] or 1.0)
             edges[other] = max(edges.get(other, 0), w)
         self._deg[node] = len(edges)
         adj = sorted(edges.items(), key=lambda kv: -kv[1])[:NEIGHBOR_CAP]

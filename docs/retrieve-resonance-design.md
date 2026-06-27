@@ -28,8 +28,8 @@ Two mechanisms the current `recall.py` is missing and this path adds:
 - **L2 claims** (distilled) — `clm_`, `claim_support`, `claims_for_episode`.
 - **L3 concepts** (clusters w/ medoids) — `cpt_`, `concept_members`.
 - **Edges** — `relations(from,to,relation,weight)`: leads_to / supports /
-  contradicts / **bridges**; plus membership (claim↔concept) and provenance
-  (fragment↔episode↔claim).
+  contradicts; plus membership (claim↔concept) and provenance
+  (fragment↔episode↔claim). (Latent `bridges` removed 2026-06-27 — retrieval-inert.)
 
 Navigation happens on L2+L3 (the indexed layer); the answer is *materialised* from
 L1 (verbatim, for fidelity).
@@ -127,7 +127,7 @@ Emit R8 (`record_retrieval_signal`) with lit / dropped / confluence per node, fr
 
 | Reuse (unchanged) | New (retrieval-side only) |
 |---|---|
-| graph: concepts/claims/members/relations/bridges | per-probe activation map (sum + confluence) |
+| graph: concepts/claims/members/relations | per-probe activation map (sum + confluence) |
 | `knn_claims` / `knn_concepts` seeders | fan-out-normalised, PE-gated spread |
 | `predict.residuals_against` (conductance, distinctiveness) | VOI frontier stop |
 | `baselines` table (distinctiveness prior) | bright-node → fragment materialisation |
@@ -144,7 +144,7 @@ No consolidation, Write, or schema change. It runs on today's DB.
 | concept | cosine knn | fixed 2-hop, `max`, `SPREAD_*` | activation·strength | distilled (lossy) |
 | fragment | cosine knn | none (flat pool) | max-marginal-residual | verbatim |
 | hybrid | both | concept leg only | two readers concat | mixed |
-| hierarchical | concept frame + frag | OFF bridge-walk | frame + VOI nuance | mixed |
+| hierarchical | concept frame + frag | OFF graph-walk | frame + VOI nuance | mixed |
 | **resonance** | **per-probe multi-source** | **summed, PE-gated, VOI-stopped hops** | **Strength·Confluence·Distinctiveness** | **verbatim (materialised from bright nodes)** |
 
 It is the concept path's successor: same graph, but **sum not max**, **PE-gated not

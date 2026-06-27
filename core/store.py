@@ -129,6 +129,7 @@ CREATE TABLE IF NOT EXISTS concept_members (
     user_id    TEXT NOT NULL,
     claim_id   TEXT NOT NULL,
     weight     REAL DEFAULT 1.0,
+    kind       TEXT DEFAULT 'primary',   -- 'primary' | 'redundant' (channel-code attach)
     PRIMARY KEY (concept_id, claim_id)
 );
 
@@ -184,7 +185,7 @@ CREATE TABLE IF NOT EXISTS relations (
     from_id             TEXT NOT NULL,      -- claim or concept id
     to_id               TEXT NOT NULL,
     user_id             TEXT NOT NULL,
-    relation            TEXT NOT NULL,      -- 'leads_to'|'contradicts'|'supports'|'bridges'|...
+    relation            TEXT NOT NULL,      -- 'leads_to'|'contradicts'|'supports'|...
     weight              REAL DEFAULT 1.0,
     created_at          TEXT,
     evidence_episode_id TEXT,
@@ -198,7 +199,7 @@ CREATE TABLE IF NOT EXISTS events (
     ts           TEXT NOT NULL,
     run_id       TEXT,
     type         TEXT NOT NULL,             -- ENCODED|FRAGMENTED|CANONICALIZED|CONCEPT_CREATED|
-                                            -- MERGED|SPLIT|BRIDGED|RELATED|DECAYED|STRENGTHENED
+                                            -- MERGED|SPLIT|RELATED|DECAYED|STRENGTHENED
     payload_json TEXT NOT NULL
 );
 
@@ -348,7 +349,12 @@ def connect(db_path: str | Path | None = None) -> sqlite3.Connection:
 _ADD_COLUMNS = {"fragments": {"cluster": "TEXT", "medoid_idx": "INTEGER"},
                 "claims": {"status": "TEXT DEFAULT 'current'", "superseded_by": "TEXT",
                            "qualifier": "TEXT", "version_group": "TEXT",
-                           "background": "INTEGER DEFAULT 0"}}
+                           "background": "INTEGER DEFAULT 0"},
+                # 'primary' = the LLM-decided home; 'redundant' = a channel-code
+                # coverage-hole attach (Consolidate step 6c). Redundant rows feed
+                # retrieval spread/materialize but are excluded from center/baseline
+                # computation, so they never corrupt the concept vector.
+                "concept_members": {"kind": "TEXT DEFAULT 'primary'"}}
 
 
 def _migrate_add_columns(conn: sqlite3.Connection) -> None:
@@ -714,10 +720,9 @@ def concept_embedding(conn: sqlite3.Connection, user_id: str, concept_id: str):
 def related_concepts(conn: sqlite3.Connection, user_id: str,
                      concept_ids: list[str]) -> list[dict]:
     """Concept→concept graph neighbours of `concept_ids` via the relations table —
-    the substrate the residual-VOI bridge-walk hops over (replacing recall.py's
-    fixed-decay spreading activation). Returns {concept_id, relation, weight, bridge}
-    for each edge whose OTHER endpoint is a concept not already in the seed set.
-    `bridge` flags a non-obvious link (relation == 'bridges')."""
+    the substrate the residual-VOI graph-walk hops over (replacing recall.py's
+    fixed-decay spreading activation). Returns {concept_id, relation, weight,
+    edge_score} for each edge whose OTHER endpoint is a concept not in the seed set."""
     if not concept_ids:
         return []
     seed = set(concept_ids)
@@ -732,14 +737,12 @@ def related_concepts(conn: sqlite3.Connection, user_id: str,
         if not other.startswith("cpt_") or other in seed:
             continue
         w = min(1.0, r["weight"] or 1.0)
-        bridge = r["relation"] == "bridges"
-        # a bridge counts for more — it's the non-obvious cross-theme link
-        score = w * (1.3 if bridge else 1.0)
+        score = w
         if other not in best or score > best[other][0]:
-            best[other] = (score, r["relation"], w, bridge)
-    for cid, (score, rel, w, bridge) in best.items():
+            best[other] = (score, r["relation"], w)
+    for cid, (score, rel, w) in best.items():
         out.append({"concept_id": cid, "relation": rel, "weight": w,
-                    "bridge": bridge, "edge_score": round(score, 4)})
+                    "edge_score": round(score, 4)})
     out.sort(key=lambda d: -d["edge_score"])
     return out
 
@@ -748,7 +751,7 @@ def fragments_for_episodes(conn: sqlite3.Connection, user_id: str,
                            episode_ids: list[str], embedding) -> list[dict]:
     """Fragments belonging to the given episodes, shaped like `fragment_candidates`
     (with medoid embedding + provenance + cosine `similarity` to `embedding`). Lets
-    the bridge-walk inject fragments from graph-reached notes the query knn missed —
+    the graph-walk inject fragments from graph-reached notes the query knn missed —
     the R0 fix: a topically-linked but lexically-distant note becomes reachable."""
     if not episode_ids:
         return []
@@ -791,8 +794,13 @@ def concept_episode_ids(conn: sqlite3.Connection, user_id: str,
 
 
 def claim_in_any_concept(conn: sqlite3.Connection, user_id: str, claim_id: str) -> bool:
+    """Does the claim have a HOME concept? PRIMARY membership only — a channel-code
+    'redundant' attach is a parity bit, not a home (and is wiped/recomputed each run),
+    so it must not keep an otherwise-homeless claim alive (C7 prune) or pass the
+    'has a theme to fold into' guard (C9 demote). Mirrors _claim_concept's filter."""
     return conn.execute(
-        "SELECT 1 FROM concept_members WHERE claim_id = ? AND user_id = ? LIMIT 1",
+        "SELECT 1 FROM concept_members WHERE claim_id = ? AND user_id = ? "
+        "AND kind = 'primary' LIMIT 1",
         (claim_id, user_id)).fetchone() is not None
 
 
@@ -942,11 +950,32 @@ def delete_concept(conn: sqlite3.Connection, user_id: str, concept_id: str) -> N
 
 
 def add_concept_member(conn: sqlite3.Connection, user_id: str, concept_id: str,
-                       claim_id: str, weight: float = 1.0) -> None:
+                       claim_id: str, weight: float = 1.0, kind: str = "primary") -> None:
     conn.execute(
-        """INSERT INTO concept_members (concept_id, user_id, claim_id, weight)
-           VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING""",
-        (concept_id, user_id, claim_id, weight))
+        """INSERT INTO concept_members (concept_id, user_id, claim_id, weight, kind)
+           VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING""",
+        (concept_id, user_id, claim_id, weight, kind))
+
+
+def set_channel_redundancy(conn: sqlite3.Connection, user_id: str,
+                           pairs: dict) -> int:
+    """Replace ALL of a user's redundant memberships with `pairs`
+    ({claim_id: [concept_id, ...]}). Idempotent — clears prior kind='redundant' rows
+    then inserts the fresh set, so re-running consolidation never accumulates stale
+    attaches. Primary rows are untouched; a (concept, claim) that is already a primary
+    member stays primary (PK conflict → no-op). Applier for the CHANNEL_REDUNDANCY
+    event; rebuild() replays it, the last event's set winning."""
+    conn.execute("DELETE FROM concept_members WHERE user_id = ? AND kind = 'redundant'",
+                 (user_id,))
+    n = 0
+    for claim_id, concept_ids in pairs.items():
+        for concept_id in concept_ids:
+            conn.execute(
+                """INSERT INTO concept_members (concept_id, user_id, claim_id, weight, kind)
+                   VALUES (?, ?, ?, 1.0, 'redundant') ON CONFLICT DO NOTHING""",
+                (concept_id, user_id, claim_id))
+            n += 1
+    return n
 
 
 def remove_concept_member(conn: sqlite3.Connection, user_id: str, concept_id: str,
@@ -956,10 +985,16 @@ def remove_concept_member(conn: sqlite3.Connection, user_id: str, concept_id: st
         (concept_id, claim_id, user_id))
 
 
-def concept_member_ids(conn: sqlite3.Connection, user_id: str, concept_id: str) -> list[str]:
-    return [r["claim_id"] for r in conn.execute(
-        "SELECT claim_id FROM concept_members WHERE concept_id = ? AND user_id = ? ORDER BY claim_id",
-        (concept_id, user_id))]
+def concept_member_ids(conn: sqlite3.Connection, user_id: str, concept_id: str,
+                       primary_only: bool = False) -> list[str]:
+    """Member claim ids of a concept. Retrieval reads ALL members (primary +
+    redundant — redundancy is the point). Center/baseline computation passes
+    primary_only=True so channel-code redundant attaches never move the concept vector."""
+    q = "SELECT claim_id FROM concept_members WHERE concept_id = ? AND user_id = ?"
+    if primary_only:
+        q += " AND kind = 'primary'"
+    q += " ORDER BY claim_id"
+    return [r["claim_id"] for r in conn.execute(q, (concept_id, user_id))]
 
 
 def get_concept(conn: sqlite3.Connection, user_id: str, concept_id: str) -> sqlite3.Row | None:
@@ -1001,9 +1036,10 @@ def recompute_concept_embedding(conn: sqlite3.Connection, user_id: str,
     concept toward the same point, so the concept layer ends up LESS separable than
     the claims. The medoid is a real member vector, on-manifold, so concepts keep
     their natural spread (the de-collapse the consolidation layer is for).
-    Deterministic (argmax over stored vectors), so event-log rebuild reproduces it."""
+    Deterministic (argmax over stored vectors), so event-log rebuild reproduces it.
+    PRIMARY members only — channel-code redundant attaches must not pull the medoid."""
     import numpy as np
-    members = concept_member_ids(conn, user_id, concept_id)
+    members = concept_member_ids(conn, user_id, concept_id, primary_only=True)
     vecs = [claim_embedding(conn, user_id, c) for c in members]
     vecs = [v for v in vecs if v is not None]
     conn.execute("DELETE FROM vec_concepts WHERE concept_id = ?", (concept_id,))

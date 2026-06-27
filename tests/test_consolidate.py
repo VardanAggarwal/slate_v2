@@ -28,7 +28,7 @@ def _seed(conn, uid, text, source="test", title=None):
 @pytest.fixture
 def fake_llm(monkeypatch):
     """Deterministic stand-in for core.llm.call keyed off each prompt's header."""
-    calls = {"blueprint": 0, "canon": 0, "concept": 0, "bridge": 0}
+    calls = {"blueprint": 0, "canon": 0, "concept": 0}
 
     def fake_call(prompt, tier="mechanical", max_tokens=2048, system=None, json_out=True):
         base = {"text": "", "provider": "fake", "model": "fake",
@@ -56,9 +56,6 @@ def fake_llm(monkeypatch):
                 "action": "CREATE", "label": "test concept",
                 "canonical": "claims grouped by the fake llm",
                 "claim_ids": [c["id"] for c in new_claims]}]}}
-        if "drifted near each other" in prompt:
-            calls["bridge"] += 1
-            return {**base, "json": {"bridge": False, "rationale": ""}}
         raise AssertionError(f"unexpected prompt: {prompt[:80]}")
 
     monkeypatch.setattr("core.llm.call", fake_call)
@@ -967,26 +964,6 @@ def test_c4_medoid_is_a_central_member():
     # the medoid is one of the tight members, never the outlier
     assert not np.array_equal(med, V[-1])
     assert float(med @ outlier) < float(med @ V[0])
-
-
-# ── C5: bridge residual band — related→bridge, near-dup/unrelated→no ──────────
-def test_c5_bridge_residual_band():
-    a = _topic(7)
-    region_a = np.vstack([_near(a, 700 + i) for i in range(6)])
-
-    # near-duplicate concept: medoid ~ inside region_a → residual below band
-    dup_medoid = _near(a, 700, noise=0.01)
-    r_dup = float(predict.residuals_against(dup_medoid, region_a)[0])
-    assert r_dup < Cmod.BRIDGE_RES_LOW
-
-    # unrelated concept: orthogonal medoid → residual above band
-    r_far = float(predict.residuals_against(_topic(770), region_a)[0])
-    assert r_far > Cmod.BRIDGE_RES_HIGH
-
-    # related-but-distinct: partial overlap → residual inside the band
-    related = _unit(0.5 * a + 0.5 * _topic(771))
-    r_rel = float(predict.residuals_against(related, region_a)[0])
-    assert Cmod.BRIDGE_RES_LOW <= r_rel <= Cmod.BRIDGE_RES_HIGH
 
 
 # ── C12: re-cluster fragments onto concepts + push baselines down ─────────────

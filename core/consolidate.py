@@ -1,4 +1,4 @@
-"""Nightly sleep phase: blueprint extraction, claim canonicalization, concept merge/split/create, latent bridges, decay/strengthen. Sole writer to the semantic store, only via events. Batch API. See PLAN.md §5.
+"""Nightly sleep phase: blueprint extraction, claim canonicalization, concept merge/split/create, decay/strengthen. Sole writer to the semantic store, only via events. Batch API. See PLAN.md §5.
 
 Every decision is emitted as an event and then applied by the matching
 applier in this module; `rebuild()` truncates the semantic tables and
@@ -48,12 +48,6 @@ CANON_LLM_BAND = 0.75    # [band, auto) : ask the LLM; below: new claim
 DEDUP_Z_ECHO = 1.0
 DEDUP_CALIBRATION = {"z_echo": DEDUP_Z_ECHO, "prox_margin": predict.PROX_MARGIN,
                      "per_cluster": {}, "canon_llm": False}
-
-# Bridge candidate band — C5 now a medoid-vs-region RESIDUAL band (predictor
-# spine), not a centroid cosine: close enough to relate (residual not too high),
-# enough residual that the link is non-obvious (not a near-duplicate concept).
-BRIDGE_RES_LOW, BRIDGE_RES_HIGH = 0.40, 0.85
-BRIDGE_MAX_VERIFY = 5
 
 CANON_CHUNK = 20         # uncertain pairs per LLM call
 CONCEPT_CHUNK = 30       # new claims per concept-pass call (keeps JSON within budget)
@@ -121,17 +115,6 @@ NEW CLAIMS:
 
 EXISTING CONCEPTS (nearest first):
 {concepts}
-"""
-
-PROMPT_BRIDGE = """Two concepts from a personal knowledge base drifted near each other in meaning, but no note connects them yet. Decide whether there is a real, non-obvious intellectual connection worth surfacing to the author.
-
-Concept A: {a_label} — {a_canonical}
-Sample claims: {a_claims}
-
-Concept B: {b_label} — {b_canonical}
-Sample claims: {b_claims}
-
-Return ONLY valid JSON: {{"bridge": true|false, "rationale": "one sentence naming the connection (empty if false)"}}
 """
 
 
@@ -212,11 +195,6 @@ def apply_event(conn, user_id: str, type_: str, payload: dict) -> None:
                               p.get("weight", 1.0), p["ts"],
                               p.get("evidence_episode_id"))
 
-    elif type_ == "BRIDGED":
-        store.insert_relation(conn, user_id, p["a"], p["b"], "bridges",
-                              p.get("score", 1.0), p["ts"],
-                              p.get("evidence_episode_id"))
-
     elif type_ == "STRENGTHENED":
         if p.get("claim_id"):
             store.bump_claim_strength(conn, user_id, p["claim_id"], p["ts"], p["delta"])
@@ -277,6 +255,12 @@ def apply_event(conn, user_id: str, type_: str, payload: dict) -> None:
         # (embeddings recomputed from the fragment text, like CANONICALIZED claims).
         from core import write
         write.apply_fragmented(conn, user_id, p)
+
+    elif type_ == "CHANNEL_REDUNDANCY":
+        # Step 6c — replace all of this user's redundant (channel-code) memberships
+        # with the event's set. Idempotent; on rebuild the last such event wins, and a
+        # rolled-back run's event is excluded → its redundant attaches vanish.
+        store.set_channel_redundancy(conn, user_id, p["pairs"])
 
     elif type_ == "RECLUSTERED":
         # C12 — fragment regions reassigned to their nearest consolidated concept.
@@ -516,7 +500,7 @@ def _dedup_route(conn, user_id: str, raw_claims: list[dict], embs,
         # the predictor still routes below; an absent prior leaves this loop unchanged.
         prior_cid = _anchor_concept_prior(conn, user_id, episode_id, emb)
         seen = {h["claim_id"] for h in hits}
-        extra = ([cid for cid in store.concept_member_ids(conn, user_id, prior_cid)
+        extra = ([cid for cid in store.concept_member_ids(conn, user_id, prior_cid, primary_only=True)
                   if cid not in seen] if prior_cid else [])
         if not hits and not extra:
             decided.append((c, "new", None))
@@ -671,7 +655,7 @@ def _concept_geometry(conn, user_id: str, concept_id: str) -> dict:
     neutral defaults."""
     import numpy as np
     rows = _members_with_emb(conn, user_id,
-                             store.concept_member_ids(conn, user_id, concept_id))
+                             store.concept_member_ids(conn, user_id, concept_id, primary_only=True))
     if not rows:
         return {"representative": "", "shape": "cohesive"}
     V = np.vstack([r["embedding"] for r in rows])
@@ -710,7 +694,7 @@ def _membership_z(conn, user_id: str, emb, claim_text: str,
     cluster (measure() nearest-cluster). None when the concept is too thin for a
     spread estimate (caller falls back to cosine)."""
     rows = _members_with_emb(conn, user_id,
-                             store.concept_member_ids(conn, user_id, concept_id))
+                             store.concept_member_ids(conn, user_id, concept_id, primary_only=True))
     if len(rows) <= predict.SPAN_K:
         return None
     corpus = [{**r, "cluster": concept_id} for r in rows]
@@ -751,7 +735,7 @@ def _concept_pass_chunk(conn, user_id: str, run_id: str, new_claim_ids: list[str
 
     concepts_ctx = []
     for c in nearby.values():
-        member_ids = store.concept_member_ids(conn, user_id, c["id"])[:CONCEPT_CONTEXT_MEMBERS]
+        member_ids = store.concept_member_ids(conn, user_id, c["id"], primary_only=True)[:CONCEPT_CONTEXT_MEMBERS]
         members = [{"id": m, "text": (store.get_claim(conn, user_id, m) or {"text": ""})["text"]}
                    for m in member_ids]
         # C4 spread test: a measure()-based geometric read of the concept, surfaced
@@ -811,7 +795,7 @@ def _apply_concept_decisions(conn, user_id, run_id, decisions, valid_claims,
                     "winner_snapshot": _snapshot(conn, user_id, w),
                     "loser_snapshot": loser_snap, "ts": ts})
         elif action == "SPLIT" and d.get("concept_id") in valid_concepts:
-            members = set(store.concept_member_ids(conn, user_id, d["concept_id"]))
+            members = set(store.concept_member_ids(conn, user_id, d["concept_id"], primary_only=True))
             into = []
             for child in d.get("into", []):
                 kept = [c for c in child.get("claim_ids", []) if c in members]
@@ -830,7 +814,7 @@ def _apply_concept_decisions(conn, user_id, run_id, decisions, valid_claims,
 def _snapshot(conn, user_id: str, concept_id: str) -> dict:
     c = store.get_concept(conn, user_id, concept_id)
     return {"concept": dict(c) if c else None,
-            "member_claim_ids": store.concept_member_ids(conn, user_id, concept_id)}
+            "member_claim_ids": store.concept_member_ids(conn, user_id, concept_id, primary_only=True)}
 
 
 def _members_with_emb(conn, user_id: str, claim_ids: list[str]) -> list[dict]:
@@ -854,7 +838,7 @@ def _merge_guard_partition(conn, user_id: str, winner_id: str,
     concept-pass already played resolver in proposing the merge, and C14 makes a
     wrong fold reversible. Empty/uncomparable → legacy behaviour (fold all)."""
     survivors = _members_with_emb(conn, user_id,
-                                  store.concept_member_ids(conn, user_id, winner_id))
+                                  store.concept_member_ids(conn, user_id, winner_id, primary_only=True))
     losers = _members_with_emb(conn, user_id, loser_member_ids)
     if not survivors or not losers:
         return list(loser_member_ids), []
@@ -866,9 +850,11 @@ def _merge_guard_partition(conn, user_id: str, winner_id: str,
 
 # ── Step 5: relations (spine promotion + contradiction receipts) ──────────────
 def _claim_concept(conn, user_id: str, claim_id: str) -> str | None:
+    # A claim's HOME concept is its primary membership (it may also have redundant
+    # channel-code attaches to other concepts, which are not its home).
     row = conn.execute(
-        "SELECT concept_id FROM concept_members WHERE claim_id = ? AND user_id = ? LIMIT 1",
-        (claim_id, user_id)).fetchone()
+        "SELECT concept_id FROM concept_members WHERE claim_id = ? AND user_id = ? "
+        "AND kind = 'primary' LIMIT 1", (claim_id, user_id)).fetchone()
     return row["concept_id"] if row else None
 
 
@@ -1033,7 +1019,7 @@ def _check_integrity(conn, user_id: str, run_id: str, claim_ids: list[str],
                   "anchor_text": anchor, "ts": ts})
 
 
-# ── Step 6: latent bridges (embedding math + small verify calls) ──────────────
+# ── Step 6: concept representative (medoid) ───────────────────────────────────
 def _medoid_vec(V):
     """Representative core of a member set (W7): the member nearest all others
     (max summed cosine). One member → itself."""
@@ -1075,7 +1061,8 @@ def _reanchor_concepts(conn, user_id: str,
     mem, med = {}, {}
     for c in concepts:
         rows = _members_with_emb(conn, user_id,
-                                 store.concept_member_ids(conn, user_id, c["id"]))
+                                 store.concept_member_ids(conn, user_id, c["id"],
+                                                          primary_only=True))
         if rows:
             V = np.vstack([r["embedding"] for r in rows])
             mem[c["id"]] = V
@@ -1110,65 +1097,109 @@ def _reanchor_concepts(conn, user_id: str,
             (user_id, cid, store.serialize_float32([float(x) for x in v])))
 
 
-def _bridges(conn, user_id: str, run_id: str, ts: str) -> float:
-    """C5 — propose bridges between concepts whose MEDOIDS sit in a RESIDUAL band:
-    close enough to relate (the one's core is partly reconstructable from the
-    other's region), far enough that the link is non-obvious (a real residual
-    remains — not a near-duplicate concept). Spread-relative via the predictor
-    spine (`residuals_against`), replacing the centroid-cosine band. The LLM still
-    confirms each candidate (direction/meaning is its job, not the geometry's)."""
+# ── Step 6c: channel-code coverage-hole redundancy (validated win — see
+#    docs/consolidation-strategy-team-findings.md). Retrieval is a channel-coding
+#    problem, not source coding: a few STRUCTURED redundant attaches let a query that
+#    lands on concept k still recover a claim c whose home is elsewhere, when k's own
+#    members can't reconstruct c (a coverage hole). Lifts paragraph Coverage@B with no
+#    narrow/broad cost and no partition collapse (the attaches are kind='redundant', so
+#    centers/baselines ignore them). Scarce + globally budgeted = "parity bits". ───────
+CHANNEL_REDUNDANCY = True   # master switch for step 6c
+CHANNEL_COS_FLOOR = 0.55    # reachable: claim's cosine to k's mean-direction center
+CHANNEL_Z_LO, CHANNEL_Z_HI = 1.0, 3.0   # uncovered band: recon-z of claim vs k's members
+CHANNEL_BUDGET = 80         # global cap on redundant attaches (band self-limits below this)
+CHANNEL_R_MAX = 1           # max redundant attaches per claim
+CHANNEL_J_REACH = 10        # candidate non-home concepts per claim (nearest by center)
+
+
+def _unit_mean(M):
     import numpy as np
-    concepts = store.all_concepts(conn, user_id)
-    if len(concepts) < 2:
-        return 0.0
+    v = M.mean(0)
+    n = float(np.linalg.norm(v))
+    return v / n if n else v
 
-    existing = {(r["from_id"], r["to_id"]) for r in
-                conn.execute("SELECT from_id, to_id FROM relations WHERE user_id = ?",
-                             (user_id,))}
-    members, medoids = {}, {}
-    for c in concepts:
-        rows = _members_with_emb(conn, user_id,
-                                 store.concept_member_ids(conn, user_id, c["id"]))
-        if rows:
-            V = np.vstack([r["embedding"] for r in rows])
-            members[c["id"]] = V
-            medoids[c["id"]] = _medoid_vec(V)
 
-    candidates = []
-    ids = sorted(medoids.keys())
-    for i, a in enumerate(ids):
-        for b in ids[i + 1:]:
-            if (a, b) in existing or (b, a) in existing:
+def _channel_holes(conn, user_id: str) -> dict:
+    """Compute A's coverage holes over the PRIMARY partition. For each claim, among its
+    CHANNEL_J_REACH nearest non-home concepts, a (claim, concept k) pair is an eligible
+    hole iff it is REACHABLE (cosine to k's mean-direction center >= COS_FLOOR — a query
+    on k could want c) yet UNCOVERED (reconstruction-z of c against k's members in
+    [Z_LO, Z_HI] — k can't already rebuild c, but c isn't pure noise). Rank globally by
+    cos*z (near AND uncovered = best parity bit), keep top-BUDGET, <=R_MAX per claim.
+    Pure geometry via the predictor spine. Returns {claim_id: [concept_id, ...]}."""
+    import numpy as np
+    rows = conn.execute(
+        "SELECT claim_id, concept_id FROM concept_members "
+        "WHERE user_id = ? AND kind = 'primary'", (user_id,)).fetchall()
+    home = {r["claim_id"]: r["concept_id"] for r in rows}
+    ids = [c for c in home if store.claim_embedding(conn, user_id, c) is not None]
+    if len(ids) < 2:
+        return {}
+    X = np.vstack([store.claim_embedding(conn, user_id, c) for c in ids]).astype(float)
+    X /= np.clip(np.linalg.norm(X, axis=1, keepdims=True), 1e-9, None)
+    pos = {c: i for i, c in enumerate(ids)}
+
+    by_c: dict[str, list[int]] = {}
+    for c in ids:
+        by_c.setdefault(home[c], []).append(pos[c])
+    cids = [k for k, idx in by_c.items() if len(idx) >= 2]
+    if len(cids) < 2:
+        return {}
+    members = {k: np.array(by_c[k]) for k in cids}
+    centers = np.vstack([_unit_mean(X[members[k]]) for k in cids])
+    spread = {}
+    for k in cids:
+        idx = members[k]
+        M = X[idx]
+        if len(idx) <= predict.SPAN_K + 1:
+            spread[k] = (0.7, 0.2)
+            continue
+        sample = (idx if len(idx) <= 24
+                  else np.random.default_rng(0).choice(idx, 24, replace=False))
+        rs = [float(predict.residuals_against(
+                  X[i], np.delete(M, int(np.where(idx == i)[0][0]), axis=0))[0])
+              for i in sample]
+        spread[k] = (float(np.mean(rs)), float(max(np.std(rs), 0.05)))
+
+    reach = X @ centers.T
+    J = min(CHANNEL_J_REACH, len(cids))
+    cand = np.argsort(-reach, axis=1)[:, :J]
+    pool = []
+    for i, c in enumerate(ids):
+        for j in cand[i]:
+            k = cids[int(j)]
+            if k == home[c]:
                 continue
-            # symmetric: how much of each core the OTHER region can't reconstruct
-            r_ab = float(predict.residuals_against(medoids[a], members[b])[0])
-            r_ba = float(predict.residuals_against(medoids[b], members[a])[0])
-            res = 0.5 * (r_ab + r_ba)
-            if BRIDGE_RES_LOW <= res <= BRIDGE_RES_HIGH:
-                candidates.append((res, a, b))
-    candidates.sort()                       # most-related (lowest residual) first
+            M = X[members[k]]
+            M = M[np.any(M != X[i], axis=1)] if len(M) > 1 else M
+            r = float(predict.residuals_against(X[i], M)[0])
+            mu, sd = spread[k]
+            z = (r - mu) / sd
+            cos = float(reach[i, int(j)])
+            if cos >= CHANNEL_COS_FLOOR and CHANNEL_Z_LO <= z <= CHANNEL_Z_HI:
+                pool.append((cos * z, c, k))
+    pool.sort(key=lambda t: -t[0])
+    redundant: dict[str, list[str]] = {}
+    per_claim: dict[str, int] = {}
+    total = 0
+    for _, c, k in pool:
+        if total >= CHANNEL_BUDGET:
+            break
+        if per_claim.get(c, 0) >= CHANNEL_R_MAX:
+            continue
+        redundant.setdefault(c, []).append(k)
+        per_claim[c] = per_claim.get(c, 0) + 1
+        total += 1
+    return redundant
 
-    cost = 0.0
-    by_id = {c["id"]: c for c in concepts}
-    for res, a, b in candidates[:BRIDGE_MAX_VERIFY]:
-        ca, cb = by_id[a], by_id[b]
-        sample = lambda cid: json.dumps([
-            (store.get_claim(conn, user_id, m) or {"text": ""})["text"]
-            for m in store.concept_member_ids(conn, user_id, cid)[:4]], ensure_ascii=False)
-        prompt = PROMPT_BRIDGE.format(
-            a_label=ca["label"], a_canonical=ca["canonical"], a_claims=sample(a),
-            b_label=cb["label"], b_canonical=cb["canonical"], b_claims=sample(b))
-        try:
-            result = llm.call(prompt, tier="mechanical", max_tokens=256)  # outside txn
-            cost += result["cost"]
-            if result["json"].get("bridge"):
-                with conn:
-                    emit(conn, user_id, run_id, "BRIDGED", {
-                        "a": a, "b": b, "score": round(1.0 - res, 3),
-                        "rationale": result["json"].get("rationale", ""), "ts": ts})
-        except llm.LLMError:
-            break  # bridges are best-effort; never fail the run over them
-    return cost
+
+def _channel_redundancy(conn, user_id: str, run_id: str, ts: str) -> int:
+    """Step 6c — emit the channel-code redundant attaches as ONE event carrying the full
+    set. The applier (set_channel_redundancy) replaces all prior redundant rows, so the
+    step is idempotent across re-runs and rebuild-correct (last event wins)."""
+    pairs = _channel_holes(conn, user_id)
+    emit(conn, user_id, run_id, "CHANNEL_REDUNDANCY", {"pairs": pairs, "ts": ts})
+    return sum(len(v) for v in pairs.values())
 
 
 # ── Step 7: decay / strengthen (ported v1 health state model) ─────────────────
@@ -1300,7 +1331,7 @@ def _feedback_claims(conn, user_id: str, node_id: str) -> list[str]:
     if node_id.startswith("clm_"):
         return [node_id]
     if node_id.startswith("cpt_"):
-        return store.concept_member_ids(conn, user_id, node_id)
+        return store.concept_member_ids(conn, user_id, node_id, primary_only=True)
     if node_id.startswith("ep_"):
         return store.claims_for_episode(conn, user_id, node_id)
     return []
@@ -1357,7 +1388,7 @@ def _prune_safely(conn, user_id: str, run_id: str, ts: str) -> None:
     for c in store.all_concepts(conn, user_id):
         if c["state"] != "dormant":
             continue
-        member_ids = store.concept_member_ids(conn, user_id, c["id"])
+        member_ids = store.concept_member_ids(conn, user_id, c["id"], primary_only=True)
         if len(member_ids) < PRUNE_MIN_MEMBERS:
             continue
         verdicts = guard.forget(_members_with_emb(conn, user_id, member_ids),
@@ -1485,7 +1516,6 @@ def consolidate(conn, user_id: str, max_episodes: int = 50) -> dict:
             _consume_retrieval_signals(conn, user_id, run_id, ts)
             # C13b: explicit relevance feedback — last word over usage inference.
             _consume_relevance_feedback(conn, user_id, run_id, ts)
-        cost += _bridges(conn, user_id, run_id, ts)
         with conn:
             _decay_strengthen(conn, user_id, run_id, episodes, ts)
             _prune_safely(conn, user_id, run_id, ts)
@@ -1495,6 +1525,13 @@ def consolidate(conn, user_id: str, max_episodes: int = 50) -> dict:
         # per-event medoid now that the neighbourhood is final.
         with conn:
             _reanchor_concepts(conn, user_id)
+
+        # Step 6c: centers are settled — add scarce channel-code redundant attaches that
+        # patch coverage holes (retrieval = channel coding). kind='redundant', so the
+        # baseline/center recompute below ignores them; retrieval consumes them.
+        if CHANNEL_REDUNDANCY:
+            with conn:
+                _channel_redundancy(conn, user_id, run_id, ts)
 
         # C12: regions are now settled — re-cluster fragments onto them and push the
         # recomputed cohesion baselines down to Write (measurement half of calibration).

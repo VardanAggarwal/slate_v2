@@ -2,7 +2,7 @@ import pytest
 
 from core.consolidate import consolidate, emit
 from core.encode import encode
-from core.reconstruct import bridges, reconstruct, synthesize
+from core.reconstruct import reconstruct, synthesize
 from tests.conftest import UID
 from tests.test_consolidate import S1, S2, _seed, fake_llm  # noqa: F401
 
@@ -45,7 +45,7 @@ def test_reconstruct_scores_fidelity_and_compression(conn, fake_gen_llm):
     assert 0 < result["compression"]["ratio"]
 
 
-def test_synthesize_uses_bridge_rationale(conn, fake_gen_llm):
+def test_synthesize_two_concepts(conn, fake_gen_llm):
     for cid, text, label in (("clm_a", S1, "Memory"), ("clm_b", S2, "Sleep")):
         emit(conn, UID, "run_t", "CANONICALIZED",
              {"action": "new", "claim_id": cid, "text": text,
@@ -56,12 +56,11 @@ def test_synthesize_uses_bridge_rationale(conn, fake_gen_llm):
     emit(conn, UID, "run_t", "CONCEPT_CREATED",
          {"concept_id": "cpt_b", "label": "Sleep", "canonical": "s",
           "claim_ids": ["clm_b"], "ts": TS})
-    emit(conn, UID, "run_t", "BRIDGED",
-         {"a": "cpt_a", "b": "cpt_b", "score": 0.6,
-          "rationale": "memory depends on sleep", "ts": TS})
     conn.commit()
 
-    assert bridges(conn, UID)[0]["a_label"] == "Memory"
+    # no BRIDGED event needed — synthesize drafts from any two concepts
     result = synthesize(conn, UID, "cpt_a", "cpt_b")
-    assert result["rationale"] == "memory depends on sleep"
+    assert result["rationale"]            # defaulted
     assert result["document"]
+    result2 = synthesize(conn, UID, "cpt_a", "cpt_b", rationale="explicit link")
+    assert result2["rationale"] == "explicit link"

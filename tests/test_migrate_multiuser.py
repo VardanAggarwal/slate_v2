@@ -61,7 +61,7 @@ def _make_legacy_db(path):
     conn.execute("INSERT INTO concepts VALUES ('cpt_x', 'Memory', 'm', 'active', 1.0, ?, ?)", (ts, ts))
     conn.execute("INSERT INTO concept_members VALUES ('cpt_x', 'clm_x', 1.0)")
     conn.execute("INSERT INTO vec_concepts VALUES ('cpt_x', ?)", (vec,))
-    conn.execute("INSERT INTO relations VALUES ('cpt_x', 'cpt_x2', 'bridges', 0.6, ?, NULL)", (ts,))
+    conn.execute("INSERT INTO relations VALUES ('cpt_x', 'cpt_x2', 'leads_to', 0.6, ?, NULL)", (ts,))
     conn.execute("INSERT INTO events (ts, run_id, type, payload_json) VALUES (?, 'run_1', 'ENCODED', '{}')", (ts,))
     conn.execute("INSERT INTO consolidation_runs VALUES ('run_1', ?, ?, 1, NULL, 'ok', 0.1)", (ts, ts))
     conn.execute("INSERT INTO episode_consolidations VALUES ('ep_1', 'run_1', ?)", (ts,))

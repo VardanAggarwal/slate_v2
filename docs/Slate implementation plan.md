@@ -48,7 +48,7 @@ Where structure changes, so where the risks live.
 - **Reconstruction-residual guard** (the third wrapper) → safe merge / safe forget; stop averaging centroids.
 - Real **pruning** (not just relabel), **belief versioning schema** (status / version / qualifier + `superseded_by`).
 - Feed Phase 3's retrieval signals into consolidation (promote / demote / resolve).
-- **Bridge candidacy** (residual band between concept medoids — feeds the existing `list_bridges` MCP) and the **store-integrity check** (derived claim vs its source episode, PRD §40).
+- ~~**Bridge candidacy**~~ (built then **removed 2026-06-27** — retrieval-inert; `list_bridges` MCP also removed) and the **store-integrity check** (derived claim vs its source episode, PRD §40).
 - **Run-level rollback** (`run_id` on events; drop run N, rebuild to N−1) + **true re-derivation from raw** (not event-log replay).
 - **Exit:** ΔSR@B positive, **catastrophic-forgetting rate = 0** on frozen set.
 

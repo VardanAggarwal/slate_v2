@@ -62,7 +62,7 @@ the project's instructions so Claude reaches for memory proactively:
 > summaries.
 
 Two-stage retrieval keeps it cheap: `recall` returns ~50-token headlines
-(with why-now signals: 🌉 bridged, 🔁 recurring, 🕰️ resurfacing, 2-hop =
+(with why-now signals: 🔁 recurring, 🕰️ resurfacing, 2-hop =
 non-obvious connection); escalate to `assemble_context` / `get_concept` for
 full claims with provenance.
 
@@ -74,7 +74,7 @@ core/
   encode.py       — embed, novelty receipt, episode write
   consolidate.py  — nightly batch pipeline; event emit/apply; rebuild
   recall.py       — spreading-activation retrieval + read/browse API
-  reconstruct.py  — doc regeneration / synthesis from bridges
+  reconstruct.py  — doc regeneration / synthesis from two concepts
   digest.py       — morning digest from last night's events
   llm.py          — provider chain + Batch API helpers
   config.py       — env vars

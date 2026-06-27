@@ -151,11 +151,6 @@ def test_same_claim_text_two_users_distinct_ids(conn, fake_llm):
                             (r["id"],)).fetchone()["strength"] == 1.0
 
 
-def test_bridges_and_synthesize_scoped(two_corpora):
-    from core.reconstruct import bridges
-    assert all("krakatoa" not in _flat(b) for b in bridges(two_corpora, UID))
-
-
 def test_rebuild_preserves_per_user_separation(two_corpora):
     """rebuild() spans users; afterwards each corpus must still be intact and
     still separate."""
