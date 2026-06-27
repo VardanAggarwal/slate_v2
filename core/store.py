@@ -129,7 +129,7 @@ CREATE TABLE IF NOT EXISTS concept_members (
     user_id    TEXT NOT NULL,
     claim_id   TEXT NOT NULL,
     weight     REAL DEFAULT 1.0,
-    kind       TEXT DEFAULT 'primary',   -- 'primary' | 'redundant' (channel-code attach)
+    kind       TEXT DEFAULT 'primary',   -- 'primary' | 'redundant' (channel-code attach) | 'query' (query-claim hub)
     PRIMARY KEY (concept_id, claim_id)
 );
 
@@ -976,6 +976,48 @@ def set_channel_redundancy(conn: sqlite3.Connection, user_id: str,
                 (concept_id, user_id, claim_id))
             n += 1
     return n
+
+
+def clear_query_claims(conn: sqlite3.Connection, user_id: str) -> None:
+    """Drop ALL of a user's query-claims — the kind='query' memberships, the qclm_
+    claim rows, and their vectors. The replace-whole half of the QUERY_INJECTED
+    applier (mirrors set_channel_redundancy): clear, then re-insert the fresh set,
+    so re-running consolidation or rebuilding the log never accumulates stale
+    query-claims (last QUERY_INJECTED event wins). Scoped to qclm_ ids so a real
+    content claim that happens to be a kind='query' member is never deleted."""
+    conn.execute(
+        "DELETE FROM concept_members WHERE user_id = ? AND kind = 'query'", (user_id,))
+    conn.execute(
+        "DELETE FROM vec_claims WHERE user_id = ? AND claim_id LIKE 'qclm\\_%' ESCAPE '\\'",
+        (user_id,))
+    conn.execute(
+        "DELETE FROM claims WHERE user_id = ? AND id LIKE 'qclm\\_%' ESCAPE '\\'", (user_id,))
+
+
+def recompute_concept_embedding_demand(conn: sqlite3.Connection, user_id: str,
+                                       concept_id: str) -> None:
+    """Demand-side medoid: like recompute_concept_embedding but the candidate set
+    INCLUDES kind='query' members (the query-claims). The concept vector can then
+    drift toward the question-shapes that retrieve it — the lever that moves broad
+    (cross-note synthesis). Deterministic argmax → rebuild reproduces it. Only the
+    QUERY_INJECTED applier calls this, and only when QUERY_CLAIM_REANCHOR is on; the
+    normal path (recompute_concept_embedding, primary_only) is unaffected."""
+    import numpy as np
+    rows = conn.execute(
+        "SELECT claim_id FROM concept_members WHERE concept_id = ? AND user_id = ? "
+        "AND kind IN ('primary', 'query') ORDER BY claim_id", (concept_id, user_id))
+    vecs = [v for v in (claim_embedding(conn, user_id, r["claim_id"]) for r in rows)
+            if v is not None]
+    conn.execute("DELETE FROM vec_concepts WHERE concept_id = ?", (concept_id,))
+    if not vecs:
+        return
+    V = np.vstack(vecs)
+    medoid = V[0] if V.shape[0] == 1 else V[int(np.argmax((V @ V.T).sum(axis=1)))]
+    norm = np.linalg.norm(medoid)
+    if norm > 0:
+        medoid = medoid / norm
+    conn.execute("INSERT INTO vec_concepts (user_id, concept_id, embedding) VALUES (?, ?, ?)",
+                 (user_id, concept_id, serialize_float32([float(x) for x in medoid])))
 
 
 def remove_concept_member(conn: sqlite3.Connection, user_id: str, concept_id: str,

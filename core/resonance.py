@@ -433,11 +433,19 @@ def resonance_recall(conn, user_id: str, query: str, *,
 
 
 def _concept_members(conn, user_id: str, concept_id: str, n: int) -> list[dict]:
-    """Top-n member claims of a concept by strength, with first provenance title."""
+    """Top-n member claims of a concept by strength, with first provenance title.
+
+    Excludes query-claims (`qclm_` ids): synthetic claims minted from retrieval
+    queries to route activation across structural holes. They carry a QUESTION,
+    not stored content — they must steer the graph but never appear in the answer
+    frame. The fragment path already drops them (no source episode); this is the
+    one other text-emitting path. (The concept-minting LLM is safe by a different
+    mechanism: query-claims attach as kind='redundant' and minting reads
+    primary_only — see consolidate._consolidate_concepts.)"""
     rows = conn.execute(
         """SELECT cl.id, cl.text FROM concept_members cm
            JOIN claims cl ON cl.id = cm.claim_id
-           WHERE cm.concept_id = ? AND cm.user_id = ?
+           WHERE cm.concept_id = ? AND cm.user_id = ? AND cl.id NOT LIKE 'qclm\\_%' ESCAPE '\\'
            ORDER BY cl.strength DESC LIMIT ?""", (concept_id, user_id, n)).fetchall()
     out = []
     for r in rows:

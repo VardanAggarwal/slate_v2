@@ -700,6 +700,18 @@ title = "HF-only embeddings"</div>
     <div class="arrow">↓</div>
 
     <div class="step">
+      <span class="tag">QUERY INJECTION · Step 6d · default OFF</span>
+      <h3>Encode real retrieval queries as routing hubs — <span class="fn">_inject_query_claims()</span></h3>
+      <p>A single retrieval lights up only the geometry-nearest region, so cross-note (<b>broad</b>) synthesis questions miss. This encodes the <b>queries themselves</b> as a usage signal: each distinct recent query (from the <code>RETRIEVAL_SIGNAL</code> log) is navigated (<code>resonance.activate</code>), and if it spans ≥2 concepts a <code>qclm_</code> claim is attached to its top-K as <code>kind='query'</code> — a knn seed target + weight-1.0 multi-concept <b>hub</b> the spreader crosses, lighting up regions a single shot misses. If <code style="font-family:var(--mono)">QUERY_CLAIM_REANCHOR</code>, the touched concept medoids re-anchor to include the query-claims (the centroid drifts toward the question-shapes that retrieve it — the <b>broad</b> lever).</p>
+      <div class="value"><span class="ic">★</span><div><b>Status: SHIPPED, default OFF</b> (<code style="font-family:var(--mono)">INJECT_QUERY_CLAIMS</code>). Cosine-proxy gain (broad +0.077 / paragraph +0.111) is <b>not yet confirmed under a sonnet-class LLM judge</b>, and the re-anchor mutates concept vectors (forgetting gate pending) — so it's wired but inert. <b>Three isolation guards:</b> query text never reaches an answer (fragment path has no episode; the breadth frame filters <code>qclm_</code>) nor the minting LLM / normal medoid (primary-only reads; <code>kind='query'</code> isn't primary), and <code>kind='query'</code>≠<code>'redundant'</code> so channel-code never clobbers it. One <code>QUERY_INJECTED</code> event carries the full set → replace-whole, idempotent, <code>rebuild()</code>-reproducible. See docs/query-claims-findings.md.</div></div>
+      <div class="touches">
+        <span class="seg"><span class="h rh">READS</span> <code>events:<em>RETRIEVAL_SIGNAL</em></code> <code>vec_claims</code> <code>vec_concepts</code> <code>concept_members</code></span>
+        <span class="seg"><span class="h wh">WRITES</span> <code>events:<em>QUERY_INJECTED</em></code> → <code>claims</code> <code>vec_claims</code> <code>concept_members</code> <span style="color:var(--muted);font-size:11px">(kind='query')</span> · <code>vec_concepts</code> <span style="color:var(--muted);font-size:11px">(if reanchor)</span></span>
+      </div>
+    </div>
+    <div class="arrow">↓</div>
+
+    <div class="step">
       <span class="tag">HEALTH + CALIBRATION · C12</span>
       <h3>Decay/prune, then re-fit &amp; push down — <span class="fn">_decay_strengthen() · _prune_safely() · _fit_baselines()</span></h3>
       <p>Spaced-repetition health model strengthens/decays/prunes. Then, with regions settled, fragments are <b>re-clustered onto concepts</b>, cohesion baselines (μ,σ) and calibration are recomputed and <b>pushed back down</b> to Write &amp; Retrieve.</p>
@@ -836,7 +848,7 @@ title = "HF-only embeddings"</div>
         <div class="fields">
           <div class="f"><span class="fn2 pk">concept_id, claim_id</span><span class="fd">which claims belong to which concept (the clustering)</span></div>
           <div class="f"><span class="fn2">weight</span><span class="fd">how central the claim is to the concept</span></div>
-          <div class="f"><span class="fn2">kind</span><span class="fd"><em>primary</em> = the claim's home (exactly one) · <em>redundant</em> = a channel-code parity attach (Step 6c). Retrieval reads both; centres/baselines/membership read <em>primary</em> only</span></div>
+          <div class="f"><span class="fn2">kind</span><span class="fd"><em>primary</em> = the claim's home (exactly one) · <em>redundant</em> = a channel-code parity attach (Step 6c) · <em>query</em> = a query-claim routing hub (Step 6d, default OFF). Retrieval spread reads all three; centres/baselines/membership read <em>primary</em> only</span></div>
         </div></div>
       <div class="tbl"><div class="nm">relations <span class="w w-cons">CONSOLIDATE</span></div>
         <div class="fields">
@@ -946,6 +958,7 @@ title = "HF-only embeddings"</div>
     <div class="ev"><div class="et">VERSIONED · C8</div><div class="tl"><span class="op upd">UPD</span> <code>claims.status</code>,<code>version_group</code>,<code>superseded_by</code></div></div>
     <div class="ev"><div class="et">PRUNED · C7</div><div class="tl"><span class="op del">DEL</span> <code>concept_members</code>; if no <em>primary</em> home left <span class="op del">DEL</span> <code>claims</code></div></div>
     <div class="ev"><div class="et">CHANNEL_REDUNDANCY · 6c</div><div class="tl"><span class="op del">DEL</span> all <code>kind='redundant'</code> + <span class="op ins">INS</span> the new set into <code>concept_members</code> (replace-whole → idempotent)</div></div>
+    <div class="ev"><div class="et">QUERY_INJECTED · 6d <small>(default OFF)</small></div><div class="tl"><span class="op del">DEL</span> all <code>qclm_</code> claims + <code>kind='query'</code> rows + <span class="op ins">INS</span> the fresh set into <code>claims</code>,<code>vec_claims</code>,<code>concept_members</code> · <span class="op upd">UPD</span> <code>vec_concepts</code> (demand-side medoid, if reanchor) — replace-whole → idempotent</div></div>
     <div class="ev"><div class="et">RECLUSTERED · C12</div><div class="tl"><span class="op upd">UPD</span> <code>fragments.cluster</code> → nearest concept</div></div>
     <div class="ev"><div class="et">FRAGMENTED</div><div class="tl">re-applied on rebuild → <code>write.apply_fragmented()</code> (see flow ①)</div></div>
     <div class="ev"><div class="et">ENCODED · INTEGRITY_FLAGGED</div><div class="tl">log-only — nothing materialized (episodic-side / review signal)</div></div>

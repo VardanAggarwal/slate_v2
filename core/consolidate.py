@@ -129,6 +129,15 @@ def claim_id_for(user_id: str, text: str) -> str:
     return "clm_" + hashlib.md5(raw).hexdigest()
 
 
+def query_claim_id_for(user_id: str, text: str) -> str:
+    """Like claim_id_for but a `qclm_` prefix — the marker that keeps query-claims
+    out of every text-emitting / minting path (retrieval frame filters `qclm_`;
+    primary_only excludes them from the minting LLM and the normal medoid). Same
+    user-salt + md5(query) so re-injecting the same query is idempotent."""
+    raw = f"{user_id}\x00{text.strip().lower()}".encode("utf-8")
+    return "qclm_" + hashlib.md5(raw).hexdigest()
+
+
 # ── Event emit + apply (the backbone) ─────────────────────────────────────────
 def emit(conn, user_id: str, run_id: str | None, type_: str, payload: dict) -> None:
     """Append the event, then materialize it. Decision → event → row, always."""
@@ -261,6 +270,27 @@ def apply_event(conn, user_id: str, type_: str, payload: dict) -> None:
         # with the event's set. Idempotent; on rebuild the last such event wins, and a
         # rolled-back run's event is excluded → its redundant attaches vanish.
         store.set_channel_redundancy(conn, user_id, p["pairs"])
+
+    elif type_ == "QUERY_INJECTED":
+        # Step 6d — encode real retrieval queries as query-claims (`qclm_` ids):
+        # knn seed targets + weight-1.0 multi-concept hubs that route activation
+        # across structural holes (cross-note synthesis). Replace-whole + rebuild-
+        # correct (last event wins). The qclm_ marker + kind='query' keep them out
+        # of every answer/minting path; only routing (raw concept_members read) and,
+        # if `reanchor`, the demand-side medoid see them. embeddings recomputed from
+        # the query text on replay, like CANONICALIZED claims.
+        store.clear_query_claims(conn, user_id)
+        touched: set[str] = set()
+        for q in p["queries"]:
+            emb = get_embedder().encode([q["text"]], normalize_embeddings=True,
+                                        show_progress_bar=False)[0]
+            store.insert_claim(conn, user_id, q["id"], q["text"], emb, p["ts"])
+            for cid in q["concept_ids"]:
+                store.add_concept_member(conn, user_id, cid, q["id"], kind="query")
+                touched.add(cid)
+        if p.get("reanchor"):
+            for cid in touched:
+                store.recompute_concept_embedding_demand(conn, user_id, cid)
 
     elif type_ == "RECLUSTERED":
         # C12 — fragment regions reassigned to their nearest consolidated concept.
@@ -1107,6 +1137,17 @@ def _reanchor_concepts(conn, user_id: str,
 CHANNEL_REDUNDANCY = True   # master switch for step 6c
 CHANNEL_COS_FLOOR = 0.55    # reachable: claim's cosine to k's mean-direction center
 CHANNEL_Z_LO, CHANNEL_Z_HI = 1.0, 3.0   # uncovered band: recon-z of claim vs k's members
+
+# ── Step 6d: query injection (encode retrieval queries as routing hubs) ──────────
+# Master switch DEFAULT OFF — the mechanism is wired + rebuild-safe, but the broad
+# gain is unconfirmed under a real (sonnet-class) LLM judge and the demand-side
+# re-anchor mutates concept vectors (forgetting gate not yet run). Flip on only after
+# both clear. See docs/query-claims-findings.md.
+INJECT_QUERY_CLAIMS = False     # master switch for step 6d
+QUERY_CLAIM_REANCHOR = False    # demand-side medoid drift (the part that moves broad; riskiest)
+QUERY_CLAIM_ATTACH_K = 4        # concepts a query-claim joins (its multi-topic span)
+QUERY_CLAIM_MIN_CONCEPTS = 2    # skip a query that doesn't span ≥2 concepts (no bridge)
+QUERY_CLAIM_MAX = 200           # cap distinct queries encoded (most-recent-first)
 CHANNEL_BUDGET = 80         # global cap on redundant attaches (band self-limits below this)
 CHANNEL_R_MAX = 1           # max redundant attaches per claim
 CHANNEL_J_REACH = 10        # candidate non-home concepts per claim (nearest by center)
@@ -1200,6 +1241,46 @@ def _channel_redundancy(conn, user_id: str, run_id: str, ts: str) -> int:
     pairs = _channel_holes(conn, user_id)
     emit(conn, user_id, run_id, "CHANNEL_REDUNDANCY", {"pairs": pairs, "ts": ts})
     return sum(len(v) for v in pairs.values())
+
+
+def _inject_query_claims(conn, user_id: str, run_id: str, ts: str) -> int:
+    """Step 6d — encode the REAL retrieval queries (logged as RETRIEVAL_SIGNAL) as
+    query-claims that route activation across structural holes. For each distinct
+    recent query: navigate it (resonance.activate) to find the concepts it lights
+    up, and attach a `qclm_` claim as a kind='query' member of its top-K. The query
+    text never reaches an answer or the minting LLM (qclm_ marker + kind='query');
+    it only seeds knn and bridges concepts (raw concept_members read), and — if
+    QUERY_CLAIM_REANCHOR — pulls the medoid toward the question (broad lever).
+
+    One QUERY_INJECTED event carrying the full current set → replace-whole,
+    idempotent, rebuild-correct (mirrors _channel_redundancy). Synthetic queries are
+    an eval-only device; in prod the signal is genuine usage, so gold stays clean."""
+    from core import resonance
+    sigs = store.events_since(conn, user_id, 0, types=["RETRIEVAL_SIGNAL"])
+    seen: set[str] = set()
+    queries: list[str] = []
+    for s in reversed(sigs):                       # most-recent-first
+        q = (json.loads(s["payload_json"]).get("query") or "").strip()
+        key = q.lower()
+        if q and key not in seen:
+            seen.add(key)
+            queries.append(q)
+        if len(queries) >= QUERY_CLAIM_MAX:
+            break
+
+    payload_queries: list[dict] = []
+    for q in queries:
+        field = resonance.activate(conn, user_id, q)
+        cps = sorted(((n, d["salience"]) for n, d in field["nodes"].items()
+                      if n.startswith("cpt_")), key=lambda kv: -kv[1])[:QUERY_CLAIM_ATTACH_K]
+        if len(cps) < QUERY_CLAIM_MIN_CONCEPTS:    # no genuine cross-concept span → skip
+            continue
+        payload_queries.append({"id": query_claim_id_for(user_id, q), "text": q,
+                                "concept_ids": [c for c, _ in cps]})
+
+    emit(conn, user_id, run_id, "QUERY_INJECTED",
+         {"queries": payload_queries, "reanchor": bool(QUERY_CLAIM_REANCHOR), "ts": ts})
+    return len(payload_queries)
 
 
 # ── Step 7: decay / strengthen (ported v1 health state model) ─────────────────
@@ -1532,6 +1613,13 @@ def consolidate(conn, user_id: str, max_episodes: int = 50) -> dict:
         if CHANNEL_REDUNDANCY:
             with conn:
                 _channel_redundancy(conn, user_id, run_id, ts)
+
+        # Step 6d: encode real retrieval queries as routing hubs (default OFF — see
+        # INJECT_QUERY_CLAIMS). After 6c so concepts/centers are final before we
+        # navigate queries against them.
+        if INJECT_QUERY_CLAIMS:
+            with conn:
+                _inject_query_claims(conn, user_id, run_id, ts)
 
         # C12: regions are now settled — re-cluster fragments onto them and push the
         # recomputed cohesion baselines down to Write (measurement half of calibration).
