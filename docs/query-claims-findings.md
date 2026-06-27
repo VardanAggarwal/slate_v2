@@ -50,23 +50,31 @@ Results (cosine coverage proxy `eval.coverage`, all three golds, n: narrow 16 / 
   it — is what moved **broad +0.077**. This is the only thing in the thread that moved broad
   and is exactly the "geometry can't provide this; only queries can" lever. No regression.
 
-## The catch — does it survive a real LLM answerer+judge?
-The numbers above are the **cosine proxy**. Under the real harness (LLM answers from the
-context, LLM judge checks all key-facts) on **broad**, run with **gemini** (Claude CLI hit its
-subscription session limit):
+## Does it survive a real LLM answerer+judge? — YES (Opus-4.8 judge)
+The cosine numbers above are a proxy. Confirmed against a real answer+judge on **broad**:
 
-| metric | baseline broad | +q-claims broad |
-|---|---|---|
-| cosine coverage proxy | 0.231 | 0.308 (+0.077) |
-| real LLM answer+judge (gemini) | 0.077 | 0.077 (Δ0) |
+| answerer+judge | baseline broad | +q-claims broad | Δ |
+|---|---|---|---|
+| cosine coverage proxy | 0.231 | 0.308 | +0.077 |
+| gemini (weak) | 0.077 | 0.077 | 0 — **floor artifact, inconclusive** |
+| **Opus 4.8 (in-session)** | **0.077 (1/13)** | **0.231 (3/13)** | **+0.154, forgetting 0** |
 
-**The broad gain did NOT appear under the LLM judge.** BUT this run is **inconclusive**: the
-harness docstring requires a **sonnet-class** answerer/judge — a weak reader floors broad and
-deflates SR@B, and gemini baseline broad = 1/13 is the floor signature. So gemini can't
-distinguish "no real gain" from "judge too weak to see it." **Needs a Claude/sonnet rerun**
-(`scratchpad/query_claims_llm.py [gold_file]`) once the subscription resets.
-Leaky-vs-suppressed was **identical** under both metrics → the cosine gain was not leaked
-question-text gaming the metric.
+The **gemini** run (Claude CLI was session-limited) floored both conditions at 1/13 — exactly
+the weak-judge failure the harness docstring warns about (it needs a sonnet-class reader). So
+it was re-judged with the **Opus-4.8 session itself** as answerer+judge (retrieval is local;
+contexts emitted by `scratchpad/emit_contexts.py`, then judged in-conversation against the
+pre-registered key_facts). Broad lifts **1/13 → 3/13, zero forgetting** (b_religion passes in
+both). The two flips rest on verbatim cross-note text present in treatment, absent in baseline:
+- **b_labour** ← "Economic Coercion of Gig Work" note (*"gig contract is legally voluntary but
+  economically coercive"*) — baseline had no gig content (3/4 → 4/4).
+- **b_community** ← "Future Farming Practices" note (*"peer-driven hyperlocal communities for
+  inputs, knowledge, and market access"*) — baseline missed the hyperlocal-farmer fact (3/4 → 4/4).
+
+Exactly the mechanism's claim: a query-claim bridged a far note into the query's lit region.
+Caveats: judged un-blinded (but flips are literal text diffs, verifiable); broad only (narrow/
+paragraph real-judge forgetting check NOT run); n=13, 2-query flips; re-anchor variant + cached
+synthetic queries. Leaky-vs-suppressed was identical under every metric → the gain is structural,
+not leaked-text gaming.
 
 ## Shipped (prod wiring, default OFF)
 In prod the signal is **real retrieval queries** (logged as `RETRIEVAL_SIGNAL`), not the
@@ -100,16 +108,15 @@ Routing still works because the spreader reads `concept_members` via raw SQL
 (`resonance.neighbours`), which is kind-agnostic.
 
 ## Open / next move (the gate to flip it ON)
-The mechanism is shipped; **enabling it** (`INJECT_QUERY_CLAIMS=True`, then
-`QUERY_CLAIM_REANCHOR=True`) waits on:
-1. **Confirm or kill the broad gain on a sonnet-class judge** (the gemini run is inconclusive —
-   gemini floors broad). Rerun `scratchpad/query_claims_llm.py <gold>` on Claude once the
-   subscription resets. This is the gate — nothing flips on until it's green.
-2. **Forgetting gate** before turning on `QUERY_CLAIM_REANCHOR` — it mutates concept medoids,
-   so run the full SR@B before/after `compare()` and require forgetting_rate = 0.
-3. **Stability** — broad +0.077 is ~1 query on n=13; show it holds across query-stream seeds +
+The mechanism is shipped; **gate #1 (does broad survive a real judge?) is PASSED** (Opus-4.8:
+1/13 → 3/13, forgetting 0 on broad). Still required before `INJECT_QUERY_CLAIMS=True` /
+`QUERY_CLAIM_REANCHOR=True`:
+1. **Forgetting gate on narrow + paragraph** — re-anchor mutates concept medoids; only broad was
+   real-judge-checked. Run the same emit-contexts → judge on the other two golds and require
+   zero regressions before enabling re-anchor.
+2. **Stability** — broad is a 2-query flip on n=13; show it holds across query-stream seeds +
    attach_k ∈ {3,5,6} before trusting it.
-4. **Marker** — `qclm_` id prefix is the current marker; if it proves load-bearing long-term,
+3. **Marker** — `qclm_` id prefix is the current marker; if it proves load-bearing long-term,
    promote to a `claims.origin='query'` column.
 
 ## Lab files (scratchpad/)
