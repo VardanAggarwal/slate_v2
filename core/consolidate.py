@@ -51,6 +51,7 @@ DEDUP_CALIBRATION = {"z_echo": DEDUP_Z_ECHO, "prox_margin": predict.PROX_MARGIN,
 
 CANON_CHUNK = 20         # uncertain pairs per LLM call
 CONCEPT_CHUNK = 30       # new claims per concept-pass call (keeps JSON within budget)
+RECONCILE_CHUNK = 15     # contradiction pairs per reconcile call (one call, not per-pair)
 CONCEPT_CONTEXT_MEMBERS = 12
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
@@ -926,35 +927,50 @@ def _relations(conn, user_id: str, run_id: str, episode, bp: dict,
 # (usage signals from C13 will refine the metric); a constant for now.
 VERSION_FLIP_MARGIN = 1.0
 
-PROMPT_VERSION = """Two of the user's notes contradict each other. Decide how they reconcile. Return ONLY JSON.
+PROMPT_VERSION = """Some of the user's notes contradict each other. For each numbered pair, decide how the two reconcile. Return ONLY JSON.
 
-NEWER claim: "{newer}"
-OLDER claim: "{older}"
-
-Pick "mode":
-- "supersede": the newer claim replaces the older on better/newer grounds (a changed mind).
+For each pair pick "mode":
+- "supersede": the NEWER claim replaces the OLDER on better/newer grounds (a changed mind).
 - "scope": both are true under DIFFERENT conditions — give each a short "qualifier_newer"/"qualifier_older" naming its condition.
 - "version": both genuinely stand as rival views; neither clearly wins.
 
-{"mode": "supersede|scope|version", "qualifier_newer": null, "qualifier_older": null}"""
+Return ONLY valid JSON: {"verdicts": [{"i": <pair number>, "mode": "supersede|scope|version", "qualifier_newer": null, "qualifier_older": null}, ...]}
+
+PAIRS:
+"""
 
 
-def _resolve_conflict(newer_text: str, older_text: str) -> tuple[dict, float]:
-    """Reconcile a contradiction into supersede/scope/version (PRD: the predictor
-    detects, the resolver — LLM — reconciles). On LLM failure the safe default is
-    "version": keep both, flip nothing, drop nothing."""
-    try:
-        result = llm.call(
-            PROMPT_VERSION.replace("{newer}", newer_text).replace("{older}", older_text),
-            tier="judgment", max_tokens=512)
-        j = result["json"]
-        mode = (j.get("mode") or "version").lower()
-        if mode not in ("supersede", "scope", "version"):
-            mode = "version"
-        return {"mode": mode, "qualifier_newer": j.get("qualifier_newer"),
-                "qualifier_older": j.get("qualifier_older")}, result["cost"]
-    except llm.LLMError:
-        return {"mode": "version"}, 0.0
+def _resolve_conflicts(pairs: list[tuple[dict, dict]]) -> tuple[list[dict], float]:
+    """Batch-reconcile contradiction pairs into supersede/scope/version (PRD: the
+    predictor detects, the resolver — LLM — reconciles). Chunked so each call stays
+    within output budget. Returns a res dict per input pair, index-aligned; any pair
+    the resolver doesn't speak to (LLM failure, missing/garbled verdict) keeps the
+    safe default "version" — keep both, flip nothing, drop nothing."""
+    out = [{"mode": "version", "qualifier_newer": None, "qualifier_older": None}
+           for _ in pairs]
+    cost = 0.0
+    for start in range(0, len(pairs), RECONCILE_CHUNK):
+        chunk = pairs[start:start + RECONCILE_CHUNK]
+        body = "\n".join(
+            f'{i}. NEWER: "{ca["text"]}"\n   OLDER: "{cb["text"]}"'
+            for i, (ca, cb) in enumerate(chunk))
+        try:
+            result = llm.call(PROMPT_VERSION + body, tier="judgment", max_tokens=2048)
+            cost += result["cost"]
+            verdicts = result["json"].get("verdicts", [])
+        except llm.LLMError:
+            continue  # leave this chunk at the "version" default
+        for v in verdicts:
+            i = v.get("i")
+            if not isinstance(i, int) or not (0 <= i < len(chunk)):
+                continue
+            mode = (v.get("mode") or "version").lower()
+            if mode not in ("supersede", "scope", "version"):
+                mode = "version"
+            out[start + i] = {"mode": mode,
+                              "qualifier_newer": v.get("qualifier_newer"),
+                              "qualifier_older": v.get("qualifier_older")}
+    return out, cost
 
 
 def _reconcile(conn, user_id: str, run_id: str, claim_ids: list[str], ts: str) -> float:
@@ -963,7 +979,7 @@ def _reconcile(conn, user_id: str, run_id: str, claim_ids: list[str], ts: str) -
     VERSIONED events then commit in one short txn. The flip margin is applied
     here, so the resulting current/other is frozen in the payload → deterministic
     replay (the applier never re-resolves)."""
-    seen, decisions, cost = set(), [], 0.0
+    seen, pairs = set(), []
     for a_id, b_id in store.contradiction_pairs(conn, user_id, claim_ids):
         key = tuple(sorted((a_id, b_id)))
         if key in seen:
@@ -973,14 +989,13 @@ def _reconcile(conn, user_id: str, run_id: str, claim_ids: list[str], ts: str) -
         cb = store.get_claim(conn, user_id, b_id)   # older (incumbent)
         if not ca or not cb:
             continue
-        res, c = _resolve_conflict(ca["text"], cb["text"])
-        cost += c
-        decisions.append((dict(ca), dict(cb), res))
-    if not decisions:
-        return cost
+        pairs.append((dict(ca), dict(cb)))
+    if not pairs:
+        return 0.0
 
+    resolutions, cost = _resolve_conflicts(pairs)   # one call per RECONCILE_CHUNK pairs
     with conn:
-        for ca, cb, res in decisions:
+        for (ca, cb), res in zip(pairs, resolutions):
             grp = cb["version_group"] or ca["version_group"] or cb["id"]
             payload = {"version_group": grp, "ts": ts,
                        "qualifier_current": None, "qualifier_other": None}

@@ -416,8 +416,9 @@ def _seed_conflict(conn, ts, a_strength=1.0, b_strength=1.0):
 
 
 def _mock_resolver(monkeypatch, mode, **quals):
-    monkeypatch.setattr("core.consolidate._resolve_conflict",
-                        lambda newer, older: ({"mode": mode, **quals}, 0.0))
+    # batched resolver: one res dict per input pair, index-aligned.
+    monkeypatch.setattr("core.consolidate._resolve_conflicts",
+                        lambda pairs: ([{"mode": mode, **quals} for _ in pairs], 0.0))
 
 
 def test_version_supersede_flips_past_margin(conn, fake_llm, monkeypatch):
@@ -471,7 +472,7 @@ def test_version_decision_survives_rebuild(conn, fake_llm, monkeypatch):
     _seed_conflict(conn, ts, a_strength=3.0, b_strength=1.0)
     _mock_resolver(monkeypatch, "supersede")
     _reconcile(conn, UID, "run_v", ["clm_a", "clm_b"], ts)
-    monkeypatch.setattr("core.consolidate._resolve_conflict",
+    monkeypatch.setattr("core.consolidate._resolve_conflicts",
                         lambda *a, **k: (_ for _ in ()).throw(
                             AssertionError("resolver must not run at apply time")))
     rebuild(conn)
