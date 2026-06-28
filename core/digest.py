@@ -1,4 +1,4 @@
-"""Morning digest: read last night's events, one LLM call, markdown summary (bridges, contradictions, strengthened/dormant concepts). See PLAN.md §5.
+"""Morning digest: read last night's events, one LLM call, markdown summary (contradictions, strengthened/dormant concepts). See PLAN.md §5.
 
 The structured digest is deterministic (pure event reads); the single LLM
 call only rewrites it into prose, and is skipped when unavailable — the
@@ -40,11 +40,7 @@ def digest(conn, user_id: str, since_hours: int = 36, polish: bool = False) -> s
 
     lines = []
     for type_, p in events:
-        if type_ == "BRIDGED":
-            a = _concept_label(conn, user_id, p["a"], labels)
-            b = _concept_label(conn, user_id, p["b"], labels)
-            lines.append(f"🌉 New bridge: **{a}** × **{b}** — {p.get('rationale', '')}")
-        elif type_ == "RELATED" and p.get("relation") == "contradicts":
+        if type_ == "RELATED" and p.get("relation") == "contradicts":
             frm = store.get_claim(conn, user_id, p["from_id"])
             to = store.get_claim(conn, user_id, p["to_id"])
             if frm and to:

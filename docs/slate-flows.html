@@ -1,0 +1,986 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Slate — How it works</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b22; --panel2:#1c232d; --ink:#e6edf3; --muted:#9aa7b4;
+    --line:#2d3742; --accent:#7aa2f7; --accent2:#bb9af7;
+    --predicted:#7ee787; --novel:#79c0ff; --ambiguous:#f0883e; --contra:#ff7b72;
+    --green:#3fb950; --chip:#21303f;
+    --mono:'SF Mono',ui-monospace,'JetBrains Mono',Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Inter,Roboto,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.5;
+       -webkit-font-smoothing:antialiased}
+  .wrap{max-width:1100px;margin:0 auto;padding:32px 24px 96px}
+  header h1{font-size:30px;margin:0 0 6px;letter-spacing:-.02em}
+  header p{color:var(--muted);margin:0 0 4px;max-width:760px}
+  .lead code{background:var(--chip);padding:1px 6px;border-radius:5px;font-family:var(--mono);font-size:.85em}
+
+  /* tabs */
+  .tabs{display:flex;gap:8px;flex-wrap:wrap;margin:28px 0 22px;border-bottom:1px solid var(--line);padding-bottom:0}
+  .tab{background:none;border:none;color:var(--muted);font:inherit;font-weight:600;font-size:14px;
+       padding:10px 16px;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;transition:.15s}
+  .tab:hover{color:var(--ink)}
+  .tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+  .view{display:none;animation:fade .25s ease}
+  .view.active{display:block}
+  @keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+
+  h2.section{font-size:21px;margin:8px 0 4px;letter-spacing:-.01em}
+  .sub{color:var(--muted);margin:0 0 22px;font-size:14px;max-width:820px}
+
+  /* flow rail */
+  .rail{position:relative;padding-left:0}
+  .step{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin:0 0 14px;
+        position:relative}
+  .step .tag{display:inline-block;font-family:var(--mono);font-size:11px;color:var(--accent2);
+             background:var(--panel2);border:1px solid var(--line);padding:2px 8px;border-radius:6px;margin-bottom:8px}
+  .step h3{margin:0 0 6px;font-size:16px}
+  .step h3 .fn{font-family:var(--mono);font-size:13px;color:var(--accent);font-weight:600}
+  .step p{margin:0 0 8px;font-size:14px;color:#cdd6e0}
+  .arrow{text-align:center;color:var(--line);font-size:20px;line-height:1;margin:-6px 0 8px}
+
+  .value{display:flex;gap:8px;align-items:flex-start;background:rgba(63,185,80,.08);
+         border:1px solid rgba(63,185,80,.25);border-radius:8px;padding:9px 12px;margin-top:10px;font-size:13px}
+  .value b{color:var(--green)}
+  .value .ic{color:var(--green);flex:0 0 auto;margin-top:1px}
+
+  .ex{background:var(--panel2);border:1px dashed var(--line);border-radius:8px;padding:10px 12px;margin-top:10px;
+      font-family:var(--mono);font-size:12.5px;color:#c8d3df;white-space:pre-wrap;overflow-x:auto}
+  .ex .cm{color:var(--muted)}
+
+  /* route badges */
+  .badge{font-family:var(--mono);font-size:11px;font-weight:700;padding:1px 7px;border-radius:5px;white-space:nowrap}
+  .b-pred{color:var(--predicted);background:rgba(126,231,135,.12)}
+  .b-nov{color:var(--novel);background:rgba(121,192,255,.12)}
+  .b-amb{color:var(--ambiguous);background:rgba(240,136,62,.14)}
+  .b-con{color:var(--contra);background:rgba(255,123,114,.14)}
+
+  /* the primitive box */
+  .prim{background:linear-gradient(180deg,#15233a,#161b22);border:1px solid #2b3b57;border-radius:14px;padding:20px 22px;margin:0 0 26px}
+  .prim h2{margin:0 0 4px;font-size:19px}
+  .prim .flow{display:grid;grid-template-columns:1fr;gap:12px;margin-top:14px}
+  .pcard{background:#10182a;border:1px solid #243349;border-radius:10px;padding:14px 16px}
+  .pcard .t{font-family:var(--mono);font-size:12px;color:var(--accent);margin-bottom:6px}
+  .routes{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin-top:8px}
+  .route{border-radius:9px;padding:11px 13px;font-size:13px;border:1px solid var(--line);background:var(--panel)}
+  .route .h{font-family:var(--mono);font-size:12px;font-weight:700;margin-bottom:3px}
+  .route small{color:var(--muted);display:block;font-size:12px}
+
+  .split{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media(max-width:720px){.split{grid-template-columns:1fr}}
+  .note{font-size:12.5px;color:var(--muted);margin-top:18px;border-top:1px solid var(--line);padding-top:14px}
+  .note code{font-family:var(--mono);background:var(--chip);padding:1px 5px;border-radius:4px}
+  .pill{display:inline-block;background:var(--chip);color:var(--muted);font-family:var(--mono);font-size:11px;
+        padding:2px 8px;border-radius:20px;margin:0 4px 4px 0}
+  .async{border-left:3px solid var(--accent2)}
+  .sync{border-left:3px solid var(--green)}
+  .branch{border-left:3px solid var(--novel)}
+
+  /* per-step data-touch strip */
+  .touches{display:flex;flex-wrap:wrap;gap:7px 18px;margin-top:11px;padding-top:9px;border-top:1px dashed var(--line)}
+  .touches .seg{display:inline-flex;flex-wrap:wrap;gap:5px;align-items:center;font-size:11.5px}
+  .touches .h{font-family:var(--mono);font-size:9.5px;font-weight:700;letter-spacing:.06em;padding:1px 5px;border-radius:4px}
+  .touches .rh{color:var(--muted);background:var(--chip)}
+  .touches .wh{color:var(--green);background:rgba(63,185,80,.12)}
+  .touches .nh{color:var(--muted);background:none;border:1px dashed var(--line)}
+  .touches code{font-family:var(--mono);font-size:11px;background:#0a0f18;border:1px solid var(--line);
+                padding:0 5px;border-radius:4px;color:#aebac7}
+  .touches code em{color:var(--accent2);font-style:normal}
+
+  /* spreading-activation diagram */
+  .spread{background:linear-gradient(180deg,#101a2e,#13181f);border:1px solid #2b3b57;border-radius:14px;
+          padding:20px 22px;margin:20px 0}
+  .spread h3{margin:0 0 3px;font-size:17px}
+  .spread .desc{color:var(--muted);font-size:13px;margin:0 0 18px;max-width:840px}
+  .sgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:0;align-items:start;position:relative}
+  @media(max-width:760px){.sgrid{grid-template-columns:1fr;gap:14px}}
+  .scol{padding:0 12px;position:relative}
+  .scol .hop{font-family:var(--mono);font-size:10.5px;font-weight:700;letter-spacing:.06em;color:var(--accent2);
+             text-transform:uppercase;margin-bottom:10px;display:flex;align-items:center;gap:7px}
+  .scol .hop .dot{width:7px;height:7px;border-radius:50%;background:var(--accent2)}
+  .gnode{border-radius:9px;padding:9px 11px;margin-bottom:9px;font-size:12px;border:1px solid var(--line);
+         background:var(--panel);position:relative}
+  .gnode .lab{font-weight:600;color:#e6edf3;margin-bottom:2px}
+  .gnode .act{font-family:var(--mono);font-size:10.5px;color:var(--muted)}
+  .gnode .act b{color:var(--predicted)}
+  .gnode.seed{border-color:#3b6fb0;background:#142235}
+  .gnode.dim{opacity:.5}
+  .gnode.dead{opacity:.34;border-style:dashed}
+  .gnode .via{display:inline-block;font-family:var(--mono);font-size:9.5px;font-weight:700;padding:1px 6px;
+              border-radius:4px;margin-top:5px}
+  .via-seed{color:#79c0ff;background:rgba(121,192,255,.12)}
+  .via-hop{color:var(--accent2);background:rgba(187,154,247,.14)}
+  .via-bridge{color:#7ee787;background:rgba(126,231,135,.14)}
+  .via-cut{color:var(--muted);background:var(--chip)}
+  .edge{font-family:var(--mono);font-size:10px;color:var(--muted);margin:-3px 0 7px;padding-left:4px}
+  .edge .x{color:var(--ambiguous)}
+  .sgrid .vrule{position:absolute;top:26px;bottom:6px;width:1px;background:var(--line)}
+  .legend3{display:flex;gap:16px;flex-wrap:wrap;font-size:11.5px;color:var(--muted);margin-top:14px;
+           border-top:1px dashed var(--line);padding-top:12px}
+  .legend3 .via{margin:0}
+
+  /* branch split / combine visual */
+  .qbox{max-width:340px;margin:0 auto;background:var(--panel2);border:1px solid var(--accent);border-radius:9px;
+        padding:9px 14px;text-align:center;font-size:13px}
+  .qbox .ql{font-family:var(--mono);font-size:10.5px;color:var(--muted);letter-spacing:.05em}
+  .qbox b{color:var(--ink)}
+  .fork{display:grid;grid-template-columns:1fr 1fr;height:30px;margin:0 0 -2px}
+  .fork .l{border-right:1px solid var(--line);border-bottom:1px solid var(--line);
+           border-bottom-left-radius:14px;margin-right:50%}
+  .fork .r{border-left:1px solid var(--line);border-bottom:1px solid var(--line);
+           border-bottom-right-radius:14px;margin-left:50%}
+  .join{display:grid;grid-template-columns:1fr 1fr;height:30px;margin:-2px 0 0}
+  .join .l{border-right:1px solid var(--line);border-top:1px solid var(--line);
+           border-top-left-radius:14px;margin-right:50%}
+  .join .r{border-left:1px solid var(--line);border-top:1px solid var(--line);
+           border-top-right-radius:14px;margin-left:50%}
+  .blabel{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:8px 0 2px}
+  .blabel span{text-align:center;font-family:var(--mono);font-size:10.5px;font-weight:700;letter-spacing:.05em;
+               padding:3px 0;border-radius:5px}
+  .blabel .bc{color:var(--novel);background:rgba(121,192,255,.10)}
+  .blabel .bf{color:var(--ambiguous);background:rgba(240,136,62,.10)}
+  @media(max-width:720px){.fork,.join,.blabel{grid-template-columns:1fr}.fork .l,.fork .r,.join .l,.join .r{display:none}}
+  /* path step chips */
+  .pstep{font-family:var(--mono);font-size:10px;font-weight:700;padding:1px 6px;border-radius:4px;margin-right:6px}
+  .ps-c{color:var(--novel);background:rgba(121,192,255,.13)}
+  .ps-f{color:var(--ambiguous);background:rgba(240,136,62,.13)}
+  .ps-h{color:var(--predicted);background:rgba(126,231,135,.13)}
+  .ps-new{color:#ffd479;background:rgba(255,212,121,.13)}
+
+  /* status banner */
+  .banner{display:flex;gap:9px;align-items:flex-start;border-radius:9px;padding:10px 13px;margin:0 0 16px;font-size:12.5px}
+  .banner .bi{flex:0 0 auto;font-size:14px}
+  .banner.live{background:rgba(63,185,80,.08);border:1px solid rgba(63,185,80,.3)}
+  .banner.exp{background:rgba(255,212,121,.07);border:1px solid rgba(255,212,121,.3)}
+  .banner.retire{background:rgba(255,123,114,.06);border:1px solid rgba(255,123,114,.28)}
+  .banner b.live{color:var(--green)} .banner b.exp{color:#ffd479} .banner b.retire{color:var(--contra)}
+  .banner code{font-family:var(--mono);background:var(--chip);padding:0 4px;border-radius:3px;font-size:11px}
+
+  /* hierarchical 3-stage flow */
+  .hstage{display:grid;grid-template-columns:1fr 1fr 1fr;gap:0;position:relative}
+  @media(max-width:760px){.hstage{grid-template-columns:1fr;gap:12px}}
+  .hstage .vrule{top:30px}
+  .hcol{padding:0 13px}
+  .hcol .hh{font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;
+            margin-bottom:9px;display:flex;align-items:center;gap:7px}
+  .hcol.s1 .hh{color:var(--novel)} .hcol.s2 .hh{color:#ffd479} .hcol.s3 .hh{color:var(--ambiguous)}
+  .hcol .hh .n{width:18px;height:18px;border-radius:50%;display:inline-grid;place-items:center;font-size:10px;
+               background:var(--panel);border:1px solid var(--line)}
+  .strike{text-decoration:line-through;opacity:.55}
+
+  /* interface I/O cards */
+  .iface{border:1px solid #34507a;background:#0f1726;border-radius:10px;padding:13px 15px;margin-top:12px}
+  .iface .lbl{font-family:var(--mono);font-size:11px;color:var(--accent);text-transform:uppercase;letter-spacing:.05em;
+              display:flex;align-items:center;gap:7px;margin-bottom:9px}
+  .iface .lbl::before{content:'⇄';font-size:13px}
+  .iface .who{color:var(--muted);text-transform:none;letter-spacing:0;font-size:11px;margin-left:auto}
+  .io{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  @media(max-width:680px){.io{grid-template-columns:1fr}}
+  .io .col .k{font-family:var(--mono);font-size:10.5px;font-weight:700;letter-spacing:.05em;margin-bottom:4px}
+  .io .col.in .k{color:var(--ambiguous)}
+  .io .col.out .k{color:var(--predicted)}
+  .io pre{margin:0;background:#0a0f18;border:1px solid var(--line);border-radius:7px;padding:9px 11px;
+          font-family:var(--mono);font-size:11.5px;line-height:1.45;color:#c8d3df;white-space:pre-wrap;overflow-x:auto}
+  .io .cm{color:var(--muted)}
+  .io .s{color:#a5d6ff}     /* strings */
+  .io .key{color:#7ee787}   /* json keys */
+  .relay{font-size:12px;color:var(--accent2);margin-top:9px;display:flex;gap:7px;align-items:flex-start}
+  .relay b{color:var(--accent2)}
+
+  /* data layers */
+  .layer{border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin:0 0 16px}
+  .layer.epi{border-left:4px solid var(--green)}
+  .layer.log{border-left:4px solid var(--accent2)}
+  .layer.sem{border-left:4px solid var(--novel)}
+  .layer.cfg{border-left:4px solid var(--muted)}
+  .layer h3{margin:0 0 3px;font-size:16px}
+  .layer .desc{color:var(--muted);font-size:13px;margin:0 0 13px;max-width:780px}
+  .tbls{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:11px}
+  .tbl{background:var(--panel2);border:1px solid var(--line);border-radius:9px;padding:11px 13px}
+  .tbl .nm{font-family:var(--mono);font-size:13px;color:var(--accent);font-weight:700;margin-bottom:3px;
+           display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+  .tbl .cols{font-family:var(--mono);font-size:11.5px;color:#aebac7;line-height:1.6}
+  .tbl .cols b{color:#e6edf3;font-weight:600}
+  .tbl .meta{font-size:11.5px;color:var(--muted);margin-top:6px}
+  /* per-field descriptions */
+  .fields{margin:2px 0 0;display:flex;flex-direction:column;gap:5px}
+  .fields .f{display:grid;grid-template-columns:minmax(96px,auto) 1fr;gap:9px;font-size:11.5px;line-height:1.45}
+  .fields .f .fn2{font-family:var(--mono);font-weight:600;color:#e6edf3;white-space:nowrap}
+  .fields .f .fn2.pk{color:var(--accent)}
+  .fields .f .fd{color:#9aa7b4}
+  .fields .f .fd em{color:#c8d3df;font-style:normal}
+  .w{font-family:var(--mono);font-size:10px;font-weight:700;padding:1px 6px;border-radius:4px;white-space:nowrap}
+  .w-save{color:var(--green);background:rgba(63,185,80,.12)}
+  .w-cons{color:var(--novel);background:rgba(121,192,255,.14)}
+  .w-ret{color:var(--ambiguous);background:rgba(240,136,62,.14)}
+  .w-imm{color:var(--contra);background:rgba(255,123,114,.13)}
+  .legend2{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin:0 0 20px}
+  .legend2 span{display:inline-flex;align-items:center;gap:6px}
+
+  /* matrix */
+  .matrix{width:100%;border-collapse:collapse;font-size:12.5px;margin:6px 0 8px;overflow:hidden;border-radius:10px}
+  .matrix th,.matrix td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}
+  .matrix thead th{background:var(--panel2);color:var(--ink);font-size:11.5px;font-weight:700}
+  .matrix tbody th{background:var(--panel);font-family:var(--mono);font-size:12px;color:var(--accent);font-weight:600;white-space:nowrap}
+  .matrix .grp td{background:#11161d;color:var(--muted);font-family:var(--mono);font-size:11px;
+                  text-transform:uppercase;letter-spacing:.06em;padding:5px 10px;border-color:var(--line)}
+  .matrix td{color:#bcc7d3}
+  .op{font-family:var(--mono);font-size:11px;font-weight:700;padding:1px 5px;border-radius:4px}
+  .ins{color:var(--green);background:rgba(63,185,80,.13)}
+  .upd{color:var(--ambiguous);background:rgba(240,136,62,.14)}
+  .del{color:var(--contra);background:rgba(255,123,114,.14)}
+  .rd{color:var(--muted)}
+  .dash{color:var(--line)}
+  .matrix td small{color:var(--muted);font-size:10.5px;display:block;margin-top:2px}
+  .wrapx{overflow-x:auto;border-radius:10px;border:1px solid var(--line);margin-bottom:18px}
+  .evmap{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:9px}
+  .ev{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px 12px;font-size:12.5px}
+  .ev .et{font-family:var(--mono);font-size:12px;font-weight:700;color:var(--accent2);margin-bottom:4px}
+  .ev .tl{color:#bcc7d3;line-height:1.7}
+  .ev code{font-family:var(--mono);background:var(--chip);padding:0 4px;border-radius:3px;font-size:11px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <h1>Slate — how the engine works</h1>
+  <p class="lead">A personal memory engine. The whole system hangs off <b>one primitive</b> — measure how new a piece of text is against memory's own spread, then decide what to do with it. The three flows below are just different <code>(X, Y)</code> plugged into that primitive.</p>
+</header>
+
+<!-- THE PRIMITIVE -->
+<div class="prim">
+  <h2>The shared primitive · <span style="font-family:var(--mono);font-size:15px;color:var(--accent)">measure → decide → resolve_direction</span></h2>
+  <p class="sub" style="margin-bottom:0">Used by all three flows, three distinct stages. <b>measure</b> is a pure sensor (geometry). <b>decide</b> applies the compression <i>bet</i> (owned by consolidation, reversible). <b>resolve_direction</b> is a separate NLI stage that runs <i>only</i> on the AMBIGUOUS rows decide labelled — kept outside decide so decide stays pure &amp; replayable.</p>
+  <div class="flow">
+    <div class="pcard">
+      <div class="t">measure(X, Y) — pure, no policy, no thresholds</div>
+      <div style="font-size:13.5px;color:#cdd6e0">
+        ① kNN — nearest neighbours of <b>X</b> inside corpus <b>Y</b><br>
+        ② residual <span style="font-family:var(--mono)">r = ‖X − reconstruct(X from neighbours)‖</span> &nbsp;<span style="color:var(--muted)">→ how new</span><br>
+        ③ <span style="font-family:var(--mono)">z = (r − μ_region) / σ_region</span> &nbsp;<span style="color:var(--muted)">→ spread-RELATIVE, not raw cosine</span><br>
+        ④ anchor = nearest item + peer-similarity spread &nbsp;<span style="color:var(--muted)">→ where it attaches</span>
+      </div>
+    </div>
+    <div class="pcard">
+      <div class="t">decide(measurement, calibration) — applies the bet</div>
+      <div class="routes">
+        <div class="route"><div class="h b-pred">PREDICTED</div><small>z ≤ z_echo — reconstructs as tightly as the region itself. Store nothing, reinforce the anchor.</small></div>
+        <div class="route"><div class="h b-amb">AMBIGUOUS</div><small>attached to an anchor but looser. Store + resolve DIRECTION via an NLI stance check (contradict / refine).</small></div>
+        <div class="route"><div class="h b-nov">NOVEL</div><small>no anchor — open territory. Store as new.</small></div>
+      </div>
+    </div>
+    <div style="text-align:center;color:var(--line);font-size:18px;margin:-2px 0">↓ &nbsp;<span style="font-size:11px;color:var(--ambiguous);font-family:var(--mono)">only the AMBIGUOUS rows continue</span></div>
+    <div class="pcard" style="border-color:rgba(240,136,62,.4)">
+      <div class="t" style="color:var(--ambiguous)">resolve_direction(fragment, anchor) — NLI stance, NOT inside decide</div>
+      <div style="font-size:13.5px;color:#cdd6e0">
+        A discriminative <b>NLI</b> classifier (local CrossEncoder / HF zero-shot MNLI) reads the fragment against its anchor and returns a direction — geometry can't, since an encoder makes a paraphrase and its negation look identical.
+        <div class="routes" style="margin-top:10px">
+          <div class="route"><div class="h b-con">contradict</div><small>sign −1 · held strongly, anchor flagged</small></div>
+          <div class="route"><div class="h" style="color:var(--predicted)">refine</div><small>sign +1 · qualifies/extends the anchor</small></div>
+          <div class="route"><div class="h" style="color:var(--predicted)">reinforce</div><small>sign +1 · restates (entailment)</small></div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="value"><span class="ic">★</span><div><b>Why this matters:</b> "new" means the same thing in a dense cluster and a sparse one — novelty is judged against a region's own spread, never an absolute similarity cut. Geometry (knowable) is split from the compression bet (chosen). Direction is <i>never</i> geometry — an encoder can't tell a paraphrase from its negation — so it's deferred to a discriminative <b>NLI stance classifier</b> (not a generative LLM), run only on AMBIGUOUS.</div></div>
+</div>
+
+<div class="tabs">
+  <button class="tab active" data-view="write">① Save a note</button>
+  <button class="tab" data-view="retrieve">② Retrieve</button>
+  <button class="tab" data-view="consolidate">③ Consolidate (nightly)</button>
+  <button class="tab" data-view="data">④ Data — what's saved where</button>
+</div>
+
+<!-- ============ WRITE ============ -->
+<section class="view active" id="write">
+  <h2 class="section">Saving a note — <span style="font-family:var(--mono);font-size:15px;color:var(--accent)">save_note()</span></h2>
+  <p class="sub">Split in two: a <b style="color:var(--green)">synchronous cheap receipt (W1)</b> returned to the user instantly, and an <b style="color:var(--accent2)">async predictor pass (W2–W8)</b> that structures memory off the critical path.</p>
+
+  <div class="ex" style="margin-bottom:18px"><span class="cm">// input</span>
+text  = "Slate should embed via the HF API in prod. No torch on the 1GB host."
+title = "HF-only embeddings"</div>
+
+  <div class="rail">
+    <div class="step sync">
+      <span class="tag">W1 · SYNC · &lt;1s · no LLM · core/encode.py</span>
+      <h3>Embed &amp; build the novelty receipt — <span class="fn">encode.encode()</span></h3>
+      <p>Split into sentences → embed locally (MiniLM, 384-d). Each sentence is kNN'd against canonical <i>claims</i> and against prior <i>episode sentences</i>.</p>
+      <div class="ex"><span class="cm">// per sentence vs memory</span>
+"embed via the HF API in prod"   → <span class="b-pred">ECHO</span>          <span class="cm">sim≥ECHO, NLI stance≠contra → "echoes your June note"</span>
+"no torch on the 1GB host"       → <span class="b-nov">NOVELTY</span>       <span class="cm">sim&lt;NOVELTY threshold</span>
+(if a sentence opposed a claim)  → <span class="b-con">CONTRADICTION</span>  <span class="cm">sim≥ECHO &amp; NLI stance=contradict</span></div>
+      <div class="value"><span class="ic">★</span><div><b>Critical value:</b> never blocks on the network. The user sees echoes/contradictions <i>instantly</i> — that surfaced receipt is the product. The immutable episode + sentence vectors + an <code>ENCODED</code> event are persisted; everything downstream is replayable from this raw record.</div></div>
+
+      <div class="iface">
+        <div class="lbl">Interface · MCP tool save_note <span class="who">request/response → assistant</span></div>
+        <div class="io">
+          <div class="col in"><div class="k">▸ INPUT (assistant → Slate)</div>
+<pre>{
+  <span class="key">"text"</span>: <span class="s">"Slate should embed via the HF
+           API in prod. No torch on the
+           1GB host."</span>,
+  <span class="key">"title"</span>: <span class="s">"HF-only embeddings"</span>
+}</pre></div>
+          <div class="col out"><div class="k">◂ OUTPUT (Slate → assistant)</div>
+<pre>{
+  <span class="key">"episode_id"</span>: <span class="s">"ep_01J…"</span>,
+  <span class="key">"title"</span>: <span class="s">"HF-only embeddings"</span>,
+  <span class="key">"n_sentences"</span>: 2,
+  <span class="key">"narrate"</span>: <span class="s">"🔁 **Echoes** …"</span>  <span class="cm">← for the human</span>
+}</pre></div>
+        </div>
+        <div class="relay"><b>↳ narrate (assistant → human)</b><div><span class="ex" style="display:block;margin-top:4px">🔁 <b>Echoes</b> stored claim: "Embeddings run through the HF Inference API in production" (sim 0.91)
+🕰️ <b>Resonates with</b> your note "1GB host limits" (2026-06-12): "no room for torch on the server"
+✨ 1 new claim — nothing like it stored yet.</span></div></div>
+        <div class="value" style="margin-top:8px"><span class="ic">★</span><div>Two interfaces stack here: the structured dict is the assistant's interface; the <code>narrate</code> markdown is the human's, relayed verbatim. The async W2–W8 return <b>nothing</b> synchronously — their effect surfaces later through <code>recall</code>/<code>assemble_context</code>.</div></div>
+      </div>
+      <div class="touches">
+        <span class="seg"><span class="h rh">READS</span> <code>vec_claims</code> <code>vec_sentences</code> <span style="color:var(--muted);font-size:11px">(kNN for the receipt)</span></span>
+        <span class="seg"><span class="h wh">WRITES</span> <code>episodes</code> <code>episode_sentences</code> <code>vec_sentences</code> <code>events:<em>ENCODED</em></code> <code>replay_map</code><span style="color:var(--muted);font-size:11px">(only on import/replay, never on a normal save_note)</span></span>
+      </div>
+    </div>
+
+    <div class="arrow">↓ &nbsp;<span style="font-size:12px;color:var(--accent2)">trigger_refine_async() — daemon thread, fire &amp; forget</span></div>
+
+    <div class="step async">
+      <span class="tag">W2–W3 · ASYNC · core/write.py + scan.py</span>
+      <h3>Segment into fragments — <span class="fn">plan_fragments() → fragment_representatives()</span></h3>
+      <p>One surprise signal segments the note into <b>variable-resolution fragments</b>: mutually-predictable sentences fold together, surprising ones stay fine-grained. Each fragment is represented by its <b>medoid sentence</b> — a real sentence, <i>selected</i> not generated.</p>
+      <div class="value"><span class="ic">★</span><div><b>Critical value:</b> the medoid reuses the encode-time vector → <b>no second embedding pass</b>, and provenance stays verbatim. Resolution follows surprise, so detail is kept exactly where it's informative.</div></div>
+      <div class="touches">
+        <span class="seg"><span class="h rh">READS</span> <code>episode_sentences</code> <code>vec_sentences</code> <span style="color:var(--muted);font-size:11px">(in memory from W1)</span></span>
+        <span class="seg"><span class="h nh">WRITES nothing</span> <span style="color:var(--muted);font-size:11px">pure CPU</span></span>
+      </div>
+    </div>
+
+    <div class="arrow">↓</div>
+
+    <div class="step async">
+      <span class="tag">W4–W6 · ASYNC · the primitive, batched</span>
+      <h3>Route every fragment — <span class="fn">route_fragments() → measure/decide → resolve_direction()</span></h3>
+      <p>All fragments measured against memory in <b>one batched pass</b> (+ pushed-down baselines), plus a causal sibling check for intra-note dedup. An <b>NLI stance classifier</b> resolves DIRECTION for AMBIGUOUS fragments only — no generative LLM call here.</p>
+      <div class="ex">"embed via HF in prod"   → <span class="b-pred">PREDICTED</span>   <span class="cm">echoes a stored fragment → reinforce anchor, store nothing</span>
+"no torch on 1GB host"   → <span class="b-nov">NOVEL</span>       <span class="cm">open territory → store</span>
+"use OpenAI embeddings"  → <span class="b-amb">AMBIGUOUS</span>   → resolve_direction (NLI) → <span class="b-con">CONTRADICT</span>  <span class="cm">held strong, flagged</span></div>
+      <div class="value"><span class="ic">★</span><div><b>Critical value:</b> the only model call is the NLI stance check (local CrossEncoder, or HF zero-shot MNLI on the prod host) — cheap, discriminative, and only for genuinely ambiguous fragments. No generative LLM on the write path. A within-note echo collapses against a sibling, not memory — so a note repeating itself doesn't bloat the store.</div></div>
+      <div class="touches">
+        <span class="seg"><span class="h rh">READS</span> <code>fragments</code> <span style="color:var(--muted);font-size:11px">(memory pool)</span> <code>baselines</code> <code>calibration_profiles</code></span>
+        <span class="seg"><span class="h nh">WRITES nothing yet</span> <span style="color:var(--muted);font-size:11px">decisions held in memory → W8</span></span>
+      </div>
+    </div>
+
+    <div class="arrow">↓</div>
+
+    <div class="step async">
+      <span class="tag">W7–W8 · ASYNC · tag &amp; save (no new decisions)</span>
+      <h3>Tag and save — <span class="fn">emit FRAGMENTED → apply_fragmented()</span></h3>
+      <p><b>W7 — bookkeeping.</b> Label two fragments: the <b>centre</b> (the note's main point — reconstructs best from memory) and the <b>most-new</b> one (highest surprise). Just flags; they change no decision.</p>
+      <p><b>W8 — save.</b> All routing was already decided in W4–W6. This step just stores the result: write the decision to a log, then fill in the fragment rows and reinforce the matched anchors. Nothing new is decided here — but without it, nothing is saved.</p>
+      <div class="value"><span class="ic">★</span><div><b>Why write to a log first:</b> the routing depended on the NLI call and on what memory looked like at that moment — neither can be reproduced later. Recording it once means the database can always be rebuilt from the log, and a repeat run can't create duplicate fragments.</div></div>
+      <div class="touches">
+        <span class="seg"><span class="h rh">READS</span> <code>episodes</code> <code>episode_sentences</code> <span style="color:var(--muted);font-size:11px">(span→text + medoid vector)</span></span>
+        <span class="seg"><span class="h wh">WRITES</span> <code>events:<em>FRAGMENTED</em></code> <code>fragments</code> <span style="color:var(--muted);font-size:11px">(insert + reinforce strength)</span> <code>episode_fragmentations</code></span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ RETRIEVE ============ -->
+<section class="view" id="retrieve">
+  <h2 class="section">Retrieve — <span style="font-family:var(--mono);font-size:15px;color:var(--accent)">assemble_context()</span></h2>
+  <p class="sub">Two tools read your memory: <b>recall</b> — quick headlines, called often — and <b>assemble_context</b> — the full pull. They work the <b>same way</b>: your question lights up the notes nearest to it, then that light <b>spreads along the links</b> between ideas — but only toward ideas that <i>add something new</i> to what's already lit. The difference is only <b>where they stop</b>. recall stops the moment it knows <b>where</b> the answer lives and hands back a ranked list. assemble_context keeps going and <b>quotes your own words</b> from those spots.</p>
+
+  <div class="banner live"><span class="bi">✅</span><div><b class="live">One engine, two stopping points.</b> Both tools run the same navigator — <code>resonance.activate()</code> (<code>core/resonance.py</code>). <code>recall</code> stops at the activation field and renders headlines; <code>assemble_context</code> keeps going to quote verbatim spans (<code>resonance_context</code>). 100% local — no LLM on the read path.</div></div>
+
+  <div class="iface" style="margin-bottom:18px">
+    <div class="lbl">Interface · MCP tool recall <span class="who">cheap, speculative — call before composing</span></div>
+    <div class="io">
+      <div class="col in"><div class="k">▸ INPUT</div>
+<pre>{ <span class="key">"query"</span>: <span class="s">"has remote work made me
+           more productive or isolated?"</span>,
+  <span class="key">"k"</span>: 8 }</pre></div>
+      <div class="col out"><div class="k">◂ OUTPUT · ranked headlines (~50 tok each)</div>
+<pre>[
+ {<span class="key">"type"</span>:<span class="s">"concept"</span>, <span class="key">"id"</span>:<span class="s">"cpt_…"</span>,
+  <span class="key">"text"</span>:<span class="s">"Remote work"</span>,
+  <span class="key">"score"</span>:0.78, <span class="key">"signals"</span>:[<span class="s">"2-hop"</span>]},
+ {<span class="key">"type"</span>:<span class="s">"claim"</span>, <span class="key">"text"</span>:<span class="s">"I ship more without
+   commute interruptions"</span>, <span class="key">"score"</span>:0.71,
+  <span class="key">"signals"</span>:[<span class="s">"🔁 recurring"</span>], <span class="key">"n_episodes"</span>:3}
+]</pre></div>
+    </div>
+    <div class="value" style="margin-top:8px"><span class="ic">★</span><div>recall renders these headlines straight from the activation field below, then <b>stops</b> — no quoting, no verbatim pull. Compact, ranked, with why-now tags (🔁 recurring / 🕰️ dormant / ⚖️ contested / 2-hop). The assistant reads them and decides whether the full <code>assemble_context</code> pull is worth it.</div></div>
+  </div>
+
+  <h3 class="section" style="font-size:18px;margin:26px 0 4px">The shared engine — <code style="font-family:var(--mono);font-size:13px;color:var(--accent)">activate()</code> <span style="font-family:var(--mono);font-size:13px;color:var(--accent)">core/resonance.py</span></h3>
+  <p class="sub" style="margin-bottom:14px">Both tools start here. Three ideas drive it — and each one carries a <b>filter</b> that tells a genuinely relevant idea apart from a popular one (a hub that lights up for <i>every</i> question).</p>
+
+  <div class="routes" style="margin-bottom:18px">
+    <div class="route"><div class="h" style="color:var(--novel)">① MANY ROADS, ONE PLACE</div><small>Split the question into parts — <code>probes</code> ("more productive" / "more isolated"). Each part lights the graph on its own. Wherever <b>several parts point to the same idea</b>, that idea is probably the answer, so it ranks higher (<code>confluence</code>).</small></div>
+    <div class="route"><div class="h" style="color:var(--accent2)">② ONLY STEP SOMEWHERE NEW</div><small>When the light hops to a neighbouring idea, it only crosses if that idea <b>adds something you don't already have</b>. A near-repeat of what's lit is blocked. (Same "is this new?" test Write uses — <code>residuals_against</code>, now applied along the links.) This is what lets it reach a <i>related</i> idea two hops out.</small></div>
+    <div class="route"><div class="h" style="color:var(--predicted)">③ FIND THE SPOT, THEN QUOTE</div><small>The walk only decides <b>where</b> the answer lives (the bright ideas). The answer itself is your <b>own words</b>, pulled verbatim from the notes behind those ideas. One walk gives both the overview and the exact source.</small></div>
+  </div>
+  <div class="legend3" style="margin:-6px 0 20px">
+    <span>3 filters (without them, the walk just returns popular noise):</span>
+    <span><b style="color:var(--accent)">don't let a hub shout</b> — an idea linked to everything spreads less per link (÷degree<sup>0.5</sup>)</span>
+    <span><b style="color:var(--accent)">don't add a repeat</b> — the "is this new?" gate on every hop</span>
+    <span><b style="color:var(--accent)">discount the generic</b> — an idea wired to everything counts for less</span>
+  </div>
+
+  <div class="qbox"><div class="ql">YOUR QUESTION → split into parts (probes)</div><b>"Has remote work made me more productive, or more isolated?"</b> &nbsp;→&nbsp; <span style="font-family:var(--mono);font-size:12px;color:var(--accent2)">"more productive" · "more isolated"</span></div>
+  <div style="text-align:center;color:var(--line);font-size:18px;margin:4px 0">↓ &nbsp;<span style="font-size:11px;font-family:var(--mono);color:var(--accent2)">activate() — light up the graph</span></div>
+
+  <!-- PHASE A: navigate -->
+  <div class="spread">
+    <h3 style="font-size:15px">The shared step · navigate — <code style="font-family:var(--mono);font-size:13px;color:var(--accent)">activate()</code></h3>
+    <p class="desc">Light up the nearest notes for each part of the question → let the light hop to new ideas (up to 2 hops, stop when a hop adds little) → rank what lit up.</p>
+    <div class="sgrid">
+      <div class="vrule" style="left:25%"></div><div class="vrule" style="left:50%"></div><div class="vrule" style="left:75%"></div>
+      <div class="scol">
+        <div class="hop"><span class="dot"></span>① LIGHT UP · per part</div>
+        <div class="gnode seed"><div class="lab">claim · "I ship more without commute interruptions"</div><div class="act">nearest to "more productive" · <b>0.71</b></div><div class="via via-seed">direct hit</div></div>
+        <div style="font-size:11px;color:var(--muted);margin-top:4px">Each part finds its nearest notes (<code>kNN</code>). "more isolated" lights "I miss the hallway chats" too.</div>
+      </div>
+      <div class="scol">
+        <div class="hop"><span class="dot"></span>② HOP · only if new</div>
+        <div class="edge">cross the link? → <span style="color:#7ee787">does it add something?</span></div>
+        <div class="gnode"><div class="lab">concept · "Team trust" (via link hop)</div><div class="act"><span style="color:#7ee787">new</span> — isolation quietly erodes trust → <b>kept</b></div><div class="via via-hop">non-obvious link</div></div>
+        <div style="font-size:11px;color:var(--muted);margin-top:4px">A neighbour that just repeats what's already lit → blocked. One that adds a new angle → crosses.</div>
+      </div>
+      <div class="scol">
+        <div class="hop"><span class="dot"></span>③ HOP · quiet the hubs</div>
+        <div class="edge"><span class="x">popular idea</span> spreads less per link</div>
+        <div class="gnode dim"><div class="lab">concept · "Work life" (linked to everything)</div><div class="act">too generic → dimmed → <b>0.07</b></div><div class="via via-cut">hub damped</div></div>
+        <div style="font-size:11px;color:var(--muted);margin-top:4px">An idea wired to everything would otherwise drown out the specific ones — so it's turned down.</div>
+      </div>
+      <div class="scol">
+        <div class="hop"><span class="dot"></span>④ RANK · brightness</div>
+        <div class="gnode seed"><div class="lab">concept · "Remote work"</div><div class="act"><b>both</b> parts pointed here → <b style="color:var(--predicted)">brightest</b></div><div class="via via-bridge">two roads met</div></div>
+        <div style="font-size:11px;color:var(--muted);margin-top:4px">Reached by both "productive" and "isolated" → ranked top. Generic ideas sink.</div>
+      </div>
+    </div>
+    <div class="touches" style="margin-top:12px"><span class="seg"><span class="h rh">READS</span> <code>vec_claims</code> <code>vec_concepts</code> <code>concept_members</code> <span style="color:var(--muted);font-size:11px">(primary + channel-code redundant — a query on a concept can recover a claim homed elsewhere)</span> <code>relations</code> <span style="color:var(--muted);font-size:11px">(idea links)</span></span></div>
+  </div>
+
+  <!-- FORK: recall stops, assemble_context continues -->
+  <div class="banner exp" style="margin:18px 0"><span class="bi">⑂</span><div><b class="exp">This is where the two tools split.</b> <code>recall</code> takes the ranked ideas above, adds the why-now tags, and <b>returns the headlines</b> — done (the box at the top). <code>assemble_context</code> keeps going ↓ to turn the brightest ideas into your actual words.</div></div>
+
+  <div style="text-align:center;color:var(--line);font-size:18px;margin:4px 0">↓ &nbsp;<span style="font-size:11px;font-family:var(--mono);color:var(--accent2)">assemble_context only — bright ideas → your own words</span></div>
+
+  <!-- PHASE B: materialise -->
+  <div class="spread">
+    <h3 style="font-size:15px">assemble_context continues · quote — <code style="font-family:var(--mono);font-size:13px;color:var(--accent)">resonance_recall() → resonance_context()</code></h3>
+    <p class="desc">Take the brightest ideas → find the notes behind them → quote them verbatim, in three layers: a short overview, a deep read of the top note, and one line each from the rest.</p>
+    <div class="hstage">
+      <div class="vrule" style="left:33.3%"></div><div class="vrule" style="left:66.6%"></div>
+
+      <!-- frame -->
+      <div class="hcol s1">
+        <div class="hh"><span class="n">1</span> OVERVIEW</div>
+        <p style="font-size:12.5px;color:#cdd6e0;margin:0 0 9px">The brightest <b>handful of concepts</b> give a one-line summary + their top member claims (<b>including channel-code redundant attaches</b> — the parity bits that patch a concept's coverage holes) — the at-a-glance picture a "what do I think about X?" question needs. The walk (not raw similarity) picks which concepts. Capped at <b>~35%</b> of the budget.</p>
+        <div class="gnode seed">
+          <div class="lab">concept · "Remote work"</div>
+          <div class="act">summary + top claims</div>
+        </div>
+      </div>
+
+      <!-- depth -->
+      <div class="hcol s2">
+        <div class="hh"><span class="n">2</span> THE TOP NOTE, IN DEPTH</div>
+        <p style="font-size:12.5px;color:#cdd6e0;margin:0 0 9px">Read the single brightest note <b>closely</b> (more lines from it) — "find the right note, then actually read it." It also keeps that note's <b>standout lines</b> even if they don't match the question word-for-word — the nuance a plain keyword match would miss.</p>
+        <div class="gnode seed">
+          <div class="lab">"The quiet is great for deep work, but the isolation creeps up."</div>
+          <div class="act">deep-read → <b style="color:var(--predicted)">kept</b></div>
+        </div>
+      </div>
+
+      <!-- breadth -->
+      <div class="hcol s3">
+        <div class="hh"><span class="n">3</span> A LINE FROM EACH OF THE REST</div>
+        <p style="font-size:12.5px;color:#cdd6e0;margin:0 0 9px">Every other bright note gives <b>one line</b> → coverage across many notes. The budget reserves space for this breadth <b>first</b>, then hands the leftover to the deep read — so a narrow question funds depth, a wide one keeps coverage. No need to guess which kind it is.</p>
+        <div class="gnode">
+          <div class="lab">5 other notes · 1 line each</div>
+          <div class="act">self-balancing</div>
+        </div>
+        <div class="touches" style="margin-top:8px"><span class="seg"><span class="h rh">READS</span> <code>fragments</code> <code>calibration_profiles</code></span><span class="seg"><span class="h wh">WRITES</span> <code>events:<em>RETRIEVAL_SIGNAL</em></code></span></div>
+      </div>
+    </div>
+    <div class="value" style="margin-top:14px"><span class="ic">★</span><div><b>The whole point:</b> the right notes are <i>found</i> by the walk, not by a fixed recipe. The overview gives breadth, the deep read gives the detail, and the budget balances them on its own — without ever guessing whether you asked a narrow or a wide question.</div></div>
+  </div>
+
+  <div class="arrow">↓</div>
+
+  <!-- shared assembly engine -->
+  <div class="step" style="border-left:3px solid var(--ambiguous)">
+    <span class="tag">SHARED ENGINE · core/assembly.py · assemble() · <i>PRD R-steps</i></span>
+    <h3>How the quoted lines get picked and ordered</h3>
+    <p style="margin-bottom:6px">All the candidate lines (overview + deep read + breadth) go through one picker, weighted by how bright their idea was:</p>
+    <p style="margin-bottom:6px"><span class="pstep ps-f">start</span> from the question itself.</p>
+    <p style="margin-bottom:6px"><span class="pstep ps-f">R5 / R6</span> repeatedly add the line that brings the <b>most new information</b> on top of what's chosen so far. A line that just restates one already picked adds nothing — so <b>duplicates drop out for free</b>.</p>
+    <p style="margin-bottom:6px"><span class="pstep ps-f">stop</span> once new lines stop adding much (<code>ASSEMBLE_GAIN_FLOOR</code>=0.20, max 24 lines) — "enough to answer."</p>
+    <p style="margin-bottom:0"><span class="pstep ps-f">R8 learn</span> record which lines were used vs skipped, so consolidation can later demote notes that keep surfacing but never get used (<code>signals=True</code> in prod).</p>
+  </div>
+
+  <div class="arrow">↓</div>
+
+  <!-- output -->
+  <div class="step">
+    <span class="tag">OUTPUT · resonance_context()</span>
+    <h3>Overview first, then the deep read, then a line each — sized to fit</h3>
+    <div class="iface">
+      <div class="lbl">Interface · assemble_context <span class="who">request → single markdown string</span></div>
+      <div class="io">
+        <div class="col in"><div class="k">▸ INPUT</div>
+<pre>{ <span class="key">"topic"</span>: <span class="s">"remote work —
+       productive or isolated?"</span> }
+<span class="cm">budget ≈ 6000 chars</span></pre></div>
+        <div class="col out"><div class="k">◂ OUTPUT · overview + specifics</div>
+<pre>## Slate context: remote work
+<span class="cm">### Background  (≤ 35%)</span>
+- <b>Remote work</b> — more output,
+  fewer connections
+  - I ship more without commute breaks
+  - I miss the hallway chats
+<span class="cm">### Specifics  (deep read, then a line each)</span>
+### Weekly review — Mar
+- The quiet is great for deep work, but
+  the isolation creeps up.
+- open office boosts collaboration  <span class="b-con">⚠️ contested</span></pre></div>
+      </div>
+      <div class="relay"><b>↳ (assistant injects this, then answers you)</b></div>
+    </div>
+  </div>
+
+  <!-- recall: the same walk, stopped early -->
+  <h3 class="section" style="font-size:18px;margin:30px 0 4px"><code style="font-family:var(--mono);font-size:14px;color:var(--accent)">recall()</code> — the same walk, stopped early</h3>
+  <p class="sub" style="margin-bottom:14px">recall runs the <b>exact navigate step above</b> (<code>resonance.activate</code>, <code>core/recall.py</code>). Instead of quoting, it scores the brightest ideas and returns them as headlines. Its why-now tags come from two places — <b>how an idea was reached</b>, and <b>what's recorded on it</b>:</p>
+
+  <div class="legend3" style="margin:0 0 8px">
+    <span><b>From the walk:</b></span>
+    <span><b style="color:var(--accent)">2-hop</b> — reached by a hop, not a direct match → a non-obvious connection</span>
+  </div>
+  <div class="legend3" style="margin:0 0 18px">
+    <span><b>From the note's own record:</b></span>
+    <span><b style="color:var(--accent)">🔁 recurring</b> — you've come back to it often</span>
+    <span><b style="color:var(--accent)">🕰️ dormant</b> — not touched in a while, now resurfacing</span>
+    <span><b style="color:var(--accent)">⚖️ contested</b> — you later wrote something that disagrees</span>
+  </div>
+</section>
+
+<!-- ============ CONSOLIDATE ============ -->
+<section class="view" id="consolidate">
+  <h2 class="section">Consolidate — <span style="font-family:var(--mono);font-size:15px;color:var(--accent)">consolidate()</span> · the nightly sleep phase</h2>
+  <p class="sub">The <b>only writer</b> to the semantic store, and only via events. Appliers are deterministic, so <code>rebuild()</code> replays the whole log without drift. Anything non-deterministic (LLM output, ids, timestamps) is decided <i>before</i> emit and frozen in the payload.</p>
+
+  <div class="iface" style="margin-bottom:18px">
+    <div class="lbl">Interface · consolidate(user) <span class="who">cron-triggered (nightly), not user-facing</span></div>
+    <div class="io">
+      <div class="col in"><div class="k">▸ INPUT (scheduler → Slate)</div>
+<pre>consolidate(
+  <span class="key">user_id</span>,
+  <span class="key">max_episodes</span>=50)
+<span class="cm"># operates on unconsolidated episodes</span></pre></div>
+      <div class="col out"><div class="k">◂ OUTPUT · run report (logs/ops, not the human)</div>
+<pre>{
+  <span class="key">"status"</span>: <span class="s">"ok"</span>,
+  <span class="key">"run_id"</span>: <span class="s">"run_01J…"</span>,
+  <span class="key">"episodes"</span>: 7, <span class="key">"skipped"</span>: [<span class="s">"ep_…"</span>],
+  <span class="key">"claims_touched"</span>: 23,
+  <span class="key">"cost"</span>: 0.014
+}</pre></div>
+    </div>
+    <div class="value" style="margin-top:8px"><span class="ic">★</span><div>No synchronous human/assistant interface — consolidation runs offline. Its <i>results</i> reach the human two ways: silently (better <code>recall</code>/<code>assemble_context</code> next time) and explicitly via the <code>digest</code> tool ↓.</div></div>
+  </div>
+
+  <div class="rail">
+    <div class="step">
+      <span class="tag">ORDER · C1</span>
+      <h3>Revisit highest-surprise first — <span class="fn">_revisit_order()</span></h3>
+      <p>Oldest unconsolidated episodes, but reordered to spend effort where surprise was highest.</p>
+      <div class="touches">
+        <span class="seg"><span class="h rh">READS</span> <code>episodes</code> <code>episode_consolidations</code> <span style="color:var(--muted);font-size:11px">(which are still pending)</span></span>
+        <span class="seg"><span class="h wh">WRITES</span> <code>consolidation_runs</code> <span style="color:var(--muted);font-size:11px">(start_run)</span></span>
+      </div>
+    </div>
+    <div class="arrow">↓</div>
+
+    <div class="step">
+      <span class="tag">CLAIM GENESIS · no LLM · PRD §21/§178</span>
+      <h3>Mint claims from the fragment layer — <span class="fn">blueprint_from_fragments()</span></h3>
+      <p>Claims come straight from the fragments Write already built — each fragment <i>is</i> both the claim and its representative sentence. Raw text is never re-processed. Unrefined episode? → <b>skip</b> (next run retries), never fall back to raw.</p>
+      <div class="value"><span class="ic">★</span><div><b>Critical value:</b> chunking, membership, centre were already done geometrically at Write — so the only sanctioned LLM work left is claim dedup and the concept judgment call. The expensive layer shrinks dramatically.</div></div>
+      <div class="touches">
+        <span class="seg"><span class="h rh">READS</span> <code>fragments</code> <span style="color:var(--muted);font-size:11px">(the episode's spans + clusters)</span></span>
+        <span class="seg"><span class="h nh">WRITES nothing</span> <span style="color:var(--muted);font-size:11px">builds a blueprint dict in memory</span></span>
+      </div>
+    </div>
+    <div class="arrow">↓</div>
+
+    <div class="step">
+      <span class="tag">CANONICALIZE · C2 · the primitive again</span>
+      <h3>Deduplicate claims — <span class="fn">_dedup_route()</span></h3>
+      <p>Each new claim is measured against its kNN neighbourhood of canonical claims:</p>
+      <div class="ex">claim vs neighbourhood →
+  <span class="b-pred">PREDICTED</span>  → SAME existing claim, bump support   <span class="cm">no LLM</span>
+  <span class="b-amb">AMBIGUOUS</span>  → ask PROMPT_CANON                   <span class="cm">LLM only here, batched</span>
+  <span class="b-nov">NOVEL</span>      → mint NEW canonical claim
+<span class="cm">(thin/cold neighbourhood → absolute-cosine fallback)</span></div>
+      <div class="touches">
+        <span class="seg"><span class="h rh">READS</span> <code>vec_claims</code> <code>claims</code> <code>concept_members</code> <span style="color:var(--muted);font-size:11px">(neighbourhood)</span></span>
+        <span class="seg"><span class="h wh">WRITES</span> <code>events:<em>CANONICALIZED</em></code> → <code>claims</code> <code>vec_claims</code> <code>claim_support</code></span>
+      </div>
+    </div>
+    <div class="arrow">↓</div>
+
+    <div class="step">
+      <span class="tag">CONCEPTS &amp; RELATIONS · LLM judgment</span>
+      <h3>Concept pass + relations — <span class="fn">_concept_pass() · _relations()</span></h3>
+      <p>The LLM decides <b>CREATE / ATTACH / MERGE / SPLIT</b> over new claims vs nearest concepts, then promotes the spine and writes contradiction receipts.</p>
+      <div class="ex">claim "HF API embeddings in prod" → <span class="b-pred">ATTACH</span> to concept "Deployment constraints"</div>
+      <div class="touches">
+        <span class="seg"><span class="h rh">READS</span> <code>vec_concepts</code> <code>concepts</code> <code>concept_members</code> <code>claims</code></span>
+        <span class="seg"><span class="h wh">WRITES</span> <code>events:<em>CONCEPT_CREATED·ATTACHED·MERGED·SPLIT·RELATED</em></code> → <code>concepts</code> <code>vec_concepts</code> <code>concept_members</code> <code>relations</code></span>
+      </div>
+    </div>
+    <div class="arrow">↓</div>
+
+    <div class="step">
+      <span class="tag">MAINTENANCE · C8 / C10 / C9 / C13</span>
+      <h3>Reconcile · integrity · demote · consume signals</h3>
+      <p>
+        <span class="pill">C8 reconcile contradictions</span>
+        <span class="pill">C10 flag claims unfaithful to raw</span>
+        <span class="pill">C9 fold recurrent claims into theme</span>
+        <span class="pill">C13 consume retrieval signals</span>
+      </p>
+      <div class="value"><span class="ic">★</span><div><b>Critical value:</b> C13 closes the retrieve loop — dropped-but-needed spans get promoted, salient-but-never-fetched get demoted. Consolidation sees accumulated retrieval signals, a real proxy for future use Q.</div></div>
+      <div class="touches">
+        <span class="seg"><span class="h rh">READS</span> <code>claims</code> <code>episodes</code> <span style="color:var(--muted);font-size:11px">(C10 vs raw)</span> <code>events:<em>RETRIEVAL_SIGNAL</em></code> <span style="color:var(--muted);font-size:11px">(C13)</span></span>
+        <span class="seg"><span class="h wh">WRITES</span> <code>events:<em>VERSIONED·BACKGROUNDED</em></code> → <code>claims</code> <span style="color:var(--muted);font-size:11px">status / background / salience</span></span>
+      </div>
+    </div>
+    <div class="arrow">↓</div>
+
+    <div class="step">
+      <span class="tag">BRIDGES · C5 · REMOVED 2026-06-27</span>
+      <h3>Latent concept-pair bridges — <span class="fn">_bridges()</span> <b>deleted</b></h3>
+      <p>Was: concept pairs in a medoid residual band, LLM-confirmed → <code>BRIDGED</code> events. <b>Removed</b> — proven retrieval-inert (no Coverage@B change at B or 2B, concept- or claim-edge wiring); the <code>BRIDGE_BOOST</code> retrieval weight and <code>list_bridges</code> MCP went with it. The structural lever that <i>does</i> pay is channel-code redundancy (Step 6c, below) — a claim multi-attached to a far-but-reachable concept it spans into.</p>
+    </div>
+    <div class="arrow">↓</div>
+
+    <div class="step">
+      <span class="tag">CONCEPT REPRESENTATION · Step 6b · the primitive</span>
+      <h3>Re-anchor each concept to its contrastive representative — <span class="fn">_reanchor_concepts()</span></h3>
+      <p>A concept's stored vector is one <b>real member</b> (the medoid), never the mean — averaging members in an already-saturated claim-space drags every concept toward the same global centre and the layer <b>collapses</b>. Once the run's create/merge/split have settled, each concept is re-anchored to the member that is <b>both central to its own cluster <i>and</i> distinct from its neighbours</b>: <code style="font-family:var(--mono)">argmax<sub>m</sub>(r_nbr − λ·r_own)</code> — same residual primitive, now scoring members against own-cluster (squish) vs the J=3 nearest concepts (push). λ=1.</p>
+      <div class="value"><span class="ic">★</span><div><b>Critical value:</b> de-collapses the concept layer (pair-cosine 0.24→0.13) so the retrieve walk can tell concepts apart — lifted paragraph Coverage@B 62→75. Deterministic given settled members + (λ,J), so <code>rebuild()</code> reproduces it. Pure-push (λ=0) drags the anchor to the boundary and tanks broad recall; the <i>margin</i> keeps centrality while sharpening separation.</div></div>
+      <div class="touches">
+        <span class="seg"><span class="h rh">READS</span> <code>concepts</code> <code>concept_members</code> <code>vec_claims</code> <span style="color:var(--muted);font-size:11px">(member vectors + nearest concepts)</span></span>
+        <span class="seg"><span class="h wh">WRITES</span> <code>vec_concepts</code> <span style="color:var(--muted);font-size:11px">(representative vector, in place)</span></span>
+      </div>
+    </div>
+    <div class="arrow">↓</div>
+
+    <div class="step">
+      <span class="tag">CHANNEL-CODE REDUNDANCY · Step 6c · the primitive</span>
+      <h3>Patch coverage holes with scarce parity attaches — <span class="fn">_channel_redundancy()</span></h3>
+      <p>Retrieval is a <b>channel-coding</b> problem, not compression: a query that lands on concept <i>k</i> should still recover a claim whose home is elsewhere when <i>k</i>'s own members can't reconstruct it. For each claim, among its nearest non-home concepts, a <code style="font-family:var(--mono)">(claim, k)</code> pair is an eligible <b>hole</b> iff it is <b>reachable</b> (cosine to <i>k</i>'s centre ≥ 0.55 — a query on <i>k</i> could want it) <i>yet</i> <b>uncovered</b> (reconstruction-z vs <i>k</i>'s members in [1,3] — <i>k</i> can't already rebuild it, but it isn't noise). Rank globally by <code style="font-family:var(--mono)">cos·z</code>, keep the top ~33 (budget 80, ≤1 per claim) — <b>parity bits</b>, not blanket duplication. Written as <code>kind='redundant'</code> members, after the centres are settled.</p>
+      <div class="value"><span class="ic">★</span><div><b>Critical value:</b> lifted paragraph Coverage@B 0.78→0.89 with no narrow/broad cost and no partition collapse. Redundant rows feed <b>retrieval</b> (activation spread + concept enumeration) but are <b>excluded from every centre / baseline / membership computation</b> (primary-only reads), so they never corrupt the concept vector or drift across runs. One <code>CHANNEL_REDUNDANCY</code> event carries the full set, replacing all prior redundant rows → idempotent, <code>rebuild()</code>-reproducible, rollback-reversible. Master switch <code style="font-family:var(--mono)">CHANNEL_REDUNDANCY</code>.</div></div>
+      <div class="touches">
+        <span class="seg"><span class="h rh">READS</span> <code>concept_members</code> <span style="color:var(--muted);font-size:11px">(primary partition)</span> <code>vec_claims</code> <code>vec_concepts</code></span>
+        <span class="seg"><span class="h wh">WRITES</span> <code>events:<em>CHANNEL_REDUNDANCY</em></code> → <code>concept_members</code> <span style="color:var(--muted);font-size:11px">(kind='redundant')</span></span>
+      </div>
+    </div>
+    <div class="arrow">↓</div>
+
+    <div class="step">
+      <span class="tag">QUERY INJECTION · Step 6d · default OFF</span>
+      <h3>Encode real retrieval queries as routing hubs — <span class="fn">_inject_query_claims()</span></h3>
+      <p>A single retrieval lights up only the geometry-nearest region, so cross-note (<b>broad</b>) synthesis questions miss. This encodes the <b>queries themselves</b> as a usage signal: each distinct recent query (from the <code>RETRIEVAL_SIGNAL</code> log) is navigated (<code>resonance.activate</code>), and if it spans ≥2 concepts a <code>qclm_</code> claim is attached to its top-K as <code>kind='query'</code> — a knn seed target + weight-1.0 multi-concept <b>hub</b> the spreader crosses, lighting up regions a single shot misses. If <code style="font-family:var(--mono)">QUERY_CLAIM_REANCHOR</code>, the touched concept medoids re-anchor to include the query-claims (the centroid drifts toward the question-shapes that retrieve it — the <b>broad</b> lever).</p>
+      <div class="value"><span class="ic">★</span><div><b>Status: SHIPPED, default OFF</b> (<code style="font-family:var(--mono)">INJECT_QUERY_CLAIMS</code>). Cosine-proxy gain (broad +0.077 / paragraph +0.111) is <b>not yet confirmed under a sonnet-class LLM judge</b>, and the re-anchor mutates concept vectors (forgetting gate pending) — so it's wired but inert. <b>Three isolation guards:</b> query text never reaches an answer (fragment path has no episode; the breadth frame filters <code>qclm_</code>) nor the minting LLM / normal medoid (primary-only reads; <code>kind='query'</code> isn't primary), and <code>kind='query'</code>≠<code>'redundant'</code> so channel-code never clobbers it. One <code>QUERY_INJECTED</code> event carries the full set → replace-whole, idempotent, <code>rebuild()</code>-reproducible. See docs/query-claims-findings.md.</div></div>
+      <div class="touches">
+        <span class="seg"><span class="h rh">READS</span> <code>events:<em>RETRIEVAL_SIGNAL</em></code> <code>vec_claims</code> <code>vec_concepts</code> <code>concept_members</code></span>
+        <span class="seg"><span class="h wh">WRITES</span> <code>events:<em>QUERY_INJECTED</em></code> → <code>claims</code> <code>vec_claims</code> <code>concept_members</code> <span style="color:var(--muted);font-size:11px">(kind='query')</span> · <code>vec_concepts</code> <span style="color:var(--muted);font-size:11px">(if reanchor)</span></span>
+      </div>
+    </div>
+    <div class="arrow">↓</div>
+
+    <div class="step">
+      <span class="tag">HEALTH + CALIBRATION · C12</span>
+      <h3>Decay/prune, then re-fit &amp; push down — <span class="fn">_decay_strengthen() · _prune_safely() · _fit_baselines()</span></h3>
+      <p>Spaced-repetition health model strengthens/decays/prunes. Then, with regions settled, fragments are <b>re-clustered onto concepts</b>, cohesion baselines (μ,σ) and calibration are recomputed and <b>pushed back down</b> to Write &amp; Retrieve.</p>
+      <div class="value"><span class="ic">★</span><div><b>Critical value — this closes the system:</b> the compression bet (z_echo, gain_floor, depth_share) is re-fitted against accumulated signal and pushed down, so the next Write/Retrieve measures <code>z</code> against settled regions. Everything is reversible against the immutable raw record.</div></div>
+      <div class="touches">
+        <span class="seg"><span class="h rh">READS</span> <code>claims</code> <code>concepts</code> <code>fragments</code> <code>vec_*</code> <span style="color:var(--muted);font-size:11px">(re-cluster + fit)</span></span>
+        <span class="seg"><span class="h wh">WRITES</span> <code>events:<em>STRENGTHENED·DECAYED·PRUNED·RECLUSTERED</em></code> → <code>claims</code> <code>concepts</code> <code>concept_members</code> <code>fragments.cluster</code> · then <code>baselines</code> <code>calibration_profiles</code> · <code>consolidation_runs</code> <code>episode_consolidations</code></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="iface">
+    <div class="lbl">Interface · MCP tool digest <span class="who">how consolidation reaches the human</span></div>
+    <div class="io">
+      <div class="col in"><div class="k">▸ INPUT</div>
+<pre>{ <span class="key">"since_hours"</span>: 36 }
+<span class="cm"># "what's new in my notes?"</span></pre></div>
+      <div class="col out"><div class="k">◂ OUTPUT · markdown, ready to relay</div>
+<pre>## What emerged overnight
+⚡ Contradiction reconciled: HF vs OpenAI
+   embeddings — HF kept (current)
+🔁 Strengthened: <span class="s">"1GB host limit"</span> (×3)
+🌫️ Going dormant: <span class="s">"v1 engine notes"</span></pre></div>
+    </div>
+    <div class="relay"><b>↳ digest (assistant → human)</b><div>relayed verbatim — the explicit channel for offline consolidation results.</div></div>
+  </div>
+</section>
+
+<!-- ============ DATA ============ -->
+<section class="view" id="data">
+  <h2 class="section">Data model — what's saved where</h2>
+  <p class="sub">Four layers, one rule: <b style="color:var(--green)">episodes are the immutable truth</b>; <b style="color:var(--accent2)">the event log is the backbone</b>; <b style="color:var(--novel)">everything semantic is a derived view</b> that <code>rebuild()</code> can re-create from episodes + events; config/caches sit outside and survive rebuild. (SQLite + sqlite-vec; every table is partitioned by <code>user_id</code>.)</p>
+
+  <div class="legend2">
+    <span><span class="w w-save">SAVE</span> written by save_note</span>
+    <span><span class="w w-cons">CONSOLIDATE</span> written nightly</span>
+    <span><span class="w w-ret">RETRIEVE</span> written on lookup</span>
+    <span><span class="w w-imm">IMMUTABLE</span> insert-only, never updated</span>
+  </div>
+
+  <!-- LAYER 1 -->
+  <div class="layer epi">
+    <h3>① Episodic store · the source of truth</h3>
+    <p class="desc">The note exactly as the user wrote it, plus its sentence vectors. A DB trigger blocks any UPDATE/DELETE — this layer is append-only. Everything else can be thrown away and rebuilt; this cannot.</p>
+    <div class="tbls">
+      <div class="tbl"><div class="nm">episodes <span class="w w-save">SAVE</span><span class="w w-imm">IMMUTABLE</span></div>
+        <div class="fields">
+          <div class="f"><span class="fn2 pk">id</span><span class="fd"><em>ep_&lt;ulid&gt;</em> — primary key; ulid sorts by creation time</span></div>
+          <div class="f"><span class="fn2">raw_text</span><span class="fd">the note exactly as the user wrote it — never edited</span></div>
+          <div class="f"><span class="fn2">title</span><span class="fd">3–8 word title (assistant-generated)</span></div>
+          <div class="f"><span class="fn2">ts</span><span class="fd">ISO timestamp; a replayed note keeps its original date</span></div>
+          <div class="f"><span class="fn2">source</span><span class="fd"><em>mcp</em> / <em>replay</em> / <em>import</em> — where the note came from</span></div>
+          <div class="f"><span class="fn2">receipt_json</span><span class="fd">the W1 novelty receipt (echoes/contradictions/novelties)</span></div>
+        </div></div>
+      <div class="tbl"><div class="nm">episode_sentences <span class="w w-save">SAVE</span><span class="w w-imm">IMMUTABLE</span></div>
+        <div class="fields">
+          <div class="f"><span class="fn2 pk">episode_id, idx</span><span class="fd">composite key — which note, and sentence position within it</span></div>
+          <div class="f"><span class="fn2">text</span><span class="fd">the verbatim sentence (used to reconstruct fragment spans)</span></div>
+        </div></div>
+      <div class="tbl"><div class="nm">vec_sentences <span class="w w-save">SAVE</span></div>
+        <div class="fields">
+          <div class="f"><span class="fn2 pk">sent_key</span><span class="fd"><em>"&lt;episode_id&gt;:&lt;idx&gt;"</em> — joins a vector back to its sentence</span></div>
+          <div class="f"><span class="fn2">embedding</span><span class="fd"><em>FLOAT[384]</em> — MiniLM vector; the only embedding stored (fragments reuse it via medoid_idx)</span></div>
+          <div class="f"><span class="fn2">user_id</span><span class="fd">vec0 partition key — kNN never crosses users</span></div>
+        </div></div>
+    </div>
+  </div>
+
+  <!-- LAYER 2 -->
+  <div class="layer log">
+    <h3>② Event log · the backbone</h3>
+    <p class="desc">Every decision any flow makes is appended here first, then materialized into the tables below. Append-only and ordered by <code>seq</code>. The semantic store is literally a replay of this log — so the log, not the tables, is the real record.</p>
+    <div class="tbls">
+      <div class="tbl" style="grid-column:1/-1"><div class="nm">events <span class="w w-save">SAVE</span><span class="w w-cons">CONSOLIDATE</span><span class="w w-ret">RETRIEVE</span><span class="w w-imm">IMMUTABLE</span></div>
+        <div class="fields">
+          <div class="f"><span class="fn2 pk">seq</span><span class="fd">autoincrement — the total order events are replayed in</span></div>
+          <div class="f"><span class="fn2">ts</span><span class="fd">when the decision was taken</span></div>
+          <div class="f"><span class="fn2">run_id</span><span class="fd">which consolidation run emitted it (NULL for W1/W8/retrieve); lets a run be rolled back</span></div>
+          <div class="f"><span class="fn2">type</span><span class="fd">the decision kind — dispatches to its applier</span></div>
+          <div class="f"><span class="fn2">payload_json</span><span class="fd">the frozen decision; carries <em>references</em> (ids, spans) not copied text/vectors</span></div>
+        </div>
+        <div class="meta" style="margin-top:9px">types: <b>ENCODED</b> (W1) · <b>FRAGMENTED</b> (W8) · <b>RETRIEVAL_SIGNAL</b> (R8) · <b>CANONICALIZED · CONCEPT_CREATED · ATTACHED · MERGED · SPLIT · RELATED · STRENGTHENED · DECAYED · BACKGROUNDED · VERSIONED · PRUNED · RECLUSTERED</b> (consolidation).</div></div>
+    </div>
+  </div>
+
+  <!-- LAYER 3 -->
+  <div class="layer sem">
+    <h3>③ Semantic store · derived view (rebuildable)</h3>
+    <p class="desc"><code>rebuild()</code> truncates all of these and replays the event log to re-create them. Three sub-layers of increasing distillation: <b>fragments</b> (write-time working memory) → <b>claims</b> (canonical assertions) → <b>concepts</b> (clustered themes) → <b>relations</b> (links between them).</p>
+    <div class="tbls">
+      <div class="tbl"><div class="nm">fragments <span class="w w-save">SAVE</span><span class="w w-cons">CONSOLIDATE</span></div>
+        <div class="fields">
+          <div class="f"><span class="fn2 pk">id</span><span class="fd"><em>frg_&lt;md5 of user+ep+span&gt;</em> — content-addressed, so retries don't duplicate</span></div>
+          <div class="f"><span class="fn2">episode_id</span><span class="fd">provenance — the immutable note this span came from</span></div>
+          <div class="f"><span class="fn2">text</span><span class="fd">the fragment (its sentence span, joined)</span></div>
+          <div class="f"><span class="fn2">sent_start/end</span><span class="fd">inclusive sentence-index range the fragment covers</span></div>
+          <div class="f"><span class="fn2">medoid_idx</span><span class="fd">→ vec_sentences: the representative sentence whose vector <em>is</em> this fragment's vector</span></div>
+          <div class="f"><span class="fn2">route</span><span class="fd"><em>NOVEL</em> or <em>AMBIGUOUS</em> (PREDICTED is never stored)</span></div>
+          <div class="f"><span class="fn2">z</span><span class="fd">surprise — residual z-score vs memory's spread</span></div>
+          <div class="f"><span class="fn2">residual, weight</span><span class="fd">raw novelty + its within-note share (relative salience)</span></div>
+          <div class="f"><span class="fn2">anchor_id</span><span class="fd">the prior fragment it sits on (AMBIGUOUS); NULL for NOVEL</span></div>
+          <div class="f"><span class="fn2">direction</span><span class="fd"><em>contradict / refine / reinforce</em> — the NLI verdict (AMBIGUOUS only)</span></div>
+          <div class="f"><span class="fn2">cluster</span><span class="fd">region it belongs to — the scope per-cluster calibration resolves on; re-set by consolidation</span></div>
+          <div class="f"><span class="fn2">is_centre / is_novel_peak</span><span class="fd">W7 flags: the note's core / its most-novel point</span></div>
+          <div class="f"><span class="fn2">strength, reinforced</span><span class="fd">bumped + counted each time a later fragment is PREDICTED by it</span></div>
+        </div>
+        <div class="meta" style="margin-top:8px"><b>No vec_fragments table</b> — the vector is the medoid sentence's, referenced via medoid_idx.</div></div>
+      <div class="tbl"><div class="nm">claims + vec_claims <span class="w w-cons">CONSOLIDATE</span></div>
+        <div class="fields">
+          <div class="f"><span class="fn2 pk">id</span><span class="fd"><em>clm_&lt;md5 of text&gt;</em> — identical text → identical id (dedup is free)</span></div>
+          <div class="f"><span class="fn2">text</span><span class="fd">the canonical, distilled assertion</span></div>
+          <div class="f"><span class="fn2">strength</span><span class="fd">spaced-repetition weight — bumped on re-encounter, decayed over time</span></div>
+          <div class="f"><span class="fn2">last_seen</span><span class="fd">last time a note re-asserted it</span></div>
+          <div class="f"><span class="fn2">status</span><span class="fd"><em>current / superseded / version</em> — C8 contradiction handling</span></div>
+          <div class="f"><span class="fn2">version_group</span><span class="fd">ties rival beliefs together so contestation is always surfaced</span></div>
+          <div class="f"><span class="fn2">superseded_by</span><span class="fd">points an old belief at the one that replaced it</span></div>
+          <div class="f"><span class="fn2">background</span><span class="fd">C9 — re-seen so often its theme stands for it; demotes standalone pull</span></div>
+        </div></div>
+      <div class="tbl"><div class="nm">claim_support <span class="w w-cons">CONSOLIDATE</span></div>
+        <div class="fields">
+          <div class="f"><span class="fn2 pk">claim_id, episode_id</span><span class="fd">a claim ↔ each note that backs it (many-to-many)</span></div>
+          <div class="f"><span class="fn2">verbatim_sentence</span><span class="fd">the exact original sentence — the audit trail back to raw</span></div>
+        </div></div>
+      <div class="tbl"><div class="nm">concepts + vec_concepts <span class="w w-cons">CONSOLIDATE</span></div>
+        <div class="fields">
+          <div class="f"><span class="fn2 pk">id</span><span class="fd"><em>cpt_&lt;ulid&gt;</em> — a clustered theme</span></div>
+          <div class="f"><span class="fn2">label</span><span class="fd">2–4 word name</span></div>
+          <div class="f"><span class="fn2">canonical</span><span class="fd">one-sentence description of the theme</span></div>
+          <div class="f"><span class="fn2">state</span><span class="fd"><em>grounded / active / stale / dormant</em> — health/decay stage</span></div>
+          <div class="f"><span class="fn2">strength, last_activity</span><span class="fd">salience + when it was last touched (drives decay)</span></div>
+        </div>
+        <div class="meta" style="margin-top:8px">vec_concepts vector = a real member (the <b>medoid</b>, not the mean — the mean collapses the layer), refined to a contrastive representative end-of-run (Step 6b).</div></div>
+      <div class="tbl"><div class="nm">concept_members <span class="w w-cons">CONSOLIDATE</span></div>
+        <div class="fields">
+          <div class="f"><span class="fn2 pk">concept_id, claim_id</span><span class="fd">which claims belong to which concept (the clustering)</span></div>
+          <div class="f"><span class="fn2">weight</span><span class="fd">how central the claim is to the concept</span></div>
+          <div class="f"><span class="fn2">kind</span><span class="fd"><em>primary</em> = the claim's home (exactly one) · <em>redundant</em> = a channel-code parity attach (Step 6c) · <em>query</em> = a query-claim routing hub (Step 6d, default OFF). Retrieval spread reads all three; centres/baselines/membership read <em>primary</em> only</span></div>
+        </div></div>
+      <div class="tbl"><div class="nm">relations <span class="w w-cons">CONSOLIDATE</span></div>
+        <div class="fields">
+          <div class="f"><span class="fn2 pk">from_id, to_id, relation</span><span class="fd">a directed link; from/to are claim or concept ids</span></div>
+          <div class="f"><span class="fn2">relation</span><span class="fd"><em>leads_to / contradicts / supports</em></span></div>
+          <div class="f"><span class="fn2">weight</span><span class="fd">link strength / confidence</span></div>
+          <div class="f"><span class="fn2">evidence_episode_id</span><span class="fd">the note that justified the link</span></div>
+        </div></div>
+    </div>
+  </div>
+
+  <!-- LAYER 4 -->
+  <div class="layer cfg">
+    <h3>④ Config &amp; bookkeeping · outside the rebuild</h3>
+    <p class="desc">Not derived from events, so <code>rebuild()</code> leaves them untouched. The fitted calibration bet + measurement baselines (pushed down to Write/Retrieve), plus "done" markers tracking which episodes each flow has processed.</p>
+    <div class="tbls">
+      <div class="tbl"><div class="nm">calibration_profiles <span class="w w-cons">CONSOLIDATE</span></div>
+        <div class="fields">
+          <div class="f"><span class="fn2 pk">user_id</span><span class="fd">one fitted profile per user</span></div>
+          <div class="f"><span class="fn2">profile_json</span><span class="fd">the compression bet — <em>z_echo, gain_floor, depth_share…</em> — pushed down to Write/Retrieve (C12)</span></div>
+        </div></div>
+      <div class="tbl"><div class="nm">baselines <span class="w w-cons">CONSOLIDATE</span></div>
+        <div class="fields">
+          <div class="f"><span class="fn2 pk">user_id</span><span class="fd">one snapshot per user</span></div>
+          <div class="f"><span class="fn2">baselines_json</span><span class="fd">per-cluster cohesion (μ,σ) + prior — the spread a residual's z is measured against</span></div>
+        </div></div>
+      <div class="tbl"><div class="nm">episode_fragmentations <span class="w w-save">SAVE</span></div>
+        <div class="fields">
+          <div class="f"><span class="fn2 pk">episode_id</span><span class="fd">"W2–W8 done" marker — its absence drives the retry sweep</span></div>
+          <div class="f"><span class="fn2">n_fragments</span><span class="fd">how many fragments the note produced</span></div>
+        </div></div>
+      <div class="tbl"><div class="nm">episode_consolidations <span class="w w-cons">CONSOLIDATE</span></div>
+        <div class="fields">
+          <div class="f"><span class="fn2 pk">episode_id</span><span class="fd">"consolidated" marker — keeps the next run from re-processing it</span></div>
+          <div class="f"><span class="fn2">run_id</span><span class="fd">which run consolidated it</span></div>
+        </div></div>
+      <div class="tbl"><div class="nm">consolidation_runs <span class="w w-cons">CONSOLIDATE</span></div>
+        <div class="fields">
+          <div class="f"><span class="fn2 pk">id</span><span class="fd"><em>run_&lt;ulid&gt;</em></span></div>
+          <div class="f"><span class="fn2">status</span><span class="fd"><em>ok / failed</em> — a failed run leaves its episodes unmarked for retry</span></div>
+          <div class="f"><span class="fn2">n_episodes</span><span class="fd">how many notes the run covered</span></div>
+          <div class="f"><span class="fn2">cost_estimate</span><span class="fd">LLM spend — surfaced in the run report</span></div>
+        </div></div>
+      <div class="tbl"><div class="nm">replay_map <span class="w w-save">SAVE</span></div>
+        <div class="fields">
+          <div class="f"><span class="fn2 pk">old_source_id, user_id</span><span class="fd">the external note's original id</span></div>
+          <div class="f"><span class="fn2">episode_id</span><span class="fd">the episode it became — makes re-import idempotent (import/replay only)</span></div>
+        </div></div>
+    </div>
+  </div>
+
+  <div class="value"><span class="ic">★</span><div><b>The two load-bearing ideas:</b> (1) <b>nothing is stored twice</b> — fragments reference sentence vectors via <code>medoid_idx</code> (there's deliberately no <code>vec_fragments</code>), and event payloads reference spans instead of copying text. (2) <b>layers ③ + parts of ④ are disposable</b> — only layer ① (episodes) + layer ② (events) are irreplaceable; everything else is a cache you can rebuild byte-for-byte.</div></div>
+
+  <h2 class="section" style="margin-top:34px">Which process writes which table</h2>
+  <p class="sub">Every write is one of four processes. <span class="op ins">INSERT</span> add rows · <span class="op upd">UPDATE</span> mutate in place · <span class="op del">DELETE</span> remove · <span class="rd">read</span> read-only · <span class="dash">—</span> untouched. Note how narrow each process's write surface is.</p>
+
+  <div class="wrapx">
+  <table class="matrix">
+    <thead><tr>
+      <th>Table</th>
+      <th>W1 · save_note<br><small style="color:var(--green)">sync, core/encode</small></th>
+      <th>W2–W8 · refine<br><small style="color:var(--accent2)">async, core/write</small></th>
+      <th>Retrieve<br><small style="color:var(--ambiguous)">core/resonance+assembly</small></th>
+      <th>Consolidate<br><small style="color:var(--novel)">nightly, core/consolidate</small></th>
+    </tr></thead>
+    <tbody>
+      <tr class="grp"><td colspan="5">① Episodic store — immutable</td></tr>
+      <tr><th>episodes</th><td><span class="op ins">INSERT</span></td><td><span class="dash">—</span></td><td><span class="rd">read</span></td><td><span class="rd">read</span></td></tr>
+      <tr><th>episode_sentences</th><td><span class="op ins">INSERT</span></td><td><span class="dash">—</span></td><td><span class="dash">—</span></td><td><span class="rd">read</span></td></tr>
+      <tr><th>vec_sentences</th><td><span class="op ins">INSERT</span></td><td><span class="rd">read</span><small>medoid ref</small></td><td><span class="rd">read</span><small>query kNN</small></td><td><span class="rd">read</span></td></tr>
+
+      <tr class="grp"><td colspan="5">② Event log — backbone</td></tr>
+      <tr><th>events</th><td><span class="op ins">INSERT</span><small>ENCODED</small></td><td><span class="op ins">INSERT</span><small>FRAGMENTED</small></td><td><span class="op ins">INSERT</span><small>RETRIEVAL_SIGNAL</small></td><td><span class="op ins">INSERT</span><small>12 types ↓</small></td></tr>
+
+      <tr class="grp"><td colspan="5">③ Semantic store — derived</td></tr>
+      <tr><th>fragments</th><td><span class="dash">—</span></td><td><span class="op ins">INSERT</span> <span class="op upd">UPDATE</span><small>rows + reinforce strength</small></td><td><span class="rd">read</span><small>seed/assemble</small></td><td><span class="op upd">UPDATE</span><small>cluster (RECLUSTERED)</small></td></tr>
+      <tr><th>claims · vec_claims</th><td><span class="dash">—</span></td><td><span class="dash">—</span></td><td><span class="rd">read</span></td><td><span class="op ins">INSERT</span> <span class="op upd">UPDATE</span> <span class="op del">DELETE</span><small>canon / strength·status / prune</small></td></tr>
+      <tr><th>claim_support</th><td><span class="dash">—</span></td><td><span class="dash">—</span></td><td><span class="dash">—</span></td><td><span class="op ins">INSERT</span><small>provenance</small></td></tr>
+      <tr><th>concepts · vec_concepts</th><td><span class="dash">—</span></td><td><span class="dash">—</span></td><td><span class="rd">read</span></td><td><span class="op ins">INSERT</span> <span class="op upd">UPDATE</span> <span class="op del">DELETE</span><small>create/merge/split/decay</small></td></tr>
+      <tr><th>concept_members</th><td><span class="dash">—</span></td><td><span class="dash">—</span></td><td><span class="rd">read</span><small>primary + redundant</small></td><td><span class="op ins">INSERT</span> <span class="op del">DELETE</span><small>attach / fold / prune / channel-code</small></td></tr>
+      <tr><th>relations</th><td><span class="dash">—</span></td><td><span class="dash">—</span></td><td><span class="rd">read</span><small>spreading activation</small></td><td><span class="op ins">INSERT</span><small>RELATED</small></td></tr>
+
+      <tr class="grp"><td colspan="5">④ Config &amp; bookkeeping — survives rebuild</td></tr>
+      <tr><th>calibration_profiles</th><td><span class="dash">—</span></td><td><span class="rd">read</span></td><td><span class="rd">read</span></td><td><span class="op upd">WRITE</span><small>C12 fit</small></td></tr>
+      <tr><th>baselines</th><td><span class="dash">—</span></td><td><span class="rd">read</span></td><td><span class="dash">—</span></td><td><span class="op upd">WRITE</span><small>C12 fit</small></td></tr>
+      <tr><th>episode_fragmentations</th><td><span class="dash">—</span></td><td><span class="op ins">INSERT</span><small>done-marker</small></td><td><span class="dash">—</span></td><td><span class="rd">read</span></td></tr>
+      <tr><th>episode_consolidations</th><td><span class="dash">—</span></td><td><span class="dash">—</span></td><td><span class="dash">—</span></td><td><span class="op ins">INSERT</span></td></tr>
+      <tr><th>consolidation_runs</th><td><span class="dash">—</span></td><td><span class="dash">—</span></td><td><span class="dash">—</span></td><td><span class="op ins">INSERT</span> <span class="op upd">UPDATE</span><small>start→finish</small></td></tr>
+      <tr><th>replay_map</th><td><span class="op ins">INSERT</span><small>if replay</small></td><td><span class="dash">—</span></td><td><span class="dash">—</span></td><td><span class="dash">—</span></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <div class="value" style="margin-bottom:30px"><span class="ic">★</span><div><b>Read the columns:</b> Save touches only layer ① + two markers — it never writes anything semantic. Retrieve writes <i>one</i> thing (a signal event) and is otherwise pure read. Consolidate is the <b>only</b> writer of claims/concepts/relations. Every write also lands in <code>events</code> first (column-wide INSERT) — the tables are downstream of the log.</div></div>
+
+  <h2 class="section">Inside consolidate — event → table (the applier)</h2>
+  <p class="sub">Consolidation never writes tables directly: each decision is an event, and <code>apply_event()</code> (<code>core/consolidate.py:156</code>) materializes it. This is the exact dispatch — and it's the same path <code>rebuild()</code> replays.</p>
+  <div class="evmap">
+    <div class="ev"><div class="et">CANONICALIZED</div><div class="tl"><i>new</i> → <span class="op ins">INS</span> <code>claims</code>,<code>vec_claims</code>,<code>claim_support</code><br><i>support</i> → <span class="op upd">UPD</span> <code>claims.strength</code> + <span class="op ins">INS</span> <code>claim_support</code></div></div>
+    <div class="ev"><div class="et">CONCEPT_CREATED</div><div class="tl"><span class="op ins">INS</span> <code>concepts</code>,<code>vec_concepts</code>,<code>concept_members</code></div></div>
+    <div class="ev"><div class="et">ATTACHED</div><div class="tl"><span class="op ins">INS</span> <code>concept_members</code> · <span class="op upd">UPD</span> <code>concepts.last_activity</code>,<code>vec_concepts</code></div></div>
+    <div class="ev"><div class="et">MERGED</div><div class="tl"><span class="op ins">INS</span>/<span class="op del">DEL</span> <code>concept_members</code> · <span class="op upd">UPD</span> winner / <span class="op del">DEL</span> loser <code>concepts</code></div></div>
+    <div class="ev"><div class="et">SPLIT</div><div class="tl"><span class="op del">DEL</span> parent + <span class="op ins">INS</span> children <code>concepts</code>,<code>concept_members</code></div></div>
+    <div class="ev"><div class="et">RELATED</div><div class="tl"><span class="op ins">INS</span> <code>relations</code></div></div>
+    <div class="ev"><div class="et">STRENGTHENED</div><div class="tl"><span class="op upd">UPD</span> <code>claims.strength</code> and/or <code>concepts.strength</code></div></div>
+    <div class="ev"><div class="et">DECAYED</div><div class="tl"><span class="op upd">UPD</span> <code>concepts.state</code> (active→stale→dormant)</div></div>
+    <div class="ev"><div class="et">BACKGROUNDED · C9</div><div class="tl"><span class="op upd">UPD</span> <code>claims.background</code> = 1</div></div>
+    <div class="ev"><div class="et">VERSIONED · C8</div><div class="tl"><span class="op upd">UPD</span> <code>claims.status</code>,<code>version_group</code>,<code>superseded_by</code></div></div>
+    <div class="ev"><div class="et">PRUNED · C7</div><div class="tl"><span class="op del">DEL</span> <code>concept_members</code>; if no <em>primary</em> home left <span class="op del">DEL</span> <code>claims</code></div></div>
+    <div class="ev"><div class="et">CHANNEL_REDUNDANCY · 6c</div><div class="tl"><span class="op del">DEL</span> all <code>kind='redundant'</code> + <span class="op ins">INS</span> the new set into <code>concept_members</code> (replace-whole → idempotent)</div></div>
+    <div class="ev"><div class="et">QUERY_INJECTED · 6d <small>(default OFF)</small></div><div class="tl"><span class="op del">DEL</span> all <code>qclm_</code> claims + <code>kind='query'</code> rows + <span class="op ins">INS</span> the fresh set into <code>claims</code>,<code>vec_claims</code>,<code>concept_members</code> · <span class="op upd">UPD</span> <code>vec_concepts</code> (demand-side medoid, if reanchor) — replace-whole → idempotent</div></div>
+    <div class="ev"><div class="et">RECLUSTERED · C12</div><div class="tl"><span class="op upd">UPD</span> <code>fragments.cluster</code> → nearest concept</div></div>
+    <div class="ev"><div class="et">FRAGMENTED</div><div class="tl">re-applied on rebuild → <code>write.apply_fragmented()</code> (see flow ①)</div></div>
+    <div class="ev"><div class="et">ENCODED · INTEGRITY_FLAGGED</div><div class="tl">log-only — nothing materialized (episodic-side / review signal)</div></div>
+  </div>
+</section>
+
+<div class="note">
+  Generated from the <code>v3-changes</code> branch · <code>core/encode.py</code>, <code>write.py</code>, <code>predict.py</code>, <code>resonance.py</code>, <code>retrieve.py</code>, <code>assembly.py</code>, <code>consolidate.py</code>.
+  Route legend: <span class="badge b-pred">PREDICTED</span> reinforce · <span class="badge b-amb">AMBIGUOUS</span> store + NLI direction · <span class="badge b-nov">NOVEL</span> store · <span class="badge b-con">CONTRADICT</span> held strong.
+  <br><b>Model-call legend:</b> <b>NLI</b> = discriminative stance check (write-time direction, encode-time contradiction) · <b>LLM</b> = generative call, reserved for consolidation (claim dedup, concept pass).
+</div>
+</div>
+
+<script>
+  const tabs = document.querySelectorAll('.tab');
+  const views = document.querySelectorAll('.view');
+  tabs.forEach(t => t.addEventListener('click', () => {
+    tabs.forEach(x => x.classList.remove('active'));
+    views.forEach(v => v.classList.remove('active'));
+    t.classList.add('active');
+    document.getElementById(t.dataset.view).classList.add('active');
+  }));
+</script>
+</body>
+</html>

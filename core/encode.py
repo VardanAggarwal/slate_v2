@@ -51,7 +51,13 @@ def get_embedder():
 
 
 # ── Stance classifier (PLAN.md §9.1: local NLI first, one Haiku call fallback) ─
+# The W6 resolver answers ONE bit at write: contradiction or not. The 'nli'
+# CrossEncoder needs torch — absent on the 1GB HF-only prod host, where it throws
+# and silently returns "neutral", turning every contradiction into a refine. The
+# 'hf' provider mirrors HFEmbedder: same HF_TOKEN, server-side MNLI via
+# InferenceClient.zero_shot_classification — no torch, so contradictions survive.
 _nli = None
+_hf_stance = None
 
 
 def _get_nli():
@@ -60,6 +66,49 @@ def _get_nli():
         from sentence_transformers import CrossEncoder
         _nli = CrossEncoder(config.NLI_MODEL)
     return _nli
+
+
+class HFStance:
+    """Zero-shot MNLI over the HF Inference API (no torch). P(premise ⊨ hypothesis)
+    is read with the hypothesis as the single candidate label and a pass-through
+    template, then bucketed high→entail / low→contradict / mid→neutral.
+
+    LIMITATION (known): a single entailment score separates entail from not-entail,
+    but "not entailed" spans BOTH neutral and contradiction — this collapsed read
+    cannot distinguish them. STANCE_CONTRADICT_MAX is therefore set LOW so only a
+    confident non-entailment is called a contradiction (favouring false-neutrals
+    over false-contradictions, since a missed contradiction is reconciled later at
+    consolidation but a false one is over-held). A faithful 3-class read (P_contra,
+    P_neutral, P_entail) for the 'hf' provider — matching the local 'nli' path — is
+    a follow-up; the 'nli' and 'haiku' providers already read all three."""
+
+    def __init__(self, token: str, model: str | None = None):
+        from huggingface_hub import InferenceClient
+        self._client = InferenceClient(api_key=token)
+        self._model = model or config.STANCE_HF_MODEL
+
+    def _entail_prob(self, premise: str, hypothesis: str) -> float:
+        res = self._client.zero_shot_classification(
+            premise, [hypothesis], multi_label=True,
+            hypothesis_template="{}", model=self._model)
+        # hub returns either dicts or output objects with .label/.score
+        first = res[0] if isinstance(res, (list, tuple)) else res
+        return float(first["score"] if isinstance(first, dict) else first.score)
+
+    def classify(self, premise: str, hypothesis: str) -> str:
+        p = self._entail_prob(premise, hypothesis)
+        if p >= config.STANCE_ENTAIL_MIN:
+            return "entailment"
+        if p <= config.STANCE_CONTRADICT_MAX:
+            return "contradiction"
+        return "neutral"
+
+
+def _get_hf_stance():
+    global _hf_stance
+    if _hf_stance is None:
+        _hf_stance = HFStance(config.HF_TOKEN)
+    return _hf_stance
 
 
 def classify_stance(premise: str, hypothesis: str) -> str:
@@ -71,6 +120,11 @@ def classify_stance(premise: str, hypothesis: str) -> str:
             return labels[int(scores.argmax())]
         except Exception:
             return "neutral"  # model unavailable/offline — don't block the save
+    if config.STANCE_PROVIDER == "hf":
+        try:
+            return _get_hf_stance().classify(premise, hypothesis)
+        except Exception:
+            return "neutral"  # transient HF failure — degrade, don't block
     if config.STANCE_PROVIDER == "haiku":
         from core import llm
         try:

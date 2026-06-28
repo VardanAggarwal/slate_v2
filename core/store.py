@@ -13,6 +13,7 @@ Multi-user invariants (AUTH.md):
   with user_id — see consolidate.claim_id_for) because vec0 PRIMARY KEYs are
   unique across partitions, not per-partition.
 """
+import hashlib
 import json
 import os
 import sqlite3
@@ -86,12 +87,22 @@ CREATE TABLE IF NOT EXISTS episode_sentences (
 
 -- SEMANTIC STORE (derived; rebuildable from episodes + events)
 CREATE TABLE IF NOT EXISTS claims (
-    id         TEXT PRIMARY KEY,            -- clm_<md5 of user_id + canonical text>
-    user_id    TEXT NOT NULL,
-    text       TEXT NOT NULL,
-    strength   REAL DEFAULT 1.0,
-    created_at TEXT,
-    last_seen  TEXT
+    id            TEXT PRIMARY KEY,         -- clm_<md5 of user_id + canonical text>
+    user_id       TEXT NOT NULL,
+    text          TEXT NOT NULL,
+    strength      REAL DEFAULT 1.0,
+    created_at    TEXT,
+    last_seen     TEXT,
+    -- C8 versioning: a claim is 'current' | 'superseded' | 'version' (held).
+    -- version_group ties the rival beliefs together; superseded_by points a
+    -- past belief at the one that replaced it; qualifier scopes a conditional.
+    status        TEXT DEFAULT 'current',
+    superseded_by TEXT,
+    qualifier     TEXT,
+    version_group TEXT,
+    -- C9 background: a claim re-predicted enough to become background (its theme
+    -- now stands for it). Orthogonal to status; demotes standalone retrieval pull.
+    background    INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS claim_support (
@@ -118,14 +129,63 @@ CREATE TABLE IF NOT EXISTS concept_members (
     user_id    TEXT NOT NULL,
     claim_id   TEXT NOT NULL,
     weight     REAL DEFAULT 1.0,
+    kind       TEXT DEFAULT 'primary',   -- 'primary' | 'redundant' (channel-code attach) | 'query' (query-claim hub)
     PRIMARY KEY (concept_id, claim_id)
+);
+
+-- WRITE-SIDE WORKING MEMORY (derived; rebuildable from episodes + FRAGMENTED events)
+-- The predictor's output: the async Write refine pass (core/write.py, W2–W8)
+-- segments a note into variable-resolution fragments, routes each against memory
+-- (PRD: predicted/novel/ambiguous), and persists the NOVEL/AMBIGUOUS ones here.
+-- This is working memory: it may be wrong and is fully re-derivable, so — like
+-- claims/concepts — it is truncated and replayed by rebuild(). Written ONLY via
+-- the FRAGMENTED event applier (write.apply_fragmented); ids are deterministic
+-- (frg_<md5 of user+episode+span>) so retries and rebuild are idempotent.
+CREATE TABLE IF NOT EXISTS fragments (
+    id            TEXT PRIMARY KEY,        -- frg_<md5>
+    user_id       TEXT NOT NULL,
+    episode_id    TEXT NOT NULL,           -- provenance: the immutable raw episode
+    text          TEXT NOT NULL,           -- the fragment text (joined sentence span)
+    sent_start    INTEGER,                 -- inclusive episode_sentences.idx range …
+    sent_end      INTEGER,                 -- … this fragment spans
+    medoid_idx    INTEGER,                 -- the fragment's representative sentence (episode_sentences.idx):
+                                           -- its vector IS this sentence's vector in vec_sentences, so NO
+                                           -- duplicate fragment vector is stored — fragment_pool/knn_fragments
+                                           -- REFERENCE vec_sentences via (episode_id, medoid_idx). NULL only
+                                           -- on the legacy/bare-applier path (no sentences) → no referable vector.
+    route         TEXT,                    -- 'NOVEL' | 'AMBIGUOUS' (PREDICTED is never stored)
+    z             REAL,                    -- surprise: residual z-score vs memory's spread
+    residual      REAL,
+    weight        REAL,                    -- within-note residual share (relative salience)
+    anchor_id     TEXT,                    -- prior fragment it sits on (AMBIGUOUS); NULL for NOVEL
+    direction     TEXT,                    -- 'contradict'|'refine'|'reinforce' (resolver, AMBIGUOUS only)
+    cluster       TEXT,                    -- region/cluster this fragment belongs to: the SCOPE the
+                                           -- per-cluster calibration (z_echo/prox_margin) resolves on.
+                                           -- Bootstrapped at write by anchor-inheritance; re-clustered
+                                           -- by consolidation. NULL → global threshold (cold/sparse).
+    is_centre     INTEGER DEFAULT 0,       -- note medoid (lowest-residual stored fragment)
+    is_novel_peak INTEGER DEFAULT 0,       -- note's most-novel point (highest z)
+    strength      REAL DEFAULT 1.0,        -- bumped when a later fragment is PREDICTED by it
+    reinforced    INTEGER DEFAULT 0,       -- count of confirmed predictions (PRD: reinforcement)
+    created_at    TEXT,
+    last_seen     TEXT
+);
+
+-- Bookkeeping: which episodes the Write refine pass has processed (parallel to
+-- episode_consolidations). NOT truncated by rebuild — it is the "done" marker;
+-- the fragment rows themselves are rebuilt from FRAGMENTED events.
+CREATE TABLE IF NOT EXISTS episode_fragmentations (
+    episode_id    TEXT PRIMARY KEY,
+    user_id       TEXT NOT NULL,
+    fragmented_at TEXT NOT NULL,
+    n_fragments   INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS relations (
     from_id             TEXT NOT NULL,      -- claim or concept id
     to_id               TEXT NOT NULL,
     user_id             TEXT NOT NULL,
-    relation            TEXT NOT NULL,      -- 'leads_to'|'contradicts'|'supports'|'bridges'|...
+    relation            TEXT NOT NULL,      -- 'leads_to'|'contradicts'|'supports'|...
     weight              REAL DEFAULT 1.0,
     created_at          TEXT,
     evidence_episode_id TEXT,
@@ -138,9 +198,30 @@ CREATE TABLE IF NOT EXISTS events (
     user_id      TEXT NOT NULL,
     ts           TEXT NOT NULL,
     run_id       TEXT,
-    type         TEXT NOT NULL,             -- ENCODED|CANONICALIZED|CONCEPT_CREATED|MERGED|
-                                            -- SPLIT|BRIDGED|RELATED|DECAYED|STRENGTHENED
+    type         TEXT NOT NULL,             -- ENCODED|FRAGMENTED|CANONICALIZED|CONCEPT_CREATED|
+                                            -- MERGED|SPLIT|RELATED|DECAYED|STRENGTHENED
     payload_json TEXT NOT NULL
+);
+
+-- C12 calibration: the fitted compression/budget profile per user (the bet over
+-- Q,B that consolidation owns and pushes down to Write/Retrieve). NOT event-derived
+-- and NOT truncated by rebuild — it is fitted config, like consolidation_runs.
+CREATE TABLE IF NOT EXISTS calibration_profiles (
+    user_id      TEXT PRIMARY KEY,
+    profile_json TEXT NOT NULL,
+    updated_at   TEXT
+);
+
+-- C12 baselines: the per-cluster cohesion (μ,σ) + prior-over-clusters that the
+-- predictor measures a residual's z against. MEASUREMENT context (not the Q,B bet —
+-- see core/predict.py §2), recomputed at consolidation when clusters change and
+-- pushed down so Write reads a stable snapshot instead of rebuilding it every write.
+-- Derived cache (recomputable from the corpus), so — like calibration_profiles — it
+-- is NOT event-derived and survives rebuild untouched; the next run refreshes it.
+CREATE TABLE IF NOT EXISTS baselines (
+    user_id        TEXT PRIMARY KEY,
+    baselines_json TEXT NOT NULL,
+    updated_at     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS consolidation_runs (
@@ -202,6 +283,7 @@ CREATE INDEX IF NOT EXISTS idx_episodes_ts ON episodes(ts);
 CREATE INDEX IF NOT EXISTS idx_episodes_user ON episodes(user_id, ts);
 CREATE INDEX IF NOT EXISTS idx_claims_user ON claims(user_id);
 CREATE INDEX IF NOT EXISTS idx_concepts_user ON concepts(user_id);
+CREATE INDEX IF NOT EXISTS idx_fragments_user ON fragments(user_id, episode_id);
 
 -- PLAN.md §10: episodes are immutable — enforced mechanically, not by convention
 CREATE TRIGGER IF NOT EXISTS episodes_no_update BEFORE UPDATE ON episodes
@@ -217,6 +299,9 @@ _VEC_SCHEMA = [
     f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_sentences USING vec0(user_id TEXT PARTITION KEY, sent_key TEXT PRIMARY KEY, embedding FLOAT[{config.EMBED_DIM}])",
     f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_claims USING vec0(user_id TEXT PARTITION KEY, claim_id TEXT PRIMARY KEY, embedding FLOAT[{config.EMBED_DIM}])",
     f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_concepts USING vec0(user_id TEXT PARTITION KEY, concept_id TEXT PRIMARY KEY, embedding FLOAT[{config.EMBED_DIM}])",
+    # NOTE: there is deliberately NO vec_fragments table. A fragment's vector is its
+    # medoid sentence's vector, already in vec_sentences; fragment_pool/knn_fragments
+    # reference it via (episode_id, medoid_idx) instead of storing a second copy.
 ]
 
 _FTS_SCHEMA = "CREATE VIRTUAL TABLE IF NOT EXISTS episodes_fts USING fts5(episode_id UNINDEXED, user_id UNINDEXED, title, raw_text)"
@@ -252,9 +337,36 @@ def connect(db_path: str | Path | None = None) -> sqlite3.Connection:
     for stmt in _VEC_SCHEMA:
         conn.execute(stmt)
     conn.execute(_FTS_SCHEMA)
+    _migrate_add_columns(conn)
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     conn.commit()
     return conn
+
+
+# Idempotent additive column migrations for tables that predate a column. The
+# schema is otherwise CREATE-IF-NOT-EXISTS, which never adds a column to an
+# existing table — so a new column on an existing table is added here.
+_ADD_COLUMNS = {"fragments": {"cluster": "TEXT", "medoid_idx": "INTEGER"},
+                "claims": {"status": "TEXT DEFAULT 'current'", "superseded_by": "TEXT",
+                           "qualifier": "TEXT", "version_group": "TEXT",
+                           "background": "INTEGER DEFAULT 0"},
+                # 'primary' = the LLM-decided home; 'redundant' = a channel-code
+                # coverage-hole attach (Consolidate step 6c). Redundant rows feed
+                # retrieval spread/materialize but are excluded from center/baseline
+                # computation, so they never corrupt the concept vector.
+                "concept_members": {"kind": "TEXT DEFAULT 'primary'"}}
+
+
+def _migrate_add_columns(conn: sqlite3.Connection) -> None:
+    # Reclaim the now-unused duplicate-vector index from pre-reference DBs. The
+    # fragment vector is referenced from vec_sentences (via medoid_idx); a rebuild
+    # repopulates fragments.medoid_idx. Harmless no-op once gone.
+    conn.execute("DROP TABLE IF EXISTS vec_fragments")
+    for table, cols in _ADD_COLUMNS.items():
+        have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for col, decl in cols.items():
+            if col not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 
 
 # ── Users (AUTH.md §2/§6) ─────────────────────────────────────────────────────
@@ -377,8 +489,14 @@ def append_event(conn: sqlite3.Connection, user_id: str, type_: str, payload: di
 
 
 def events_since(conn: sqlite3.Connection, user_id: str | None, seq: int = 0,
-                 types: list[str] | None = None) -> list[sqlite3.Row]:
-    """user_id=None spans all users — reserved for rebuild (admin path)."""
+                 types: list[str] | None = None,
+                 include_rolled_back: bool = True) -> list[sqlite3.Row]:
+    """user_id=None spans all users — reserved for rebuild (admin path).
+
+    Default returns the FULL log (audit/inspection). Materialization (rebuild,
+    re-derive) passes ``include_rolled_back=False`` so a rolled-back run's events
+    are skipped — the run never happened as far as the semantic store is concerned
+    (events stay on disk for audit; only their materialization is suppressed)."""
     q = "SELECT * FROM events WHERE seq > ?"
     args: list = [seq]
     if user_id is not None:
@@ -387,7 +505,17 @@ def events_since(conn: sqlite3.Connection, user_id: str | None, seq: int = 0,
     if types:
         q += f" AND type IN ({','.join('?' * len(types))})"
         args.extend(types)
+    if not include_rolled_back:
+        q += " AND " + ACTIVE_RUN_PREDICATE
     return conn.execute(q + " ORDER BY seq", args).fetchall()
+
+
+# A run's events are materialized only while the run is not rolled back. Write-side
+# events (run_id IS NULL) are never consolidation runs, so always active.
+ACTIVE_RUN_PREDICATE = (
+    "(run_id IS NULL OR run_id NOT IN "
+    "(SELECT id FROM consolidation_runs WHERE status = 'rolled_back'))"
+)
 
 
 # ── Episodic writes (called by encode.py inside one transaction) ──────────────
@@ -480,6 +608,20 @@ def count_episodes(conn: sqlite3.Connection, user_id: str) -> int:
                         (user_id,)).fetchone()["n"]
 
 
+def episode_sentences_with_vectors(conn: sqlite3.Connection, user_id: str,
+                                   episode_id: str) -> list[dict]:
+    """An episode's sentences in order, each with its W1-persisted embedding —
+    so the Write refine pass segments/routes over the vectors already stored, with
+    no re-embed. Returns [{idx, text, embedding(np)}] ordered by idx."""
+    rows = conn.execute(
+        """SELECT s.idx, s.text, v.embedding FROM episode_sentences s
+           JOIN vec_sentences v ON v.sent_key = s.episode_id || ':' || s.idx
+           WHERE s.episode_id = ? AND s.user_id = ? ORDER BY s.idx""",
+        (episode_id, user_id)).fetchall()
+    return [{"idx": r["idx"], "text": r["text"],
+             "embedding": _deserialize(r["embedding"])} for r in rows]
+
+
 def unconsolidated_episodes(conn: sqlite3.Connection, user_id: str) -> list[sqlite3.Row]:
     return conn.execute(
         """SELECT e.* FROM episodes e
@@ -566,6 +708,216 @@ def claim_embedding(conn: sqlite3.Connection, user_id: str, claim_id: str):
     return _deserialize(row["embedding"]) if row else None
 
 
+def concept_embedding(conn: sqlite3.Connection, user_id: str, concept_id: str):
+    """A concept's centroid vector (normalized mean of member claims), or None.
+    Used by hierarchical retrieve as the BACKGROUND frame to subtract from a query."""
+    row = conn.execute(
+        "SELECT embedding FROM vec_concepts WHERE concept_id = ? AND user_id = ?",
+        (concept_id, user_id)).fetchone()
+    return _deserialize(row["embedding"]) if row else None
+
+
+def related_concepts(conn: sqlite3.Connection, user_id: str,
+                     concept_ids: list[str]) -> list[dict]:
+    """Concept→concept graph neighbours of `concept_ids` via the relations table —
+    the substrate the residual-VOI graph-walk hops over (replacing recall.py's
+    fixed-decay spreading activation). Returns {concept_id, relation, weight,
+    edge_score} for each edge whose OTHER endpoint is a concept not in the seed set."""
+    if not concept_ids:
+        return []
+    seed = set(concept_ids)
+    ph = ",".join("?" * len(concept_ids))
+    rows = conn.execute(
+        f"""SELECT from_id, to_id, relation, weight FROM relations
+            WHERE user_id = ? AND (from_id IN ({ph}) OR to_id IN ({ph}))""",
+        (user_id, *concept_ids, *concept_ids)).fetchall()
+    out, best = [], {}
+    for r in rows:
+        other = r["to_id"] if r["from_id"] in seed else r["from_id"]
+        if not other.startswith("cpt_") or other in seed:
+            continue
+        w = min(1.0, r["weight"] or 1.0)
+        score = w
+        if other not in best or score > best[other][0]:
+            best[other] = (score, r["relation"], w)
+    for cid, (score, rel, w) in best.items():
+        out.append({"concept_id": cid, "relation": rel, "weight": w,
+                    "edge_score": round(score, 4)})
+    out.sort(key=lambda d: -d["edge_score"])
+    return out
+
+
+def fragments_for_episodes(conn: sqlite3.Connection, user_id: str,
+                           episode_ids: list[str], embedding) -> list[dict]:
+    """Fragments belonging to the given episodes, shaped like `fragment_candidates`
+    (with medoid embedding + provenance + cosine `similarity` to `embedding`). Lets
+    the graph-walk inject fragments from graph-reached notes the query knn missed —
+    the R0 fix: a topically-linked but lexically-distant note becomes reachable."""
+    if not episode_ids:
+        return []
+    ph = ",".join("?" * len(episode_ids))
+    rows = conn.execute(
+        f"""SELECT f.id, f.episode_id, f.medoid_idx, f.text, f.route, f.strength,
+                   f.cluster, f.weight, f.is_centre, f.is_novel_peak, f.direction,
+                   e.title, e.ts, v.embedding
+            FROM fragments f JOIN episodes e ON e.id = f.episode_id
+            JOIN vec_sentences v ON v.sent_key = f.episode_id || ':' || f.medoid_idx
+            WHERE f.user_id = ? AND f.medoid_idx IS NOT NULL
+              AND f.episode_id IN ({ph})""",
+        (user_id, *episode_ids)).fetchall()
+    import numpy as np
+    q = np.asarray(embedding, dtype=float)
+    out = []
+    for r in rows:
+        emb = _deserialize(r["embedding"])
+        sim = float(np.asarray(emb, dtype=float) @ q)
+        out.append({"id": r["id"], "frag_id": r["id"], "text": r["text"],
+                    "embedding": emb, "episode_id": r["episode_id"],
+                    "title": r["title"], "ts": r["ts"], "cluster": r["cluster"],
+                    "route": r["route"], "strength": r["strength"],
+                    "weight": r["weight"], "is_centre": r["is_centre"],
+                    "is_novel_peak": r["is_novel_peak"], "direction": r["direction"],
+                    "similarity": round(sim, 4)})
+    return out
+
+
+def concept_episode_ids(conn: sqlite3.Connection, user_id: str,
+                        concept_id: str) -> list[str]:
+    """Distinct source episodes of a concept's member claims — the path from a
+    graph-reached concept to its verbatim fragments."""
+    return [r["episode_id"] for r in conn.execute(
+        """SELECT DISTINCT cs.episode_id FROM concept_members cm
+           JOIN claim_support cs ON cs.claim_id = cm.claim_id
+             AND cs.user_id = cm.user_id
+           WHERE cm.concept_id = ? AND cm.user_id = ?""",
+        (concept_id, user_id))]
+
+
+def claim_in_any_concept(conn: sqlite3.Connection, user_id: str, claim_id: str) -> bool:
+    """Does the claim have a HOME concept? PRIMARY membership only — a channel-code
+    'redundant' attach is a parity bit, not a home (and is wiped/recomputed each run),
+    so it must not keep an otherwise-homeless claim alive (C7 prune) or pass the
+    'has a theme to fold into' guard (C9 demote). Mirrors _claim_concept's filter."""
+    return conn.execute(
+        "SELECT 1 FROM concept_members WHERE claim_id = ? AND user_id = ? "
+        "AND kind = 'primary' LIMIT 1",
+        (claim_id, user_id)).fetchone() is not None
+
+
+def delete_claim(conn: sqlite3.Connection, user_id: str, claim_id: str) -> None:
+    """Drop a claim from working memory (claim + support + vector). The raw
+    episodes it was derived from are untouched, so it stays re-derivable — this
+    is only ever called on a guard-confirmed reconstructable claim (C7 prune)."""
+    conn.execute("DELETE FROM claim_support WHERE claim_id = ? AND user_id = ?",
+                 (claim_id, user_id))
+    conn.execute("DELETE FROM concept_members WHERE claim_id = ? AND user_id = ?",
+                 (claim_id, user_id))
+    conn.execute("DELETE FROM claims WHERE id = ? AND user_id = ?", (claim_id, user_id))
+    conn.execute("DELETE FROM vec_claims WHERE claim_id = ?", (claim_id,))
+
+
+def set_claim_version(conn: sqlite3.Connection, user_id: str, claim_id: str,
+                      **fields) -> None:
+    """C8 — set a claim's version state. Additive; only the named columns move."""
+    allowed = {"status", "superseded_by", "qualifier", "version_group"}
+    sets = {k: v for k, v in fields.items() if k in allowed}
+    if not sets:
+        return
+    assign = ", ".join(f"{k} = ?" for k in sets)
+    conn.execute(f"UPDATE claims SET {assign} WHERE id = ? AND user_id = ?",
+                 (*sets.values(), claim_id, user_id))
+
+
+def set_claim_background(conn: sqlite3.Connection, user_id: str, claim_id: str,
+                         value: int = 1) -> None:
+    """C9 — mark a claim background (its theme now represents it). Reversible."""
+    conn.execute("UPDATE claims SET background = ? WHERE id = ? AND user_id = ?",
+                 (int(value), claim_id, user_id))
+
+
+def claim_support_count(conn: sqlite3.Connection, user_id: str, claim_id: str) -> int:
+    return conn.execute(
+        "SELECT COUNT(*) AS n FROM claim_support WHERE claim_id = ? AND user_id = ?",
+        (claim_id, user_id)).fetchone()["n"]
+
+
+def claim_source_episodes(conn: sqlite3.Connection, user_id: str, claim_id: str) -> list[str]:
+    """Episodes that support a claim (the reverse of `claims_for_episode`). Used by
+    consolidation's fragment→concept prior to find a claim's Write-time source note."""
+    return [r["episode_id"] for r in conn.execute(
+        "SELECT DISTINCT episode_id FROM claim_support WHERE claim_id = ? AND user_id = ?",
+        (claim_id, user_id))]
+
+
+def episode_fragments(conn: sqlite3.Connection, user_id: str, episode_id: str) -> list[dict]:
+    """Fragments of ONE episode as {id, route, anchor_id, cluster, embedding} — the
+    medoid vector REFERENCED from vec_sentences (no duplicate stored), same join as
+    `fragment_pool` but scoped + carrying route/anchor. Empty when the episode hasn't
+    been refined yet (Write async), so consolidation's prior degrades to a no-op."""
+    rows = conn.execute(
+        """SELECT f.id, f.route, f.anchor_id, f.cluster, v.embedding FROM fragments f
+           JOIN vec_sentences v ON v.sent_key = f.episode_id || ':' || f.medoid_idx
+           WHERE f.user_id = ? AND f.episode_id = ? AND f.medoid_idx IS NOT NULL""",
+        (user_id, episode_id)).fetchall()
+    return [{"id": r["id"], "route": r["route"], "anchor_id": r["anchor_id"],
+             "cluster": r["cluster"], "embedding": _deserialize(r["embedding"])}
+            for r in rows]
+
+
+def episode_fragment_spans(conn: sqlite3.Connection, user_id: str,
+                           episode_id: str) -> list[dict]:
+    """Materialized fragments of ONE episode as verbatim spans for claim genesis
+    (PRD §178: claims are minted from the fragment layer, never by re-processing raw):
+    {text, cluster, is_centre} ordered by position. Only `medoid_idx IS NOT NULL`
+    (referable / materialized) rows — same filter as `episode_fragments`. PREDICTED
+    fragments are never stored, so these rows are exactly the NOVEL/AMBIGUOUS residual
+    content. Empty when the episode is unrefined (Write async) → caller skips it."""
+    rows = conn.execute(
+        """SELECT text, cluster, is_centre FROM fragments
+           WHERE user_id = ? AND episode_id = ? AND medoid_idx IS NOT NULL
+           ORDER BY sent_start""", (user_id, episode_id)).fetchall()
+    return [{"text": r["text"], "cluster": r["cluster"],
+             "is_centre": bool(r["is_centre"])} for r in rows]
+
+
+def fragment_episode(conn: sqlite3.Connection, user_id: str, frag_id: str) -> str | None:
+    """The source episode of a fragment — the C13 bridge from a retrieval signal
+    (which keys on fragment ids) to the claims derived from the same episode."""
+    row = conn.execute(
+        "SELECT episode_id FROM fragments WHERE id = ? AND user_id = ?",
+        (frag_id, user_id)).fetchone()
+    return row["episode_id"] if row else None
+
+
+def claims_for_episode(conn: sqlite3.Connection, user_id: str, episode_id: str) -> list[str]:
+    return [r["claim_id"] for r in conn.execute(
+        "SELECT DISTINCT claim_id FROM claim_support WHERE episode_id = ? AND user_id = ?",
+        (episode_id, user_id))]
+
+
+def contradiction_pairs(conn: sqlite3.Connection, user_id: str,
+                        claim_ids: list[str] | None = None) -> list[tuple[str, str]]:
+    """(from_id, to_id) for every 'contradicts' edge, optionally restricted to
+    edges touching `claim_ids`. The conflict signal C8 reconciles."""
+    q = ("SELECT from_id, to_id FROM relations WHERE relation = 'contradicts' "
+         "AND user_id = ?")
+    rows = conn.execute(q, (user_id,)).fetchall()
+    pairs = [(r["from_id"], r["to_id"]) for r in rows]
+    if claim_ids is not None:
+        s = set(claim_ids)
+        pairs = [p for p in pairs if p[0] in s or p[1] in s]
+    return pairs
+
+
+def claim_versions(conn: sqlite3.Connection, user_id: str,
+                   version_group: str) -> list[sqlite3.Row]:
+    """All claims belonging to one belief's version group (current + held +
+    superseded). Used to surface 'contested' at retrieval."""
+    return conn.execute(
+        "SELECT * FROM claims WHERE version_group = ? AND user_id = ? ORDER BY id",
+        (version_group, user_id)).fetchall()
+
+
 def insert_concept(conn: sqlite3.Connection, user_id: str, concept_id: str,
                    label: str, canonical: str, ts: str) -> None:
     conn.execute(
@@ -598,11 +950,74 @@ def delete_concept(conn: sqlite3.Connection, user_id: str, concept_id: str) -> N
 
 
 def add_concept_member(conn: sqlite3.Connection, user_id: str, concept_id: str,
-                       claim_id: str, weight: float = 1.0) -> None:
+                       claim_id: str, weight: float = 1.0, kind: str = "primary") -> None:
     conn.execute(
-        """INSERT INTO concept_members (concept_id, user_id, claim_id, weight)
-           VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING""",
-        (concept_id, user_id, claim_id, weight))
+        """INSERT INTO concept_members (concept_id, user_id, claim_id, weight, kind)
+           VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING""",
+        (concept_id, user_id, claim_id, weight, kind))
+
+
+def set_channel_redundancy(conn: sqlite3.Connection, user_id: str,
+                           pairs: dict) -> int:
+    """Replace ALL of a user's redundant memberships with `pairs`
+    ({claim_id: [concept_id, ...]}). Idempotent — clears prior kind='redundant' rows
+    then inserts the fresh set, so re-running consolidation never accumulates stale
+    attaches. Primary rows are untouched; a (concept, claim) that is already a primary
+    member stays primary (PK conflict → no-op). Applier for the CHANNEL_REDUNDANCY
+    event; rebuild() replays it, the last event's set winning."""
+    conn.execute("DELETE FROM concept_members WHERE user_id = ? AND kind = 'redundant'",
+                 (user_id,))
+    n = 0
+    for claim_id, concept_ids in pairs.items():
+        for concept_id in concept_ids:
+            conn.execute(
+                """INSERT INTO concept_members (concept_id, user_id, claim_id, weight, kind)
+                   VALUES (?, ?, ?, 1.0, 'redundant') ON CONFLICT DO NOTHING""",
+                (concept_id, user_id, claim_id))
+            n += 1
+    return n
+
+
+def clear_query_claims(conn: sqlite3.Connection, user_id: str) -> None:
+    """Drop ALL of a user's query-claims — the kind='query' memberships, the qclm_
+    claim rows, and their vectors. The replace-whole half of the QUERY_INJECTED
+    applier (mirrors set_channel_redundancy): clear, then re-insert the fresh set,
+    so re-running consolidation or rebuilding the log never accumulates stale
+    query-claims (last QUERY_INJECTED event wins). Scoped to qclm_ ids so a real
+    content claim that happens to be a kind='query' member is never deleted."""
+    conn.execute(
+        "DELETE FROM concept_members WHERE user_id = ? AND kind = 'query'", (user_id,))
+    conn.execute(
+        "DELETE FROM vec_claims WHERE user_id = ? AND claim_id LIKE 'qclm\\_%' ESCAPE '\\'",
+        (user_id,))
+    conn.execute(
+        "DELETE FROM claims WHERE user_id = ? AND id LIKE 'qclm\\_%' ESCAPE '\\'", (user_id,))
+
+
+def recompute_concept_embedding_demand(conn: sqlite3.Connection, user_id: str,
+                                       concept_id: str) -> None:
+    """Demand-side medoid: like recompute_concept_embedding but the candidate set
+    INCLUDES kind='query' members (the query-claims). The concept vector can then
+    drift toward the question-shapes that retrieve it — the lever that moves broad
+    (cross-note synthesis). Deterministic argmax → rebuild reproduces it. Only the
+    QUERY_INJECTED applier calls this, and only when QUERY_CLAIM_REANCHOR is on; the
+    normal path (recompute_concept_embedding, primary_only) is unaffected."""
+    import numpy as np
+    rows = conn.execute(
+        "SELECT claim_id FROM concept_members WHERE concept_id = ? AND user_id = ? "
+        "AND kind IN ('primary', 'query') ORDER BY claim_id", (concept_id, user_id))
+    vecs = [v for v in (claim_embedding(conn, user_id, r["claim_id"]) for r in rows)
+            if v is not None]
+    conn.execute("DELETE FROM vec_concepts WHERE concept_id = ?", (concept_id,))
+    if not vecs:
+        return
+    V = np.vstack(vecs)
+    medoid = V[0] if V.shape[0] == 1 else V[int(np.argmax((V @ V.T).sum(axis=1)))]
+    norm = np.linalg.norm(medoid)
+    if norm > 0:
+        medoid = medoid / norm
+    conn.execute("INSERT INTO vec_concepts (user_id, concept_id, embedding) VALUES (?, ?, ?)",
+                 (user_id, concept_id, serialize_float32([float(x) for x in medoid])))
 
 
 def remove_concept_member(conn: sqlite3.Connection, user_id: str, concept_id: str,
@@ -612,10 +1027,16 @@ def remove_concept_member(conn: sqlite3.Connection, user_id: str, concept_id: st
         (concept_id, claim_id, user_id))
 
 
-def concept_member_ids(conn: sqlite3.Connection, user_id: str, concept_id: str) -> list[str]:
-    return [r["claim_id"] for r in conn.execute(
-        "SELECT claim_id FROM concept_members WHERE concept_id = ? AND user_id = ? ORDER BY claim_id",
-        (concept_id, user_id))]
+def concept_member_ids(conn: sqlite3.Connection, user_id: str, concept_id: str,
+                       primary_only: bool = False) -> list[str]:
+    """Member claim ids of a concept. Retrieval reads ALL members (primary +
+    redundant — redundancy is the point). Center/baseline computation passes
+    primary_only=True so channel-code redundant attaches never move the concept vector."""
+    q = "SELECT claim_id FROM concept_members WHERE concept_id = ? AND user_id = ?"
+    if primary_only:
+        q += " AND kind = 'primary'"
+    q += " ORDER BY claim_id"
+    return [r["claim_id"] for r in conn.execute(q, (concept_id, user_id))]
 
 
 def get_concept(conn: sqlite3.Connection, user_id: str, concept_id: str) -> sqlite3.Row | None:
@@ -628,23 +1049,51 @@ def all_concepts(conn: sqlite3.Connection, user_id: str) -> list[sqlite3.Row]:
                         (user_id,)).fetchall()
 
 
+def concept_pool(conn: sqlite3.Connection, user_id: str) -> list[dict]:
+    """Every concept's id + (normalized mean-of-members) vector — the consolidated
+    REGIONS a fragment is re-clustered against at C12. Reads the materialized
+    vec_concepts; concepts with no vector (emptied/just-deleted) are skipped."""
+    rows = conn.execute(
+        "SELECT concept_id, embedding FROM vec_concepts WHERE user_id = ? ORDER BY concept_id",
+        (user_id,)).fetchall()
+    return [{"concept_id": r["concept_id"], "embedding": _deserialize(r["embedding"])}
+            for r in rows]
+
+
+def set_fragment_clusters(conn: sqlite3.Connection, user_id: str,
+                          assignments: dict[str, str]) -> int:
+    """C12 re-cluster applier: set each fragment's `cluster` to its assigned region
+    (concept id). Bulk UPDATE keyed on (user_id, frag_id). Returns rows touched."""
+    conn.executemany(
+        "UPDATE fragments SET cluster = ? WHERE user_id = ? AND id = ?",
+        [(cluster, user_id, fid) for fid, cluster in assignments.items()])
+    return len(assignments)
+
+
 def recompute_concept_embedding(conn: sqlite3.Connection, user_id: str,
                                 concept_id: str) -> None:
-    """Concept vector = normalized mean of member claim vectors (deterministic,
-    so event-log rebuild reproduces it exactly)."""
+    """Concept vector = MEDOID member (the member nearest all others, max summed
+    cosine), not the centroid mean. A mean is pulled toward the crowded global
+    centre — averaging members of an already-saturated claim-space collapses every
+    concept toward the same point, so the concept layer ends up LESS separable than
+    the claims. The medoid is a real member vector, on-manifold, so concepts keep
+    their natural spread (the de-collapse the consolidation layer is for).
+    Deterministic (argmax over stored vectors), so event-log rebuild reproduces it.
+    PRIMARY members only — channel-code redundant attaches must not pull the medoid."""
     import numpy as np
-    members = concept_member_ids(conn, user_id, concept_id)
+    members = concept_member_ids(conn, user_id, concept_id, primary_only=True)
     vecs = [claim_embedding(conn, user_id, c) for c in members]
     vecs = [v for v in vecs if v is not None]
     conn.execute("DELETE FROM vec_concepts WHERE concept_id = ?", (concept_id,))
     if not vecs:
         return
-    mean = np.mean(vecs, axis=0)
-    norm = np.linalg.norm(mean)
+    V = np.vstack(vecs)
+    medoid = V[0] if V.shape[0] == 1 else V[int(np.argmax((V @ V.T).sum(axis=1)))]
+    norm = np.linalg.norm(medoid)
     if norm > 0:
-        mean = mean / norm
+        medoid = medoid / norm
     conn.execute("INSERT INTO vec_concepts (user_id, concept_id, embedding) VALUES (?, ?, ?)",
-                 (user_id, concept_id, serialize_float32([float(x) for x in mean])))
+                 (user_id, concept_id, serialize_float32([float(x) for x in medoid])))
 
 
 def knn_concepts(conn: sqlite3.Connection, user_id: str, embedding, k: int = 5) -> list[dict]:
@@ -670,12 +1119,193 @@ def insert_relation(conn: sqlite3.Connection, user_id: str, from_id: str, to_id:
 
 
 def truncate_semantic(conn: sqlite3.Connection) -> None:
-    """Wipe the materialized semantic store (claims/concepts/relations + vectors)
-    for ALL users. Episodes, events, runs, and bookkeeping are untouched — this
-    is the first half of `rebuild`, which then re-applies the event log."""
+    """Wipe the materialized semantic store (claims/concepts/relations + the
+    Write-side fragments, plus their vectors) for ALL users. Episodes, events,
+    runs, and bookkeeping (episode_consolidations / episode_fragmentations) are
+    untouched — this is the first half of `rebuild`, which then re-applies the
+    event log (FRAGMENTED events rebuild the fragments)."""
     for table in ("claim_support", "concept_members", "relations",
-                  "claims", "concepts", "vec_claims", "vec_concepts"):
+                  "claims", "concepts", "vec_claims", "vec_concepts",
+                  "fragments"):
         conn.execute(f"DELETE FROM {table}")
+
+
+# ── Write-side working memory: fragments (called ONLY by write.apply_fragmented;
+#    PLAN.md §10 — derived store written via events, never at the API boundary) ──
+def fragment_id_for(user_id: str, episode_id: str, sent_start: int, sent_end: int) -> str:
+    """Deterministic fragment id: same (user, episode, span) → same id, so a
+    refine retry or a full event-log rebuild re-inserts the same row (ON CONFLICT
+    DO NOTHING) rather than minting a duplicate. Mirrors consolidate.claim_id_for."""
+    raw = f"{user_id}\x00{episode_id}\x00{sent_start}-{sent_end}".encode("utf-8")
+    return "frg_" + hashlib.md5(raw).hexdigest()[:24]
+
+
+def insert_fragment(conn: sqlite3.Connection, user_id: str, frag_id: str,
+                    episode_id: str, text: str, sent_start: int, sent_end: int,
+                    route: str, z: float | None, residual: float | None,
+                    weight: float | None, anchor_id: str | None,
+                    direction: str | None, is_centre: bool, is_novel_peak: bool,
+                    ts: str, strength: float = 1.0, cluster: str | None = None,
+                    medoid_idx: int | None = None) -> None:
+    """Insert one routed fragment. Idempotent on the deterministic id. NO fragment
+    vector is stored — the routing/retrieval vector is the medoid SENTENCE's vector,
+    already in vec_sentences and referenced via (episode_id, medoid_idx). `strength`
+    is the initial hold — a contradiction is born held STRONGER than a refine (PRD W6:
+    "store, held strongest, flag"). `cluster` is the region the per-cluster calibration
+    resolves on (NULL → global threshold)."""
+    conn.execute(
+        """INSERT INTO fragments
+             (id, user_id, episode_id, text, sent_start, sent_end, medoid_idx, route,
+              z, residual, weight, anchor_id, direction, cluster, is_centre,
+              is_novel_peak, strength, reinforced, created_at, last_seen)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+           ON CONFLICT(id) DO NOTHING""",
+        (frag_id, user_id, episode_id, text, sent_start, sent_end, medoid_idx, route,
+         z, residual, weight, anchor_id, direction, cluster, int(is_centre),
+         int(is_novel_peak), strength, ts, ts))
+
+
+def bump_fragment_strength(conn: sqlite3.Connection, user_id: str, frag_id: str,
+                           ts: str, delta: float) -> None:
+    """Reinforce a fragment a later one was PREDICTED by (PRD: a confirmed
+    prediction strengthens what predicted it, stores nothing new). No-op if the
+    anchor isn't a fragment row (e.g. it was itself PREDICTED and never stored)."""
+    conn.execute(
+        """UPDATE fragments SET strength = strength + ?, reinforced = reinforced + 1,
+           last_seen = ? WHERE id = ? AND user_id = ?""",
+        (delta, ts, frag_id, user_id))
+
+
+def fragment_pool(conn: sqlite3.Connection, user_id: str) -> list[dict]:
+    """All of a user's fragments as measure() corpus rows {id,text,embedding,
+    cluster}. This is the memory M the Write match pass routes against. The
+    embedding is the fragment's medoid SENTENCE vector, REFERENCED from vec_sentences
+    via (episode_id, medoid_idx) — no duplicate fragment vector is stored. `cluster`
+    is the region a fragment was assigned (anchor-inheritance at write, re-clustered
+    by consolidation); NULL → measure falls back to its local-neighbour spread and
+    decide() resolves the GLOBAL threshold (cold/sparse regions)."""
+    rows = conn.execute(
+        """SELECT f.id, f.text, f.cluster, v.embedding FROM fragments f
+           JOIN vec_sentences v ON v.sent_key = f.episode_id || ':' || f.medoid_idx
+           WHERE f.user_id = ? AND f.medoid_idx IS NOT NULL""", (user_id,)).fetchall()
+    return [{"id": r["id"], "text": r["text"],
+             "embedding": _deserialize(r["embedding"]), "cluster": r["cluster"]}
+            for r in rows]
+
+
+def knn_fragments(conn: sqlite3.Connection, user_id: str, embedding, k: int = 5) -> list[dict]:
+    """Nearest stored fragments to an embedding, within one user's partition. A
+    fragment's vector IS its medoid sentence's vector (no duplicate is stored), so
+    this searches vec_sentences and maps medoid hits back to fragments. vec0 returns
+    hits in ascending-distance order, so the first k that are medoids are exactly the
+    k nearest fragments; we over-fetch and widen to all sentences if a batch is short."""
+    medoids = {f"{r['episode_id']}:{r['medoid_idx']}": r for r in conn.execute(
+        "SELECT id, episode_id, medoid_idx, text, route, strength FROM fragments "
+        "WHERE user_id = ? AND medoid_idx IS NOT NULL", (user_id,))}
+    if not medoids:
+        return []
+    total = conn.execute("SELECT COUNT(*) AS n FROM episode_sentences WHERE user_id = ?",
+                         (user_id,)).fetchone()["n"]
+    emb = serialize_float32([float(x) for x in embedding])
+    kq = min(total, max(k * 8, 32))
+    while True:
+        rows = conn.execute(
+            "SELECT sent_key, distance FROM vec_sentences WHERE embedding MATCH ? AND k = ? AND user_id = ?",
+            (emb, kq, user_id)).fetchall()
+        out = []
+        for r in rows:
+            f = medoids.get(r["sent_key"])
+            if f:
+                out.append({"frag_id": f["id"], "text": f["text"], "route": f["route"],
+                            "strength": f["strength"], "similarity": _sim(r["distance"])})
+                if len(out) >= k:
+                    break
+        if len(out) >= k or kq >= total:
+            return out
+        kq = min(total, kq * 2)
+
+
+def fragment_candidates(conn: sqlite3.Connection, user_id: str, embedding,
+                        k: int = 40) -> list[dict]:
+    """Nearest fragments to a query embedding, enriched for RETRIEVE: each carries
+    its medoid SENTENCE vector (the retrieval vector, referenced from vec_sentences)
+    plus episode provenance, so core/retrieve.py can run the assembly wrapper over
+    them and format verbatim spans with sources. Like knn_fragments but returns the
+    embedding + episode_id/title/ts/cluster — the seed candidate set for assembly.
+
+    vec0 returns sentence hits in ascending-distance order; we map the medoid hits
+    back to fragments and widen the probe until we have k (or exhaust the corpus)."""
+    medoids = {f"{r['episode_id']}:{r['medoid_idx']}": dict(r) for r in conn.execute(
+        """SELECT f.id, f.episode_id, f.medoid_idx, f.text, f.route, f.strength,
+                  f.cluster, f.weight, e.title, e.ts
+           FROM fragments f JOIN episodes e ON e.id = f.episode_id
+           WHERE f.user_id = ? AND f.medoid_idx IS NOT NULL""", (user_id,))}
+    if not medoids:
+        return []
+    total = conn.execute("SELECT COUNT(*) AS n FROM episode_sentences WHERE user_id = ?",
+                         (user_id,)).fetchone()["n"]
+    emb = serialize_float32([float(x) for x in embedding])
+    kq = min(total, max(k * 8, 32))
+    while True:
+        rows = conn.execute(
+            "SELECT sent_key, embedding, distance FROM vec_sentences "
+            "WHERE embedding MATCH ? AND k = ? AND user_id = ?",
+            (emb, kq, user_id)).fetchall()
+        out = []
+        for r in rows:
+            f = medoids.get(r["sent_key"])
+            if f:
+                out.append({"id": f["id"], "frag_id": f["id"], "text": f["text"],
+                            "embedding": _deserialize(r["embedding"]),
+                            "episode_id": f["episode_id"], "title": f["title"],
+                            "ts": f["ts"], "cluster": f["cluster"],
+                            "route": f["route"], "strength": f["strength"],
+                            "weight": f["weight"], "similarity": _sim(r["distance"])})
+                if len(out) >= k:
+                    break
+        if len(out) >= k or kq >= total:
+            return out
+        kq = min(total, kq * 2)
+
+
+def fragment_count(conn: sqlite3.Connection, user_id: str) -> int:
+    return conn.execute("SELECT COUNT(*) AS n FROM fragments WHERE user_id = ?",
+                        (user_id,)).fetchone()["n"]
+
+
+def unfragmented_episodes(conn: sqlite3.Connection, user_id: str) -> list[sqlite3.Row]:
+    """Episodes the Write refine pass hasn't processed yet (the retry queue —
+    parallel to unconsolidated_episodes). Oldest first."""
+    return conn.execute(
+        """SELECT e.* FROM episodes e
+           LEFT JOIN episode_fragmentations f ON f.episode_id = e.id
+           WHERE f.episode_id IS NULL AND e.user_id = ? ORDER BY e.ts""",
+        (user_id,)).fetchall()
+
+
+def users_with_unfragmented(conn: sqlite3.Connection) -> list[str]:
+    return [r["user_id"] for r in conn.execute(
+        """SELECT DISTINCT e.user_id FROM episodes e
+           LEFT JOIN episode_fragmentations f ON f.episode_id = e.id
+           WHERE f.episode_id IS NULL ORDER BY e.user_id""")]
+
+
+def mark_fragmented(conn: sqlite3.Connection, user_id: str, episode_id: str,
+                    n_fragments: int) -> bool:
+    """Atomically CLAIM this episode for fragmentation. Returns True iff this
+    caller won the claim (inserted the marker), False if it already existed.
+
+    This is the race guard: refine_episode runs it as the FIRST statement of its
+    commit transaction, so when a background trigger and a refine_pending sweep
+    process the same episode concurrently, SQLite serialises the two writes and
+    only the winner gets True — the loser sees the committed marker, returns
+    False, and skips append_event/apply_fragmented, so no duplicate FRAGMENTED
+    event is logged and the (non-idempotent) reinforce bump runs exactly once."""
+    cur = conn.execute(
+        """INSERT INTO episode_fragmentations (episode_id, user_id, fragmented_at, n_fragments)
+           VALUES (?, ?, ?, ?) ON CONFLICT(episode_id) DO NOTHING""",
+        (episode_id, user_id, now_iso(), n_fragments))
+    return cur.rowcount > 0
 
 
 # ── Consolidation runs + bookkeeping ──────────────────────────────────────────
@@ -698,6 +1328,60 @@ def last_run(conn: sqlite3.Connection, user_id: str) -> sqlite3.Row | None:
     return conn.execute(
         """SELECT * FROM consolidation_runs WHERE user_id = ?
            ORDER BY started_at DESC LIMIT 1""", (user_id,)).fetchone()
+
+
+def get_calibration(conn: sqlite3.Connection, user_id: str) -> dict:
+    """C12 — the fitted calibration profile for a user, or {} if none fitted."""
+    row = conn.execute(
+        "SELECT profile_json FROM calibration_profiles WHERE user_id = ?",
+        (user_id,)).fetchone()
+    return json.loads(row["profile_json"]) if row else {}
+
+
+def set_calibration(conn: sqlite3.Connection, user_id: str, profile: dict) -> None:
+    conn.execute(
+        """INSERT INTO calibration_profiles (user_id, profile_json, updated_at)
+           VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET
+           profile_json = excluded.profile_json, updated_at = excluded.updated_at""",
+        (user_id, json.dumps(profile), now_iso()))
+
+
+def get_baselines(conn: sqlite3.Connection, user_id: str) -> dict:
+    """C12 — the per-cluster cohesion baselines pushed down at the last
+    consolidation, or {} if none yet (cold start → Write recomputes on the fly)."""
+    row = conn.execute(
+        "SELECT baselines_json FROM baselines WHERE user_id = ?",
+        (user_id,)).fetchone()
+    return json.loads(row["baselines_json"]) if row else {}
+
+
+def set_baselines(conn: sqlite3.Connection, user_id: str, baselines: dict) -> None:
+    conn.execute(
+        """INSERT INTO baselines (user_id, baselines_json, updated_at)
+           VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET
+           baselines_json = excluded.baselines_json, updated_at = excluded.updated_at""",
+        (user_id, json.dumps(baselines), now_iso()))
+
+
+def get_run(conn: sqlite3.Connection, run_id: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM consolidation_runs WHERE id = ?", (run_id,)).fetchone()
+
+
+def mark_run_rolled_back(conn: sqlite3.Connection, run_id: str) -> None:
+    """Flag a run rolled back. Its events stay on disk (audit) but are excluded
+    from materialization by ACTIVE_RUN_PREDICATE — the reversible commit."""
+    conn.execute(
+        "UPDATE consolidation_runs SET status = 'rolled_back' WHERE id = ?",
+        (run_id,))
+
+
+def unconsolidate_run_episodes(conn: sqlite3.Connection, run_id: str) -> int:
+    """Drop the consolidated-bookkeeping rows for a run so its episodes are
+    re-eligible for the next consolidate() pass (re-derive from raw)."""
+    cur = conn.execute(
+        "DELETE FROM episode_consolidations WHERE run_id = ?", (run_id,))
+    return cur.rowcount
 
 
 def mark_consolidated(conn: sqlite3.Connection, user_id: str, episode_id: str,

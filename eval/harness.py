@@ -28,7 +28,11 @@ import statistics
 from pathlib import Path
 
 from core import config, llm, store
+from core.hierarchical import hierarchical_context
+from core.hybrid import hybrid_context
 from core.recall import assemble_context, list_episodes
+from core.resonance import resonance_context
+from core.retrieve import assemble_context as fragment_context
 
 # Budget is a TOKEN slice (PRD). No tokenizer on the host, so approximate with a
 # chars/token ratio — good enough to size assembly; report it as an estimate.
@@ -52,6 +56,10 @@ def _tok(s: str) -> int:
 
 # ── answerers (pluggable; same signature, same return shape) ───────────────────
 def _answer_from_context(query: str, context: str) -> dict:
+    # Answerer on the JUDGMENT tier (sonnet): a weak (haiku) reader fails to
+    # synthesise the answer from sufficient context and DEFLATES SR@B (observed:
+    # slate@2000 g01 passed 3/3 on sonnet, failed on haiku). SR@B must measure
+    # context sufficiency, not answerer weakness, so the host LLM is sonnet-class.
     prompt = f"{_ANSWER_MARK}\nContext:\n{context}\n\nQuestion: {query}\nAnswer:"
     res = llm.call(prompt, tier="judgment", max_tokens=512,
                    system=_ANSWER_SYS, json_out=False)
@@ -91,7 +99,48 @@ def grep_answer(conn, user_id: str, query: str, budget_tok: int) -> dict:
     return {"system": "grep", **_answer_from_context(query, context)}
 
 
-_ANSWERERS = {"slate": slate_answer, "grep": grep_answer}
+def frag_answer(conn, user_id: str, query: str, budget_tok: int) -> dict:
+    """Slate, fragment-backed: assemble verbatim fragment spans via the predictor's
+    assembly wrapper (core/retrieve.py), then answer. The P2.5 path — reads the
+    Write fragment layer the v2 `slate_answer` (claims/concepts) never touched."""
+    ctx = fragment_context(conn, user_id, query,
+                           max_chars=budget_tok * CHARS_PER_TOKEN)
+    return {"system": "frag", **_answer_from_context(query, ctx)}
+
+
+def hybrid_answer(conn, user_id: str, query: str, budget_tok: int) -> dict:
+    """Slate, frag+concept HYBRID: budget-split blend of the concept path (the tail)
+    and the fragment path (specificity) — core/hybrid.py. The §6 P4 'path to the
+    R-gate': the two single paths are complementary, neither dominates, so a blend
+    aims to keep frag's factual wins AND claims' conceptual-tail wins."""
+    ctx = hybrid_context(conn, user_id, query,
+                         max_chars=budget_tok * CHARS_PER_TOKEN)
+    return {"system": "hybrid", **_answer_from_context(query, ctx)}
+
+
+def hier_answer(conn, user_id: str, query: str, budget_tok: int) -> dict:
+    """Slate, HIERARCHICAL: background concept frame + verbatim nuance fragments that
+    survive background subtraction (core/hierarchical.py). Replaces the fixed-split
+    hybrid + spreading-activation walk — the concept layer is the BACKGROUND and the
+    fragment assembly carries the NUANCE, the split emergent from the residual."""
+    ctx = hierarchical_context(conn, user_id, query,
+                               max_chars=budget_tok * CHARS_PER_TOKEN)
+    return {"system": "hier", **_answer_from_context(query, ctx)}
+
+
+def resonance_answer(conn, user_id: str, query: str, budget_tok: int) -> dict:
+    """Slate, RESONANCE: navigate the consolidated graph — decompose into probes,
+    SUM activation across probes (confluence), spread PE-gated (de-noised multi-hop),
+    materialise the brightest regions to verbatim fragments (core/resonance.py). The
+    concept path's successor: sum-not-max, PE-gated-not-fixed-decay, verbatim."""
+    ctx = resonance_context(conn, user_id, query,
+                            max_chars=budget_tok * CHARS_PER_TOKEN)
+    return {"system": "resonance", **_answer_from_context(query, ctx)}
+
+
+_ANSWERERS = {"slate": slate_answer, "grep": grep_answer, "frag": frag_answer,
+              "hybrid": hybrid_answer, "hier": hier_answer,
+              "resonance": resonance_answer}
 
 
 # ── the judge (single; binary; against the pre-registered checklist) ───────────

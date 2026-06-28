@@ -183,7 +183,7 @@ Before the mechanism, the work it has to do. **Status** legend: `built` — the 
 | What to revisit first | built | rank by surprise; AMBIGUOUS items (unresolved residuals on anchors) are the priority — they need the LLM. |
 | Background detection (decay) | wrapper | track a claim's surprise over repeats; when it trends to PREDICTED, it has become background → fold into theme. |
 | Concept drift / re-anchor | wrapper | members' residual against the *current* medoid creeping up → drift → re-anchor the medoid or split. |
-| Bridge candidacy | built | a residual band between concept medoids — close enough to relate, enough residual to be non-obvious. |
+| Bridge candidacy | ~~built~~ **removed 2026-06-27** | was a residual band between concept medoids. Removed: proven retrieval-inert (no Coverage@B effect at B or 2B, concept- or claim-edge level). The structural win lives in channel-code redundancy instead. |
 | Conflict / contradiction detection | built | AMBIGUOUS + opposite-stance anchor flags *where* reconciliation is needed. |
 | Contradiction clustering / oscillation margin | built | group flags on one anchor into one reconciliation; detect a belief that flip-flops over time. |
 | Store-integrity check | built | residual/route between a derived claim and its source episode. |

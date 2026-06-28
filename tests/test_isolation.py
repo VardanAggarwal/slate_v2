@@ -13,7 +13,7 @@ from core.encode import encode
 from core.recall import (assemble_context, get_claim, get_concept,
                          get_episode, list_episodes, recall)
 from tests.conftest import UID, UID_B
-from tests.test_consolidate import fake_llm  # noqa: F401
+from tests.test_consolidate import _seed, fake_llm  # noqa: F401
 
 # Corpus A: memory/learning. Corpus B: deliberately unmistakable content.
 A1 = "Spaced repetition is the most reliable way to retain knowledge over many years."
@@ -23,9 +23,9 @@ B2 = "The Krakatoa launch depends on the unannounced partnership with Meridian R
 
 @pytest.fixture
 def two_corpora(conn, fake_llm):
-    encode(conn, UID, A1, source="test", title="memory note")
-    encode(conn, UID_B, B1, source="test", title="krakatoa budget")
-    encode(conn, UID_B, B2, source="test", title="krakatoa partnership")
+    _seed(conn, UID, A1, title="memory note")
+    _seed(conn, UID_B, B1, title="krakatoa budget")
+    _seed(conn, UID_B, B2, title="krakatoa partnership")
     consolidate(conn, UID)
     consolidate(conn, UID_B)
     return conn
@@ -137,8 +137,8 @@ def test_fts_scope(two_corpora):
 def test_same_claim_text_two_users_distinct_ids(conn, fake_llm):
     """AUTH.md §8: md5(text) PK collision — identical text from two users must
     mint two claims, not share one row."""
-    encode(conn, UID, A1, source="test")
-    encode(conn, UID_B, A1, source="test")
+    _seed(conn, UID, A1)
+    _seed(conn, UID_B, A1)
     consolidate(conn, UID)
     consolidate(conn, UID_B)
     rows = conn.execute(
@@ -149,11 +149,6 @@ def test_same_claim_text_two_users_distinct_ids(conn, fake_llm):
     for r in rows:
         assert conn.execute("SELECT strength FROM claims WHERE id = ?",
                             (r["id"],)).fetchone()["strength"] == 1.0
-
-
-def test_bridges_and_synthesize_scoped(two_corpora):
-    from core.reconstruct import bridges
-    assert all("krakatoa" not in _flat(b) for b in bridges(two_corpora, UID))
 
 
 def test_rebuild_preserves_per_user_separation(two_corpora):

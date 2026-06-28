@@ -28,8 +28,34 @@ SENT_MIN_CHARS    = int(os.getenv("SENT_MIN_CHARS", "40"))
 RECEIPT_TOP_N     = int(os.getenv("RECEIPT_TOP_N", "5"))
 
 # ── Contradiction detection (PLAN.md §9.1: NLI local first, Haiku fallback) ───
-STANCE_PROVIDER = os.getenv("STANCE_PROVIDER", "nli")  # 'nli' | 'haiku' | 'off'
+# Providers: 'nli'  — local CrossEncoder (needs torch; dev fast-path)
+#            'hf'   — HF Inference API zero-shot MNLI (NO torch; the prod path on
+#                     the 1GB host, where 'nli' would throw and silently return
+#                     "neutral", turning every contradiction into a refine)
+#            'haiku'— one Haiku call   'off' — disabled (tests)
+STANCE_PROVIDER = os.getenv("STANCE_PROVIDER", "nli")
 NLI_MODEL       = os.getenv("NLI_MODEL", "cross-encoder/nli-deberta-v3-small")
+# Server-side MNLI model for the 'hf' provider (zero-shot via InferenceClient).
+STANCE_HF_MODEL = os.getenv("STANCE_HF_MODEL", "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli")
+# Bucketing of P(anchor ⊨ fragment) into entail/contradict/neutral. Calibratable
+# (fitted at consolidation later); these are the profile defaults. NOTE: a single
+# zero-shot entailment score separates entail from not-entail, but not-entailed
+# spans BOTH neutral and contradiction — so CONTRADICT_MAX is deliberately LOW
+# (only a confident non-entailment is called a contradiction) to limit false
+# contradictions. The 'nli'/'haiku' providers read the full 3-way distribution;
+# a proper 3-class read for 'hf' is a follow-up (see HFStance).
+STANCE_ENTAIL_MIN     = float(os.getenv("STANCE_ENTAIL_MIN", "0.60"))   # >= : entailment
+STANCE_CONTRADICT_MAX = float(os.getenv("STANCE_CONTRADICT_MAX", "0.10"))  # <= : contradiction
+
+# ── Write refine pass (W2–W8; core/write.py) ──────────────────────────────────
+# W1 (persist raw + cheap receipt) is sync. The predictor-driven fragmentation /
+# routing is async + retryable: save_note kicks it off best-effort in a thread,
+# and refine_pending() sweeps anything HF/LLM failures left behind.
+WRITE_REFINE_ASYNC = os.getenv("WRITE_REFINE_ASYNC", "1") == "1"
+WRITE_REINFORCE_BUMP = float(os.getenv("WRITE_REINFORCE_BUMP", "0.25"))  # strength bump on a confirmed prediction
+# Initial hold for a fragment the resolver flags as a CONTRADICTION — born held
+# stronger than a refine/novel (PRD W6: "store, held strongest, flag").
+WRITE_CONTRADICT_HOLD = float(os.getenv("WRITE_CONTRADICT_HOLD", "2.0"))
 
 # ── API keys ──────────────────────────────────────────────────────────────────
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")

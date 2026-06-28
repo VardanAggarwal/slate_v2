@@ -1,4 +1,4 @@
-"""reconstruct(episode_id) — regenerate doc from blueprint with fidelity score. synthesize(concept_ids|bridge_id) — draft a new doc from a connection. See PLAN.md §5.
+"""reconstruct(episode_id) — regenerate doc from blueprint with fidelity score. synthesize(concept_a, concept_b) — draft a new doc from the intersection of two concepts. See PLAN.md §5.
 
 North-star metric (PLAN.md §5): unique-claim bytes ÷ reconstructable bytes —
 how few stored bytes recreate how much of the original document.
@@ -98,17 +98,9 @@ def _concept_block(conn, user_id: str, concept_id: str) -> str:
 
 def synthesize(conn, user_id: str, concept_a: str, concept_b: str,
                rationale: str | None = None) -> dict:
-    """Draft a NEW document from two (ideally bridged) concepts."""
+    """Draft a NEW document from the intersection of two concepts."""
     if rationale is None:
-        row = conn.execute(
-            """SELECT payload_json FROM events WHERE type = 'BRIDGED'
-               AND user_id = ?
-               AND ((json_extract(payload_json, '$.a') = ? AND json_extract(payload_json, '$.b') = ?)
-                 OR (json_extract(payload_json, '$.a') = ? AND json_extract(payload_json, '$.b') = ?))
-               ORDER BY seq DESC LIMIT 1""",
-            (user_id, concept_a, concept_b, concept_b, concept_a)).fetchone()
-        rationale = (json.loads(row["payload_json"]).get("rationale", "")
-                     if row else "an unstated affinity between the two clusters")
+        rationale = "an unstated affinity between the two clusters"
 
     result = llm.call(PROMPT_SYNTHESIZE.format(
         rationale=rationale,
@@ -117,20 +109,3 @@ def synthesize(conn, user_id: str, concept_a: str, concept_b: str,
         tier="judgment", max_tokens=2048, json_out=False)
     return {"concepts": [concept_a, concept_b], "rationale": rationale,
             "document": result["text"].strip(), "cost": round(result["cost"], 4)}
-
-
-def bridges(conn, user_id: str, limit: int = 20) -> list[dict]:
-    """List bridge relations with labels — entry point for synthesize()."""
-    out = []
-    for r in conn.execute(
-            """SELECT from_id, to_id, weight, created_at FROM relations
-               WHERE relation = 'bridges' AND user_id = ?
-               ORDER BY created_at DESC LIMIT ?""",
-            (user_id, limit)):
-        a = store.get_concept(conn, user_id, r["from_id"])
-        b = store.get_concept(conn, user_id, r["to_id"])
-        if a and b:
-            out.append({"a": r["from_id"], "a_label": a["label"],
-                        "b": r["to_id"], "b_label": b["label"],
-                        "score": r["weight"], "created_at": r["created_at"]})
-    return out

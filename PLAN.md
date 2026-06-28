@@ -28,7 +28,7 @@ The current implementation gets the *representation* right (fragments, concepts,
    - **Episodic store** (append-only): raw content + embeddings + novelty markers. Written at save time. Immutable. Source of truth.
    - **Semantic store** (derived, rebuildable): canonical claims, concepts, typed relations. Written ONLY by consolidation, ONLY via the event log.
 5. **`encode()` is cheap and synchronous** — embed locally, nearest-neighbor against canonical claims, return a novelty receipt (echoes / novelties / contradictions). **No LLM graph decisions at save time.** At most one small LLM (or local NLI) call for stance classification.
-6. **`consolidate()` is the nightly batch** — blueprint extraction, claim canonicalization (dedupe with provenance), concept merge/split/create with global context, latent bridge detection, decay/strengthen. All decisions emitted as **events**, never destructive updates. All LLM calls via the **Batch API** (50% off).
+6. **`consolidate()` is the nightly batch** — blueprint extraction, claim canonicalization (dedupe with provenance), concept merge/split/create with global context, channel-code redundancy, decay/strengthen. All decisions emitted as **events**, never destructive updates. All LLM calls via the **Batch API** (50% off).
 7. **Headless, MCP-first.** FastMCP server (port OAuth 2.1 scaffolding from old repo) is the only interface. Save from Claude.ai / Claude Code / mobile. A web UI, if ever, is just another client.
 8. **Nightly job = plain code on cron**, not an agent. Deterministic pipeline: collect episodes → submit batch → poll → apply events.
 9. **Morning digest is a required feature**, not a nice-to-have (Phase 6). It reads last night's events and tells the user what emerged.
@@ -45,7 +45,7 @@ slate-engine/
     encode.py       — embed, segment, novelty receipt, episode write
     consolidate.py  — sleep phase pipeline (see §5)
     recall.py       — spreading-activation retrieval
-    reconstruct.py  — regenerate a doc from its blueprint; synthesize() from bridges
+    reconstruct.py  — regenerate a doc from its blueprint; synthesize() from two concepts
     digest.py       — morning digest: summarize last night's events
     llm.py          — provider chain + Batch API helpers
     config.py       — env vars (port pattern from old engine/config.py)
@@ -92,7 +92,7 @@ concept_members(concept_id, claim_id, weight, PRIMARY KEY(concept_id, claim_id))
 
 relations(
   from_id TEXT, to_id TEXT,       -- claim or concept ids
-  relation TEXT,                  -- 'leads_to'|'contradicts'|'supports'|'bridges'|...
+  relation TEXT,                  -- 'leads_to'|'contradicts'|'supports'|...  ('bridges' removed 2026-06-27)
   weight REAL, created_at TEXT, evidence_episode_id TEXT
 )
 -- spine relations get promoted here at concept level → the temporal structure
@@ -102,7 +102,7 @@ events(
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   ts TEXT, run_id TEXT,
   type TEXT,                      -- ENCODED|CANONICALIZED|CONCEPT_CREATED|MERGED|
-                                  -- SPLIT|BRIDGED|RELATED|DECAYED|STRENGTHENED
+                                  -- SPLIT|RELATED|DECAYED|STRENGTHENED  (BRIDGED removed 2026-06-27)
   payload_json TEXT
 )
 consolidation_runs(id, started_at, finished_at, n_episodes, batch_id, status, cost_estimate)
@@ -129,12 +129,12 @@ Rules:
 3. **Canonicalize claims**: each blueprint claim vs kNN existing claims → LLM judges same/new → `CANONICALIZED` events; new rows or `claim_support` + strength bump. Haiku-class, batched.
 4. **Concept pass** (the one judgment-heavy call, Sonnet-class): affected concepts + their members + new claims, full context → decisions: CREATE / MERGE / **SPLIT** / attach / NOOP → events.
 5. **Relations**: promote blueprint spine links to claim/concept-level `relations` rows (`leads_to` etc.). Contradiction receipts → `contradicts` relations.
-6. **Latent bridges**: pure embedding math — concept-pair similarity drift + 2-hop co-activation candidates; verify top candidates with one small LLM call each → `BRIDGED` events.
+6. ~~**Latent bridges**~~ **REMOVED 2026-06-27** — was concept-pair residual-band candidates verified by an LLM call → `BRIDGED` events. Proven retrieval-inert (no Coverage@B effect at B or 2B, concept- or claim-edge level); the structural lever is channel-code redundancy (step 6c). Generation, `BRIDGE_BOOST`, and the `list_bridges` MCP all deleted.
 7. **Decay/strengthen**: port `health.py` state model as `DECAYED`/`STRENGTHENED` events; echoes from step 3 bump strength.
 8. Write `consolidation_runs` row with token/cost accounting.
 
 ### recall(query, k) → results   [$0, local]
-Vector seed over claims/concepts → spreading activation through `relations` and `concept_members` (decay per hop, weight by strength/recency/state) → ranked results with why-now signals (port: bridge 🌉, frequency 🔁, time-gap 🕰️). Two-hop activation is what surfaces non-obvious connections.
+Vector seed over claims/concepts → spreading activation through `relations` and `concept_members` (decay per hop, weight by strength/recency/state) → ranked results with why-now signals (port: frequency 🔁, time-gap 🕰️). Two-hop activation is what surfaces non-obvious connections.
 
 ### Read/browse API   [$0, local SQL — lives in recall.py or a small read.py]
 Direct lookups, no LLM, no embeddings. These back the MCP tools and replace v1's
@@ -144,7 +144,7 @@ panel browse routes (`GET /sources/{id}`, `GET /concepts/{id}`) and v1 MCP tools
 - `get_episode(id)` — raw_text, title, ts, receipt, blueprint (post-consolidation), claims it supports
 - `list_episodes(limit, before?)` — recent notes (id, title, ts, essence)
 - `get_concept(id)` — label, canonical, state/strength, member claims **with provenance**
-  (which episodes, verbatim sentences), relations incl. bridges, last_activity
+  (which episodes, verbatim sentences), relations, last_activity
 - `get_claim(id)` — text, strength, supporting episodes + verbatim sentences
 - `assemble_context(topic)` — the Claude-first read: recall(topic) → group hits by
   concept → return canonical + claims + provenance as compact markdown, sized for
@@ -171,13 +171,12 @@ pull relevant older concepts into context. This is engineered, not automatic:
 - Document a recommended claude.ai project instruction in the README, e.g.
   "When we discuss ideas, check Slate (recall) for my prior thinking first."
 
-### reconstruct(episode_id) / synthesize(concept_ids|bridge_id)   [on demand]
+### reconstruct(episode_id) / synthesize(concept_a, concept_b)   [on demand]
 - reconstruct: essence + spine + claims (+ verbatim sentences as style residue) → regenerate doc; report fidelity vs raw_text. North-star metric: unique-claim bytes ÷ reconstructable bytes.
-- synthesize: pull two bridged concepts' claims + provenance → draft a NEW document about the connection. This is "create new docs from emerging learnings".
+- synthesize: pull two concepts' claims + provenance → draft a NEW document about the connection. This is "create new docs from emerging learnings". (Previously seeded by bridges; bridges removed 2026-06-27, so callers pass two concept ids directly.)
 
 ### digest(date?) → markdown   [REQUIRED — the daily payoff]
 Read last night's events → one short LLM call → e.g.:
-> 🌉 New bridge: "Conformity as Safety" × "Platform Lock-in" (via yesterday's note)
 > ⚡ Contradiction: yesterday you argued X; on Mar 12 you claimed not-X
 > 🔁 "Battery-saver travel" strengthened (3rd encounter)
 > 🕰️ Going dormant: "Spaced repetition" — last touched 70 days ago
@@ -225,7 +224,7 @@ Host cron (or sidecar loop) → `python -m cli consolidate` (Batch mode). Failur
 
 ### Phase 6 — Morning digest + reconstruct/synthesize
 `digest.py` + delivery channel; `reconstruct.py` with fidelity score; `synthesize` MCP tool.
-✅ digest arrives every morning; reconstruct on 5 old notes with fidelity self-rated ≥ 7/10; one synthesized doc from a real bridge.
+✅ digest arrives every morning; reconstruct on 5 old notes with fidelity self-rated ≥ 7/10; one synthesized doc from two related concepts.
 
 (Then: retire or repoint the old Slate web UI; old repo becomes read-only archive.)
 

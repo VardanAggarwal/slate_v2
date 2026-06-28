@@ -1,4 +1,4 @@
-"""FastMCP + OAuth 2.1. Tools: save_note, recall, assemble_context, get_note, list_recent_notes, get_concept, timeline, digest. SlateOAuthProvider ported from v1 engine/mcp_server.py. See PLAN.md §5 MCP usage pattern + Phase 4, AUTH.md §2.
+"""FastMCP + OAuth 2.1. Tools: save_note, recall, assemble_context, mark_relevance, get_note, list_recent_notes, get_concept, timeline, digest. SlateOAuthProvider ported from v1 engine/mcp_server.py. See PLAN.md §5 MCP usage pattern + Phase 4, AUTH.md §2.
 
 Two-stage retrieval: `recall` returns ~50-token headlines so the model can
 call it speculatively; `assemble_context` / `get_concept` are the escalation.
@@ -174,7 +174,10 @@ mcp = FastMCP(
         "said. Never save AI-generated summaries, analysis, or paraphrases — the "
         "corpus must stay in the user's voice. When in doubt, ask before saving. "
         "After save_note, relay the receipt to the user — echoes and contradictions "
-        "with their past notes are the product, not metadata."
+        "with their past notes are the product, not metadata. "
+        "FEEDBACK: after you use recalled items to compose a response, when some "
+        "clearly helped and others were noise, call `mark_relevance` with their ids "
+        "— it tunes future recall. Only when you have a clear judgment."
     ),
     auth=slate_auth,
 )
@@ -288,6 +291,14 @@ def save_note(text: str, title: str) -> dict:
         receipt = encode(conn, user_id, text, title=title.strip(), source="mcp")
     except ValueError as e:
         raise ToolError(str(e))
+    finally:
+        conn.close()
+    # W1 (raw + receipt) is committed and returned now; the predictor-driven
+    # fragmentation/routing (W2–W8) runs in the background — it re-embeds and may
+    # call the resolver, so it must not block the save. A failure here just leaves
+    # the episode for the nightly refine_pending sweep.
+    from core.write import trigger_refine_async
+    trigger_refine_async(user_id, receipt["episode_id"])
     return {"episode_id": receipt["episode_id"], "title": title.strip(),
             "n_sentences": receipt["n_sentences"],
             "narrate": receipt_markdown(receipt)}
@@ -302,10 +313,11 @@ def recall(query: str, k: int = 8) -> list[dict]:
     Also for: "what do I think about X?", "have I written about X?".
 
     Returns compact headlines (~50 tokens each): claims and concepts ranked by
-    spreading activation, with why-now signals (🌉 bridged concepts, 🔁
-    recurring claims, 🕰️ long-dormant thinking resurfacing, 2-hop = non-obvious
-    connection). Escalate with assemble_context or get_concept when a hit
-    deserves the full picture.
+    graph navigation, with why-now signals (🔁 recurring claims, 🕰️ long-dormant
+    thinking resurfacing, 2-hop = non-obvious connection). Escalate with
+    assemble_context or get_concept when a hit
+    deserves the full picture. After you use the results, mark_relevance() tells
+    Slate which ones helped.
     """
     from core.recall import recall as _recall
     return _recall(_conn(), _user_id(), query, k=k)
@@ -313,14 +325,57 @@ def recall(query: str, k: int = 8) -> list[dict]:
 
 @mcp.tool
 def assemble_context(topic: str) -> str:
-    """Pull the user's full prior thinking on a topic as compact markdown,
-    grouped by concept with claims + provenance (which note, which date).
+    """Pull the user's full prior thinking on a topic as compact markdown:
+    synthesis from concepts/claims PLUS verbatim source spans, with provenance
+    (which note, which date).
 
     Call when you're about to write something substantive on a topic the user
     has history with, or after recall() surfaces a hit worth expanding. Output
-    is budgeted (~1-2K tokens, most-relevant-first) for direct injection."""
-    from core.recall import assemble_context as _ac
-    return _ac(_conn(), _user_id(), topic)
+    is budgeted (most-relevant-first) for direct injection."""
+    # RESONANCE retrieve: navigate the consolidated graph (PE-gated, fan-out-
+    # normalised spread) → materialise the brightest regions as a distilled concept
+    # frame + verbatim depth/breadth spans. Best Slate variant on the SR@B eval
+    # (narrow 85.7 / tail 80, paragraph 100, broad at its 33% ceiling — beats the old
+    # hybrid 64/60/33). Calibration is the user's fitted profile over the in-code
+    # defaults. signals=True emits R8 (fetched/dropped) for consolidation C13; commit
+    # before close since append_event does NOT commit. See docs/retrieve-resonance-design.md.
+    from core import resonance
+    conn = _conn()
+    user_id = _user_id()
+    try:
+        out = resonance.resonance_context(conn, user_id, topic, signals=True)
+        conn.commit()
+        return out
+    finally:
+        conn.close()
+
+
+@mcp.tool
+def mark_relevance(query: str, relevant: list[str] | None = None,
+                   irrelevant: list[str] | None = None) -> dict:
+    """Report which recalled items actually helped answer `query` and which were
+    noise — explicit feedback that tunes future recall.
+
+    Call AFTER you've used recalled context to compose a response, only when you
+    have a clear judgment. `relevant` / `irrelevant` take ids straight from
+    recall() headlines (claim or concept ids) or note ids (get_note /
+    list_recent_notes) — pass only the ids you're confident about, omit the rest.
+    Consolidation keeps the relevant ones in the foreground and demotes the
+    irrelevant ones, so the next recall on a similar query ranks better."""
+    rel = [i for i in (relevant or []) if i]
+    irr = [i for i in (irrelevant or []) if i]
+    if not rel and not irr:
+        return {"status": "noop", "message": "no ids provided"}
+    from core.retrieve import record_relevance_feedback
+    conn = _conn()
+    user_id = _user_id()
+    try:
+        record_relevance_feedback(conn, user_id, query, relevant=rel, irrelevant=irr)
+        conn.commit()
+        return {"status": "recorded", "query": query,
+                "relevant": len(rel), "irrelevant": len(irr)}
+    finally:
+        conn.close()
 
 
 @mcp.tool
@@ -346,7 +401,7 @@ def list_recent_notes(limit: int = 10) -> list[dict]:
 def get_concept(concept_id: str) -> dict:
     """Fetch one concept in full: label, canonical description, state/strength,
     member claims with provenance (episodes + verbatim sentences), and its
-    relations including bridges. Use after recall surfaces a concept hit."""
+    relations. Use after recall surfaces a concept hit."""
     from core.recall import get_concept as _gc
     result = _gc(_conn(), _user_id(), concept_id)
     if not result:
@@ -357,7 +412,7 @@ def get_concept(concept_id: str) -> dict:
 @mcp.tool
 def timeline(concept_id: str, limit: int = 50) -> list[dict]:
     """How the user's thinking on a concept evolved: every consolidation event
-    that touched it (created, claims attached, merged, split, bridged, decayed),
+    that touched it (created, claims attached, merged, split, decayed),
     oldest first. Use for "how did my thinking on X change?"."""
     conn = _conn()
     rows = conn.execute(
@@ -377,7 +432,7 @@ def timeline(concept_id: str, limit: int = 50) -> list[dict]:
 
 @mcp.tool
 def digest(since_hours: int = 36) -> str:
-    """What emerged from recent consolidation: new bridges, contradictions,
+    """What emerged from recent consolidation: contradictions,
     strengthened claims, concepts going dormant. Call when the user asks
     "what's new in my notes?" or each morning. Markdown, ready to relay."""
     from core.digest import digest as _digest
@@ -399,21 +454,12 @@ def reconstruct_note(episode_id: str) -> dict:
 @mcp.tool
 def synthesize(concept_a: str, concept_b: str) -> dict:
     """Draft a NEW short document from the intersection of two concepts —
-    Slate's 'create new docs from emerging learnings'. Best on bridged pairs
-    (see list_bridges); uses the stored bridge rationale automatically."""
+    Slate's 'create new docs from emerging learnings'. Pass two concept ids."""
     from core.reconstruct import synthesize as _syn
     try:
         return _syn(_conn(), _user_id(), concept_a, concept_b)
     except ValueError as e:
         raise ToolError(str(e))
-
-
-@mcp.tool
-def list_bridges(limit: int = 20) -> list[dict]:
-    """List discovered bridges between concept pairs (newest first) — the
-    non-obvious connections consolidation surfaced. Entry point for synthesize."""
-    from core.reconstruct import bridges
-    return bridges(_conn(), _user_id(), limit=limit)
 
 
 @mcp.tool
