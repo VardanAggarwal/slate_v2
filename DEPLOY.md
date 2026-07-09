@@ -41,9 +41,27 @@ docker ps        # confirm v1 'slate' container is the only thing on :8000
 Surveyed 2026-06-11: 956MB RAM (~500MB free), 25GB disk free, Docker 29 +
 Compose v5, Caddy active, v1 healthy on :8000 — all compatible.
 
-## 1. Ship the repo
+## 1. Ship the repo (git-based since 2026-07-09)
 
-Either push `slate_v2` to a private GitHub repo and clone it, or rsync:
+`/home/ubuntu/slate-engine` is a git checkout of `VardanAggarwal/slate_v2`,
+authenticated by a read-only deploy key (`~/.ssh/slate_engine_deploy` on the
+server, wired via per-repo `core.sshCommand`; the key is registered under the
+repo's Settings → Deploy keys). Runtime files (`.env`, backups, cron scripts)
+are untracked and survive checkouts.
+
+Deploy = push, pull, rebuild:
+
+```bash
+git push origin <branch>                          # from the laptop
+ssh -i ~/.ssh/slate_server ubuntu@140.245.216.42 \
+  'cd /home/ubuntu/slate-engine && git fetch origin && \
+   git reset --hard origin/<branch> && docker compose up -d --build'
+curl -s https://myslate.duckdns.org/health        # myslate serves v2 since the cutover
+```
+
+Prod tracks the branch that was last reset to (check with `git rev-parse
+--abbrev-ref HEAD` on the server). Legacy rsync (pre-2026-07-09, kept for
+emergencies — bypasses git, leaves the checkout dirty):
 
 ```bash
 rsync -av --exclude .venv --exclude data --exclude .git --exclude .env \
