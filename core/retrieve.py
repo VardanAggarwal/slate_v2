@@ -159,6 +159,53 @@ def record_retrieval_signal(conn, user_id: str, query: str, *, fetched: list[dic
     }, run_id=run_id)
 
 
+def _home_concept(conn, user_id: str, claim_id: str) -> str | None:
+    """A claim's HOME concept (primary membership) — mirrors consolidate._claim_concept,
+    inlined here so the recorder has no consolidate dependency."""
+    row = conn.execute(
+        "SELECT concept_id FROM concept_members WHERE claim_id = ? AND user_id = ? "
+        "AND kind = 'primary' LIMIT 1", (claim_id, user_id)).fetchone()
+    return row["concept_id"] if row else None
+
+
+def _concept_walk(conn, user_id: str, ids: list[str]) -> list[str]:
+    """Normalise a traversal to CONCEPTS — the only pivot the walk analysis found:
+    concepts pass through, claims lift to their home concept, episodes drop.
+    Consecutive duplicates collapse (drilling two claims of one concept is one stop)."""
+    out: list[str] = []
+    for nid in ids or []:
+        if nid.startswith("cpt_"):
+            c = nid
+        elif nid.startswith("clm_"):
+            c = _home_concept(conn, user_id, nid)
+        else:                                   # ep_/frag_ leaves carry no pivot
+            c = None
+        if c and (not out or out[-1] != c):
+            out.append(c)
+    return out
+
+
+def record_engagement(conn, user_id: str, query: str, *, surfaced: list[str],
+                      engaged: str | None, path: list[str],
+                      spawned_write: bool = False, run_id: str | None = None) -> None:
+    """Traversal signal — the user's own drill-down after a recall (the demand-side
+    concept walk consolidation was missing; docs/broad-lift-traversal-plan.md §0.1).
+    `surfaced` = what recall offered, `engaged` = the node drilled first, `path` = the
+    walk order. Path/engaged are normalised to CONCEPTS (claim → home concept, leaves
+    dropped) before append. Append-only, log-only — NOT materialized into the semantic
+    store (apply_event ignores it); consolidation reads it straight from the log,
+    mirroring RETRIEVAL_SIGNAL / RELEVANCE_FEEDBACK."""
+    walk = _concept_walk(conn, user_id, list(path or []))
+    eng = _concept_walk(conn, user_id, [engaged] if engaged else [])
+    store.append_event(conn, user_id, "ENGAGEMENT", {
+        "query": query,
+        "surfaced": list(surfaced or []),
+        "engaged": eng[0] if eng else None,
+        "path": walk,
+        "spawned_write": bool(spawned_write),
+    }, run_id=run_id)
+
+
 def record_relevance_feedback(conn, user_id: str, query: str, *,
                               relevant: list[str], irrelevant: list[str],
                               run_id: str | None = None) -> None:
@@ -352,5 +399,6 @@ def assemble_context(conn, user_id: str, topic: str, max_chars: int = 6000,
 
 
 __all__ = ["fragment_recall", "assemble_context", "decompose_query",
-           "record_retrieval_signal", "record_relevance_feedback", "SEED_K",
+           "record_retrieval_signal", "record_relevance_feedback",
+           "record_engagement", "SEED_K",
            "MAX_ITEMS", "TRIAGE_MIN_REL", "BORROW_MIN_REL", "DEFAULT_CALIBRATION"]

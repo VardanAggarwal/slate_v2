@@ -110,6 +110,13 @@ DEPTH_SHARE = 0.30      # share of specifics reserved for depth. 0.30 measured b
                         # narrow 85.7/tail80 AND broad recovers to its 33% ceiling;
                         # 0.5 over-reserves depth and starves broad coverage (16.7%);
                         # 0.0 loses the narrow-tail deep-read win (78.6%).
+# Render-packing (render-saturation fix): the depth/breadth char split + break-on-
+# first-overflow in _emit leave B unfilled (measured ~1790 tok @B=2000, ~2820 @4000
+# regardless of the selection cap N). When ON, the SPECIFICS section renders ONE
+# rank-ordered pool (the assembly order) against the FULL specifics budget and
+# skips-and-continues past any block that overflows, packing smaller blocks after
+# a big one. Default OFF → prod render byte-identical.
+RENDER_PACKED = False
 
 DEFAULT_CALIBRATION = {
     "res_seed_claims": SEED_CLAIMS, "res_seed_concepts": SEED_CONCEPTS,
@@ -124,7 +131,7 @@ DEFAULT_CALIBRATION = {
     "res_include_peaks": INCLUDE_PEAKS, "res_peaks_per_node": PEAKS_PER_NODE,
     "res_deep_top_n": DEEP_TOP_N, "res_deep_frags": DEEP_FRAGS,
     "res_breadth_frags_per_node": BREADTH_FRAGS_PER_NODE, "res_depth_share": DEPTH_SHARE,
-    "res_coverage_notes": COVERAGE_NOTES,
+    "res_coverage_notes": COVERAGE_NOTES, "res_render_packed": RENDER_PACKED,
     "gain_floor": ASSEMBLE_GAIN_FLOOR, "max_items": ASSEMBLE_MAX_ITEMS,
     "value_floor": None, "per_cluster": {},
     # ablation switches — flip to isolate each mechanism (see design doc test plan)
@@ -334,7 +341,12 @@ def resonance_recall(conn, user_id: str, query: str, *,
         return {"nodes": nodes, "fragments": [], "frame": [], "probes": field["probes"]}
 
     ranked = sorted(nodes.items(), key=lambda kv: -kv[1]["salience"])
-    top = ranked[: int(calibration.get("res_materialize_nodes", MATERIALIZE_NODES))]
+    # Query-claims (qclm_) ROUTE activation but must never hold a materialize slot:
+    # they have no source episodes, so a stored query similar to the live one would
+    # silently displace a real claim from the top-N window (a dead slot — measured
+    # −2 broad on gold when engagement queries are injected).
+    top = [kv for kv in ranked if not kv[0].startswith("qclm_")][
+        : int(calibration.get("res_materialize_nodes", MATERIALIZE_NODES))]
     n_frags = int(calibration.get("res_frags_per_node", FRAGS_PER_NODE))
 
     # Distilled breadth frame — the brightest CONCEPT nodes, enumerated (canonical +
@@ -500,9 +512,11 @@ def resonance_context(conn, user_id: str, topic: str, max_chars: int = 6000, *,
     # Reserve breadth FIRST, then give depth everything left — so a deep query (few
     # real breadth notes) hands its leftover to depth, while a broad query keeps its
     # breadth coverage. No deep-vs-broad classification needed.
-    def _emit(frag_list, budget):
+    def _emit(frag_list, budget, skip=False):
         """Render frags grouped by source episode within `budget` chars. Returns
-        (lines, chars_used). Episode order follows assembly rank (most-informative)."""
+        (lines, chars_used). Episode order follows assembly rank (most-informative).
+        `skip` (render-packed): on an overflowing block, SKIP it and try the next
+        (smaller) one instead of stopping — packs the budget instead of leaving slack."""
         groups: dict[str, list[dict]] = {}
         order: list[str] = []
         for f in frag_list:
@@ -523,6 +537,8 @@ def resonance_context(conn, user_id: str, topic: str, max_chars: int = 6000, *,
             block.append("")
             blen = sum(len(x) + 1 for x in block)
             if used + blen > budget and rendered:
+                if skip:
+                    continue
                 break
             rendered += block
             used += blen
@@ -530,17 +546,27 @@ def resonance_context(conn, user_id: str, topic: str, max_chars: int = 6000, *,
 
     frame_chars = sum(len(l) + 1 for l in lines)
     specifics_budget = max(0, max_chars - frame_chars)
-    depth_share = float(calibration.get("res_depth_share", DEPTH_SHARE))
-    breadth_budget = int(specifics_budget * (1.0 - depth_share))
+    render_packed = bool(calibration.get("res_render_packed", RENDER_PACKED))
 
-    depth_f = [f for f in frags if f.get("_depth")]
-    breadth_f = [f for f in frags if not f.get("_depth")]
-    breadth_lines, breadth_used = _emit(breadth_f, breadth_budget)
-    depth_lines, _ = _emit(depth_f, specifics_budget - breadth_used)  # depth gets the rest
+    if render_packed:
+        # ONE rank-ordered pool (assembly order = most-informative first), full
+        # specifics budget, skip-and-continue — no depth/breadth char split.
+        spec_lines, _ = _emit(frags, specifics_budget, skip=True)
+        if spec_lines:
+            lines.append("### Specifics")
+            lines += spec_lines
+    else:
+        depth_share = float(calibration.get("res_depth_share", DEPTH_SHARE))
+        breadth_budget = int(specifics_budget * (1.0 - depth_share))
 
-    if depth_lines or breadth_lines:
-        lines.append("### Specifics")
-        lines += depth_lines + breadth_lines  # focused depth first, then coverage
+        depth_f = [f for f in frags if f.get("_depth")]
+        breadth_f = [f for f in frags if not f.get("_depth")]
+        breadth_lines, breadth_used = _emit(breadth_f, breadth_budget)
+        depth_lines, _ = _emit(depth_f, specifics_budget - breadth_used)  # depth gets the rest
+
+        if depth_lines or breadth_lines:
+            lines.append("### Specifics")
+            lines += depth_lines + breadth_lines  # focused depth first, then coverage
 
     out, total = [], 0
     for line in lines:
