@@ -1154,12 +1154,23 @@ CHANNEL_COS_FLOOR = 0.55    # reachable: claim's cosine to k's mean-direction ce
 CHANNEL_Z_LO, CHANNEL_Z_HI = 1.0, 3.0   # uncovered band: recon-z of claim vs k's members
 
 # ── Step 6d: query injection (encode retrieval queries as routing hubs) ──────────
-# Master switch DEFAULT OFF — the mechanism is wired + rebuild-safe, but the broad
-# gain is unconfirmed under a real (sonnet-class) LLM judge and the demand-side
-# re-anchor mutates concept vectors (forgetting gate not yet run). Flip on only after
-# both clear. See docs/query-claims-findings.md.
-INJECT_QUERY_CLAIMS = False     # master switch for step 6d
-QUERY_CLAIM_REANCHOR = False    # demand-side medoid drift (the part that moves broad; riskiest)
+# ON since 2026-07-09 — enable-gates cleared (docs/query-claims-findings.md):
+# broad gain confirmed under an Opus-4.8 judge (1/13 → 3/13, forgetting 0); the
+# re-anchor forgetting check on narrow+paragraph passed with zero real regressions
+# (7 proxy-flagged drops were concept-frame reshuffles, facts intact verbatim in
+# Specifics); lift stable across attach_k ∈ {3..6} and disjoint query-stream halves
+# (broad .158→.210 in every cell, narrow/paragraph pinned — scratchpad/
+# qclaim_stability.json).
+INJECT_QUERY_CLAIMS = True      # master switch for step 6d
+# Re-anchor stays OFF — regressive on three independent instruments, no gain on
+# any: traversal matrix broad −1q / paragraph −2q (docs/broad-lift-traversal-
+# findings.md); Opus judge .158→.105; shipped-path E2E narrow −1q with zero broad/
+# paragraph movement (scratchpad/flywheel_e2e_reanchor.json, real signal-log
+# queries through the production applier). Medoid drift toward question-shapes
+# corrupts the content geometry near touched concepts — which axis pays depends on
+# which concepts get touched. The June-27 judge win predates the corrected
+# instrument and did not survive the re-test.
+QUERY_CLAIM_REANCHOR = False    # demand-side medoid drift — KILLED (regressive)
 QUERY_CLAIM_ATTACH_K = 4        # concepts a query-claim joins (its multi-topic span)
 QUERY_CLAIM_MIN_CONCEPTS = 2    # skip a query that doesn't span ≥2 concepts (no bridge)
 QUERY_CLAIM_MAX = 200           # cap distinct queries encoded (most-recent-first)
@@ -1311,6 +1322,44 @@ def _days_since(iso_ts: str | None, now: datetime) -> int:
         return 999
 
 
+# Step 7 input — read-side recency. last_activity only moves on WRITE-side events
+# (ATTACHED/MERGED), so a concept recalled daily but never written to would drift
+# stale → dormant → prune-eligible. Fold usage (ENGAGEMENT walks + RETRIEVAL_SIGNAL
+# fetches) into the decay clock: being read counts as activity. Read-time compute
+# from the log — DECAYED stays the only state mutation, so rebuild is unchanged.
+USAGE_REFRESH = True
+
+
+def _usage_recency(conn, user_id: str) -> dict[str, str]:
+    """Latest usage timestamp per concept across the signal log. ENGAGEMENT names
+    concepts directly (engaged + walked path); RETRIEVAL_SIGNAL fetches are frag
+    ids, bridged frag → episode → claims → home concept (the C13 bridge)."""
+    rec: dict[str, str] = {}
+    ep_of: dict[str, str | None] = {}
+    cpts_of: dict[str, list[str]] = {}
+    for s in store.events_since(conn, user_id, 0,
+                                types=["ENGAGEMENT", "RETRIEVAL_SIGNAL"]):
+        p = json.loads(s["payload_json"])
+        ev_ts = s["ts"]
+        if s["type"] == "ENGAGEMENT":
+            touched = ([p["engaged"]] if p.get("engaged") else []) + (p.get("path") or [])
+        else:
+            touched = []
+            for fid in p.get("fetched", []):
+                if fid not in ep_of:
+                    ep_of[fid] = store.fragment_episode(conn, user_id, fid)
+                if not (ep := ep_of[fid]):
+                    continue
+                if ep not in cpts_of:
+                    cpts_of[ep] = [c for cl in store.claims_for_episode(conn, user_id, ep)
+                                   if (c := _claim_concept(conn, user_id, cl))]
+                touched += cpts_of[ep]
+        for cpt in touched:
+            if ev_ts > rec.get(cpt, ""):
+                rec[cpt] = ev_ts
+    return rec
+
+
 def _decay_strengthen(conn, user_id: str, run_id: str, episodes, ts: str) -> None:
     # Strengthen: encode-time echo receipts bump the echoed claims.
     for ep in episodes:
@@ -1322,8 +1371,11 @@ def _decay_strengthen(conn, user_id: str, run_id: str, episodes, ts: str) -> Non
 
     # Decay: state transitions decided here (with dates), applied from payload.
     now = datetime.now(timezone.utc)
+    usage = _usage_recency(conn, user_id) if USAGE_REFRESH else {}
     for c in store.all_concepts(conn, user_id):
         days = _days_since(c["last_activity"], now)
+        if c["id"] in usage:    # being read counts as activity
+            days = min(days, _days_since(usage[c["id"]], now))
         if days <= config.HEALTH_ACTIVE_DAYS:
             new_state = "active"
         elif days <= config.HEALTH_STALE_DAYS:
@@ -1420,6 +1472,11 @@ def _consume_retrieval_signals(conn, user_id: str, run_id: str, ts: str) -> None
 # strong enough signal to demote standalone pull (reversible; theme still carries it).
 RELEVANCE_DEMOTE_MARGIN = 1
 
+# Workstream D (broad-lift findings): the engaged node after a recall is an implicit
+# relevant vote. Inert on Coverage@B by construction (background never gates
+# resonance/fragments) — this is the C13 promote unlock, felt-quality only.
+ENGAGEMENT_SALIENCE = True
+
 
 def _feedback_claims(conn, user_id: str, node_id: str) -> list[str]:
     """Normalise a feedback target id to the claim layer C13/C13b operate on:
@@ -1436,7 +1493,15 @@ def _feedback_claims(conn, user_id: str, node_id: str) -> list[str]:
 def _relevance_net(conn, user_id: str):
     """Net explicit-relevance vote per claim across ALL RELEVANCE_FEEDBACK events
     (relevant +1 / irrelevant −1), target ids normalised to claims. Recomputed from
-    the whole log → deterministic on replay."""
+    the whole log → deterministic on replay.
+
+    ENGAGEMENT_SALIENCE (Workstream D): the node a user drilled into after a recall
+    is the implicit 'needed' signal C13 deferred promotion for — each ENGAGEMENT's
+    `engaged` node counts as one relevant vote. Through the existing votes plumbing
+    this both EXEMPTS the engaged claims from C13's exposed-never-fetched demotion
+    and PROMOTES them via C13b's net>0 → UNBACKGROUNDED branch. Surfaced-but-not-
+    engaged nodes are deliberately NOT demoted (rare-but-correct must not be
+    suppressed for being quiet — the C13 caution)."""
     from collections import Counter
     votes = Counter()
     for s in store.events_since(conn, user_id, 0, types=["RELEVANCE_FEEDBACK"]):
@@ -1447,6 +1512,12 @@ def _relevance_net(conn, user_id: str):
         for nid in p.get("irrelevant", []):
             for cid in _feedback_claims(conn, user_id, nid):
                 votes[cid] -= 1
+    if ENGAGEMENT_SALIENCE:
+        for s in store.events_since(conn, user_id, 0, types=["ENGAGEMENT"]):
+            p = json.loads(s["payload_json"])
+            if p.get("engaged"):
+                for cid in _feedback_claims(conn, user_id, p["engaged"]):
+                    votes[cid] += 1
     return votes
 
 

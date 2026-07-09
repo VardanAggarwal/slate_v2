@@ -107,17 +107,51 @@ Three isolation guarantees, all verified (leak into a real retrieval context = *
 Routing still works because the spreader reads `concept_members` via raw SQL
 (`resonance.neighbours`), which is kind-agnostic.
 
-## Open / next move (the gate to flip it ON)
-The mechanism is shipped; **gate #1 (does broad survive a real judge?) is PASSED** (Opus-4.8:
-1/13 → 3/13, forgetting 0 on broad). Still required before `INJECT_QUERY_CLAIMS=True` /
-`QUERY_CLAIM_REANCHOR=True`:
-1. **Forgetting gate on narrow + paragraph** — re-anchor mutates concept medoids; only broad was
-   real-judge-checked. Run the same emit-contexts → judge on the other two golds and require
-   zero regressions before enabling re-anchor.
-2. **Stability** — broad is a 2-query flip on n=13; show it holds across query-stream seeds +
-   attach_k ∈ {3,5,6} before trusting it.
-3. **Marker** — `qclm_` id prefix is the current marker; if it proves load-bearing long-term,
-   promote to a `claims.origin='query'` column.
+## 2026-07-09 — INJECT enabled; re-anchor KILLED by the traversal findings
+`INJECT_QUERY_CLAIMS=True`; `QUERY_CLAIM_REANCHOR=False`.
+
+**Third strike (2026-07-09, shipped-path E2E — `scratchpad/flywheel_e2e.py` /
+`flywheel_e2e_reanchor.py`):** on the prepped corpus, 60 REAL logged queries (usage simulated
+through `resonance_context(signals=True)`, injected via the production QUERY_INJECTED
+applier): reanchor OFF = coverage byte-identical to baseline (.750/.210/.889, zero
+forgetting); reanchor ON = **narrow .750→.688, broad/paragraph unmoved**. Each instrument sees
+a different axis pay (walked queries: paragraph; judge: broad; signal-log queries: narrow) —
+the drift corrupts whatever geometry sits near the touched concepts.
+
+**Re-anchor is superseded: docs/broad-lift-traversal-findings.md (2026-07-08) measured it
+REGRESSIVE on the corrected instrument** — 19-probe extended broad gold, per-copy corpus prep
+(stale relations cleared + 6a/6b/6c), qclm dead-slot fix in place. Reanchor ON: broad
+.210→.158, paragraph .889→.667 (narrow untouched there). The in-session Opus judge agreed
+(.158→.105, b_community displacement). The June-27 judge win below and the 2026-07-09
+stale-lab re-runs (`scratchpad/reanchor_ab.json` — old synthetic stream, unprepped corpus
+copy, baseline .688/.158/.556 vs the doc's .750/.210/.889) predate/miss that prep and do not
+survive the re-test. Oracle seeding caps broad at ~.263 regardless — no headroom for a
+retrieval-side lever. Verdict: reanchor stays OFF permanently, not as safety margin.
+
+**Inject-only (routing) is coverage-NEUTRAL** (A_off exactly baseline in the traversal matrix;
+same in the stale A/B). It stays ON as the demand-capture flywheel bet: in prod the qclm hubs
+encode REAL logged queries (a distribution no eval has tested), the mechanism is rebuild-safe,
+guarded (3 leak checks + dead-slot fix), and one flag reverts it.
+
+Gate runs from earlier on 2026-07-09 (stale instrument — kept for the record, but superseded
+by the traversal findings above):
+1. **Forgetting gate on narrow + paragraph — PASSED, zero real regressions.** emit-contexts on
+   `gold.jsonl` (16q) + `gold_paragraph.jsonl` (9q), re-anchor ON. Mechanical per-fact cosine
+   pre-pass (`scratchpad/forgetting_gate.py`) flagged 7 candidate drops (g07, g12, g15×3,
+   p05×2); each was judged in-session (Opus-class) against the actual context pair. All 7 were
+   the same benign mechanism: re-anchor reshuffles which Background concept-frames render, but
+   the flagged facts survive **verbatim in Specifics** (BNPL note, gig-coercion note, symbiosis
+   paragraph). One marginal: g15 "function rather than structure" lost its explicit Background
+   bullet but remains derivable from the retained "Black box approach" note.
+2. **Stability — PASSED.** `scratchpad/qclaim_stability.py`: attach_k ∈ {3,4,5,6} on the full
+   cached 60-query stream + four 30-query composition subsets (first/last half, even/odd) at
+   k=4. Broad lifts 0.158 → 0.210 in **every** cell; narrow (0.688) and paragraph (0.556)
+   pinned at baseline throughout. Disjoint halves both produce the lift → not a single-query
+   artifact. Numbers: `scratchpad/qclaim_stability.json`. Caveat: seed-variation proxied by
+   stream-composition subsets (regenerating streams with fresh seeds needs LLM spend); identical
+   numbers across subsets say the lift rides on a robust minority of cross-concept queries.
+3. **Marker** (open, non-blocking) — `qclm_` id prefix is the current marker; if it proves
+   load-bearing long-term, promote to a `claims.origin='query'` column.
 
 ## Lab files (scratchpad/)
 - `query_bridges.py` — reading A + the cached synthetic query generator (claude-cli forced).

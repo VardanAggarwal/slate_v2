@@ -13,6 +13,7 @@ the request token via _user_id() and passes it into core explicitly.
 """
 import json
 import secrets
+import time
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -268,6 +269,46 @@ def receipt_markdown(receipt: dict) -> str:
     return "\n".join(lines)
 
 
+# ── Engagement capture (demand signal) ────────────────────────────────────────
+# recall() stashes what it surfaced; each drill-down that follows (get_note /
+# get_concept / timeline) — or a save_note, the strongest signal — is logged as an
+# ENGAGEMENT event via retrieve.record_engagement, the implicit 'needed' vote
+# consolidation's _relevance_net consumes. Implicit because hosts rarely call the
+# explicit mark_relevance tool. In-process + best-effort by design: a lost stash
+# (restart, TTL) just means one unlogged walk, never a failed tool call.
+_ENGAGEMENT_TTL = 900          # attribute drills to the recall for 15 minutes
+_engagement_ctx: dict[str, dict] = {}
+
+
+def _stash_recall(user_id: str, query: str, surfaced: list[str]) -> None:
+    _engagement_ctx[user_id] = {"query": query, "surfaced": surfaced,
+                                "path": [], "t": time.monotonic()}
+
+
+def _log_engagement(user_id: str, node_id: str | None = None, *,
+                    spawned_write: bool = False) -> None:
+    """One ENGAGEMENT event per drill (engaged=that node, path=walk so far) —
+    each drilled node is one implicit relevant vote in _relevance_net."""
+    ctx = _engagement_ctx.get(user_id)
+    if not ctx or time.monotonic() - ctx["t"] > _ENGAGEMENT_TTL:
+        return
+    if node_id:
+        ctx["path"].append(node_id)
+    if spawned_write:
+        _engagement_ctx.pop(user_id, None)   # the save consumes the walk
+    from core.retrieve import record_engagement
+    conn = _conn()
+    try:
+        record_engagement(conn, user_id, ctx["query"], surfaced=ctx["surfaced"],
+                          engaged=node_id, path=ctx["path"],
+                          spawned_write=spawned_write)
+        conn.commit()
+    except Exception:
+        pass   # capture must never break the serving tool
+    finally:
+        conn.close()
+
+
 # ── Tools ─────────────────────────────────────────────────────────────────────
 @mcp.tool
 def save_note(text: str, title: str) -> dict:
@@ -299,6 +340,9 @@ def save_note(text: str, title: str) -> dict:
     # the episode for the nightly refine_pending sweep.
     from core.write import trigger_refine_async
     trigger_refine_async(user_id, receipt["episode_id"])
+    # A save on the heels of a recall is the strongest engagement signal —
+    # the surfaced thinking spawned new writing.
+    _log_engagement(user_id, spawned_write=True)
     return {"episode_id": receipt["episode_id"], "title": title.strip(),
             "n_sentences": receipt["n_sentences"],
             "narrate": receipt_markdown(receipt)}
@@ -320,7 +364,10 @@ def recall(query: str, k: int = 8) -> list[dict]:
     Slate which ones helped.
     """
     from core.recall import recall as _recall
-    return _recall(_conn(), _user_id(), query, k=k)
+    user_id = _user_id()
+    out = _recall(_conn(), user_id, query, k=k)
+    _stash_recall(user_id, query, [r["id"] for r in out if r.get("id")])
+    return out
 
 
 @mcp.tool
@@ -383,9 +430,11 @@ def get_note(episode_id: str) -> dict:
     """Fetch one note in full: raw text, receipt, blueprint (post-consolidation),
     and the canonical claims it supports. Use after recall/list_recent_notes."""
     from core.recall import get_episode
-    result = get_episode(_conn(), _user_id(), episode_id)
+    user_id = _user_id()
+    result = get_episode(_conn(), user_id, episode_id)
     if not result:
         raise ToolError(f"Note not found: {episode_id}")
+    _log_engagement(user_id, episode_id)
     return result
 
 
@@ -403,9 +452,11 @@ def get_concept(concept_id: str) -> dict:
     member claims with provenance (episodes + verbatim sentences), and its
     relations. Use after recall surfaces a concept hit."""
     from core.recall import get_concept as _gc
-    result = _gc(_conn(), _user_id(), concept_id)
+    user_id = _user_id()
+    result = _gc(_conn(), user_id, concept_id)
     if not result:
         raise ToolError(f"Concept not found: {concept_id}")
+    _log_engagement(user_id, concept_id)
     return result
 
 
@@ -414,11 +465,17 @@ def timeline(concept_id: str, limit: int = 50) -> list[dict]:
     """How the user's thinking on a concept evolved: every consolidation event
     that touched it (created, claims attached, merged, split, decayed),
     oldest first. Use for "how did my thinking on X change?"."""
+    user_id = _user_id()
     conn = _conn()
+    # signal events (ENGAGEMENT walks name concept ids) are demand telemetry,
+    # not thinking-evolution — keep them out of the timeline.
     rows = conn.execute(
         """SELECT seq, ts, type, payload_json FROM events
-           WHERE user_id = ? AND payload_json LIKE ? ORDER BY seq LIMIT ?""",
-        (_user_id(), f"%{concept_id}%", limit)).fetchall()
+           WHERE user_id = ? AND payload_json LIKE ?
+             AND type NOT IN ('ENGAGEMENT', 'RETRIEVAL_SIGNAL', 'RELEVANCE_FEEDBACK')
+           ORDER BY seq LIMIT ?""",
+        (user_id, f"%{concept_id}%", limit)).fetchall()
+    _log_engagement(user_id, concept_id)
     out = []
     for r in rows:
         p = json.loads(r["payload_json"])
