@@ -141,6 +141,14 @@ DEFAULT_CALIBRATION = {
     "res_pe_gate": True,         # False → fixed conductance (no PE de-noising)
     "res_distinctiveness": True, # False → drop the inverse-degree node prior
     "res_clause_probes": True,   # False → only sentence-level probes (confluence rarely fires)
+    # query-tagged relevance-feedback rerank (docs/relevance-feedback-findings.md).
+    # Positive-only, claim-level salience reweight of confirmed-relevant claims for
+    # queries ≥ w_pos similar to a past feedback query. Lab: transfer .250→.541,
+    # originals byte-flat, O-gate clean. Magnitudes fitted on synthetic feedback —
+    # re-validate on real events; flip res_fb_rerank→False to disable instantly.
+    "res_fb_rerank": True,
+    "res_fb_alpha": 1.0,
+    "res_fb_w_pos": 0.45,
 }
 
 
@@ -334,6 +342,14 @@ def resonance_recall(conn, user_id: str, query: str, *,
         conn, {**retrieve.DEFAULT_CALIBRATION, **DEFAULT_CALIBRATION}, user_id)
     field = activate(conn, user_id, query, calibration=calibration)
     nodes, q_emb = field["nodes"], field["q_emb"]
+    # Query-tagged relevance feedback: reweight (never re-reach) the field so a live
+    # query inherits the confirmed-relevant claims of similar past queries. Positive-
+    # only, claim-level (docs/relevance-feedback-findings.md). Off → byte-identical.
+    if bool(calibration.get("res_fb_rerank", False)) and nodes:
+        retrieve.apply_feedback_rerank(
+            nodes, q_emb, retrieve.feedback_rerank_index(conn, user_id),
+            alpha=float(calibration.get("res_fb_alpha", 1.0)),
+            w_pos=float(calibration.get("res_fb_w_pos", 0.45)))
     if not nodes or field["top_sim"] < float(calibration.get("res_triage_min_rel", TRIAGE_MIN_REL)):
         if signals:
             retrieve.record_retrieval_signal(conn, user_id, query, fetched=[],

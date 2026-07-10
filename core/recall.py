@@ -47,11 +47,23 @@ def recall(conn, user_id: str, query: str, k: int = 8) -> list[dict]:
     confluence + PE-gated, fan-out-normalised spread over the consolidated graph.
     recall stops at the scored activation field and renders headlines; the heavy
     `assemble_context` runs the same `activate()` then materialises verbatim spans."""
-    from core import resonance
+    from core import calibration as calib, resonance, retrieve
     field = resonance.activate(conn, user_id, query)
     nodes, seeded = field["nodes"], field["seeded"]
     if not nodes:
         return []
+
+    # Query-tagged relevance-feedback rerank — the same reweight assemble_context's
+    # resonance_recall applies, so both heads rank consistently (activate() itself
+    # stays pure — consolidation's query-injection must not see feedback). Positive-
+    # only, claim-level, off → byte-identical. docs/relevance-feedback-findings.md.
+    cal = calib.merged(conn, {**retrieve.DEFAULT_CALIBRATION,
+                              **resonance.DEFAULT_CALIBRATION}, user_id)
+    if bool(cal.get("res_fb_rerank", False)):
+        retrieve.apply_feedback_rerank(
+            nodes, field["q_emb"], retrieve.feedback_rerank_index(conn, user_id),
+            alpha=float(cal.get("res_fb_alpha", 1.0)),
+            w_pos=float(cal.get("res_fb_w_pos", 0.45)))
 
     # Score the brightest nodes (by navigation salience) with why-now signals.
     # Pre-trim to a bounded pool so _score_node's per-node SQL stays cheap on a wide

@@ -28,6 +28,8 @@ consolidation and pushed down — never baked here (mirrors recall/assembly).
 """
 from __future__ import annotations
 
+import json
+
 import numpy as np
 
 from core import assembly, calibration as calib, predict, scan, store
@@ -204,6 +206,95 @@ def record_engagement(conn, user_id: str, query: str, *, surfaced: list[str],
         "path": walk,
         "spawned_write": bool(spawned_write),
     }, run_id=run_id)
+
+
+# ── query-tagged relevance feedback → retrieval-time rerank (docs/relevance-feedback-
+# findings.md) ─────────────────────────────────────────────────────────────────────
+# The demand-side lever the shipped C13b background bit could not provide: past
+# feedback that names a query re-ranks a SIMILAR live query's field, pulling
+# confirmed-relevant claims across the materialize budget boundary. Lab result:
+# paraphrase-transfer coverage .250→.541, originals byte-flat, broad-only feedback
+# leaves narrow/paragraph untouched (O-gate clean), ≤1-query cost under 20% label noise.
+# POSITIVE-ONLY + CLAIM-LEVEL by construction (suppression is fragile and worthless;
+# concept-level votes regress) — so the worst case is a wrong PROMOTE, never a demote.
+#
+# Reach is deliberately untouched: every attempt to make feedback expand what gets
+# ACTIVATED (seed injection / residual seed-shift) regressed the golds — the live
+# query's own seeding is already optimal for its facts, so feedback can only be a
+# tiebreaker WITHIN the reached set, at the budget edge. Hence a salience reweight,
+# not a seed change.
+_FB_CACHE: dict[tuple, list] = {}   # (user_id, n_events) → [{q_emb, claims:set}]
+
+
+def feedback_rerank_index(conn, user_id: str) -> list[dict]:
+    """Per feedback event: {q_emb (unit), targets (set of node ids to promote)}.
+    Granularity is what the lab validated as byte-flat on originals:
+      RELEVANCE_FEEDBACK — the `relevant` ids AS-IS (claims + concepts are both live
+        nodes; explicit votes are already the right grain). Irrelevant ignored
+        (positive-only). Episode ids expand to their claims (not nodes themselves).
+      ENGAGEMENT — the engaged CONCEPT expanded to its primary member claims: the
+        coarse drill boosts claim-level, never the concept node (concept-node drill
+        votes regressed paragraph — findings §signal-mix).
+    Cached per (user, event-count) so feedback-query embeddings are computed once, not
+    per recall (prod embeds via HF API)."""
+    n = len(store.events_since(conn, user_id, 0,
+                               types=["RELEVANCE_FEEDBACK", "ENGAGEMENT"]))
+    key = (user_id, n)
+    hit = _FB_CACHE.get(key)
+    if hit is not None:
+        return hit
+    _FB_CACHE.clear()                       # only the latest snapshot is worth holding
+    events: list[tuple[str, set]] = []
+    for s in store.events_since(conn, user_id, 0, types=["RELEVANCE_FEEDBACK"]):
+        p = json.loads(s["payload_json"])
+        targets: set[str] = set()
+        for nid in p.get("relevant", []):
+            if nid.startswith(("clm_", "cpt_")):
+                targets.add(nid)                       # explicit vote — right grain, as-is
+            elif nid.startswith("ep_"):
+                targets.update(store.claims_for_episode(conn, user_id, nid))
+        if p.get("query") and targets:
+            events.append((p["query"], targets))
+    for s in store.events_since(conn, user_id, 0, types=["ENGAGEMENT"]):
+        p = json.loads(s["payload_json"])
+        eng = p.get("engaged")
+        if not (p.get("query") and eng and eng.startswith("cpt_")):
+            continue
+        targets = set(store.concept_member_ids(conn, user_id, eng, primary_only=True))
+        if targets:
+            events.append((p["query"], targets))
+    index = []
+    for qtext, targets in events:
+        e = np.asarray(_embed_query(qtext), dtype=float)
+        nrm = float(np.linalg.norm(e))
+        if nrm > 1e-9:
+            index.append({"q_emb": e / nrm, "targets": targets})
+    _FB_CACHE[key] = index
+    return index
+
+
+def apply_feedback_rerank(nodes: dict, q_emb, index: list[dict], *,
+                          alpha: float, w_pos: float) -> None:
+    """Multiply salience of positively-voted target nodes by (1 + alpha·w) for every
+    feedback event whose query is ≥ w_pos similar to the live query (w = cosine).
+    Mutates `nodes` in place; only nodes ALREADY in the field are touched (no reach
+    change). No-op when the index is empty."""
+    if not index:
+        return
+    q = np.asarray(q_emb, dtype=float)
+    qn = float(np.linalg.norm(q))
+    if qn <= 1e-9:
+        return
+    q = q / qn
+    for ev in index:
+        w = float(q @ ev["q_emb"])
+        if w < w_pos:
+            continue
+        boost = 1.0 + alpha * w
+        for nid in ev["targets"]:
+            nd = nodes.get(nid)
+            if nd is not None:
+                nd["salience"] *= boost
 
 
 def record_relevance_feedback(conn, user_id: str, query: str, *,
@@ -398,7 +489,8 @@ def assemble_context(conn, user_id: str, topic: str, max_chars: int = 6000,
     return "\n".join(out)
 
 
-__all__ = ["fragment_recall", "assemble_context", "decompose_query",
+__all__ = ["feedback_rerank_index", "apply_feedback_rerank",
+           "fragment_recall", "assemble_context", "decompose_query",
            "record_retrieval_signal", "record_relevance_feedback",
            "record_engagement", "SEED_K",
            "MAX_ITEMS", "TRIAGE_MIN_REL", "BORROW_MIN_REL", "DEFAULT_CALIBRATION"]
