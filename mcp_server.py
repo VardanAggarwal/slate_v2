@@ -356,12 +356,21 @@ def recall(query: str, k: int = 8) -> list[dict]:
     topic they may have thought about before — BEFORE composing your response.
     Also for: "what do I think about X?", "have I written about X?".
 
+    `query` should be the full paragraph or note text the user just wrote/said,
+    verbatim — NOT a compacted keyword phrase you distill from it. Slate embeds
+    the whole query and ranks against it; a short keyword query throws away
+    context (tone, specifics, adjacent ideas) that improves matching. Only
+    shorten it yourself if the user's input is already a long document — then
+    pass the relevant excerpt, not a summary.
+
     Returns compact headlines (~50 tokens each): claims and concepts ranked by
     graph navigation, with why-now signals (🔁 recurring claims, 🕰️ long-dormant
     thinking resurfacing, 2-hop = non-obvious connection). Escalate with
     assemble_context or get_concept when a hit
-    deserves the full picture. After you use the results, mark_relevance() tells
-    Slate which ones helped.
+    deserves the full picture. After you use the results, ALWAYS call
+    mark_relevance() — pass every id you surfaced to the user, split into
+    relevant/irrelevant by their reaction (accepted vs. dismissed as noise),
+    not just the ones you're confident about.
     """
     from core.recall import recall as _recall
     user_id = _user_id()
@@ -403,10 +412,13 @@ def mark_relevance(query: str, relevant: list[str] | None = None,
     """Report which recalled items actually helped answer `query` and which were
     noise — explicit feedback that tunes future recall.
 
-    Call AFTER you've used recalled context to compose a response, only when you
-    have a clear judgment. `relevant` / `irrelevant` take ids straight from
-    recall() headlines (claim or concept ids) or note ids (get_note /
-    list_recent_notes) — pass only the ids you're confident about, omit the rest.
+    Call this EVERY time you show recall() results to the user, not just when
+    the judgment is obvious. Account for everything you surfaced: for each id
+    you showed, put it in `relevant` if the user acted on it or agreed it fit,
+    or `irrelevant` if they ignored, corrected, or waved it off as not what
+    they meant — don't just drop the rejected ones silently. `relevant` /
+    `irrelevant` take ids straight from recall() headlines (claim or concept
+    ids) or note ids (get_note / list_recent_notes).
     Consolidation keeps the relevant ones in the foreground and demotes the
     irrelevant ones, so the next recall on a similar query ranks better."""
     rel = [i for i in (relevant or []) if i]
