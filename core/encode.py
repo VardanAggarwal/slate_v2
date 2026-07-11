@@ -165,9 +165,13 @@ def split_sentences(text: str, min_chars: int | None = None) -> list[str]:
 
 
 # ── Receipt ───────────────────────────────────────────────────────────────────
-def _build_receipt(conn, user_id: str, sentences: list[str], embeddings) -> dict:
+def _build_receipt(conn, user_id: str, sentences: list[str], embeddings,
+                   exclude_episode_ids: frozenset | set = frozenset()) -> dict:
     """Classify each sentence against canonical claims (echo/novelty/contradiction)
-    and against prior episode sentences (pre-consolidation echo signal)."""
+    and against prior episode sentences (pre-consolidation echo signal).
+
+    exclude_episode_ids: episodes whose sentences must not count as prior matches —
+    edit_note passes the note being replaced, else every edit echoes itself."""
     echoes, contradictions, novelties, prior_matches = [], [], [], []
 
     for i, sent in enumerate(sentences):
@@ -189,6 +193,8 @@ def _build_receipt(conn, user_id: str, sentences: list[str], embeddings) -> dict
 
         sent_hits = store.knn_sentences(conn, user_id, emb, k=2)
         for hit in sent_hits:
+            if hit["episode_id"] in exclude_episode_ids:
+                continue
             if hit["similarity"] >= config.ECHO_THRESHOLD:
                 prior_matches.append({
                     "sentence": sent,
@@ -215,12 +221,15 @@ def _build_receipt(conn, user_id: str, sentences: list[str], embeddings) -> dict
 # ── Entry point ───────────────────────────────────────────────────────────────
 def encode(conn, user_id: str, text: str, ts: str | None = None,
            title: str | None = None, source: str = "mcp",
-           replay_key: str | None = None) -> dict:
+           replay_key: str | None = None,
+           exclude_episode_ids: frozenset | set = frozenset()) -> dict:
     """Append an episode for one user, classify novelty, return the receipt.
 
     ts: ISO timestamp; replayed notes pass their original created_at.
     replay_key: old source id — recorded in replay_map inside the same
     transaction as the episode, so replay is idempotent even across crashes.
+    exclude_episode_ids: keep these episodes out of the receipt's prior-episode
+    matches (edit_note passes the note being replaced).
     """
     text = (text or "").strip()
     if not text:
@@ -243,7 +252,8 @@ def encode(conn, user_id: str, text: str, ts: str | None = None,
                                        normalize_embeddings=True,
                                        show_progress_bar=False)
 
-    receipt = _build_receipt(conn, user_id, sentences, embeddings)
+    receipt = _build_receipt(conn, user_id, sentences, embeddings,
+                             exclude_episode_ids=exclude_episode_ids)
     episode_id = store.new_episode_id(ts_unix)
     receipt["episode_id"] = episode_id
 

@@ -1,4 +1,4 @@
-"""FastMCP + OAuth 2.1. Tools: save_note, recall, assemble_context, mark_relevance, get_note, list_recent_notes, get_concept, timeline, digest. SlateOAuthProvider ported from v1 engine/mcp_server.py. See PLAN.md §5 MCP usage pattern + Phase 4, AUTH.md §2.
+"""FastMCP + OAuth 2.1. Tools: save_note, edit_note, recall, assemble_context, mark_relevance, get_note, list_recent_notes, get_concept, timeline, digest. SlateOAuthProvider ported from v1 engine/mcp_server.py. See PLAN.md §5 MCP usage pattern + Phase 4, AUTH.md §2.
 
 Two-stage retrieval: `recall` returns ~50-token headlines so the model can
 call it speculatively; `assemble_context` / `get_concept` are the escalation.
@@ -345,6 +345,48 @@ def save_note(text: str, title: str) -> dict:
     _log_engagement(user_id, spawned_write=True)
     return {"episode_id": receipt["episode_id"], "title": title.strip(),
             "n_sentences": receipt["n_sentences"],
+            "narrate": receipt_markdown(receipt)}
+
+
+@mcp.tool
+def edit_note(episode_id: str, new_text: str, title: str | None = None) -> dict:
+    """Replace a saved note with a revised version the user wrote.
+
+    Call when the user asks to edit/update/correct/rewrite a note they already
+    saved. Same discipline as save_note: `new_text` is the FULL revised note
+    body in the user's own words — not a diff, not an AI paraphrase. If the
+    user gave you a partial change, apply it to the note's full text
+    (get_note first) and pass the complete result.
+
+    The old version is kept for provenance but superseded: it stops surfacing
+    in recall, browse and receipts; claims only it supported are withdrawn; the
+    revised text is re-processed from scratch and keeps the note's original
+    date. Relay the `narrate` receipt like save_note's.
+
+    Args:
+        episode_id: the note to revise (from get_note / list_recent_notes / recall).
+        new_text: the full revised note body, verbatim in the user's voice.
+        title: optional new 3-8 word title; omit to keep the old one.
+    """
+    from core.edit import edit_note as _edit
+    user_id = _user_id()
+    conn = _conn()
+    try:
+        receipt = _edit(conn, user_id, episode_id, new_text,
+                        title=title.strip() if title else None)
+    except ValueError as e:
+        raise ToolError(str(e))
+    finally:
+        conn.close()
+    # Same async W2–W8 path as save_note — the revised episode re-fragments in
+    # the background; a failure is swept up by the nightly refine_pending.
+    from core.write import trigger_refine_async
+    trigger_refine_async(user_id, receipt["episode_id"])
+    # An edit on the heels of a recall is a save-strength engagement signal.
+    _log_engagement(user_id, spawned_write=True)
+    return {"episode_id": receipt["episode_id"],
+            "superseded_episode_id": receipt["superseded_episode_id"],
+            "title": receipt["title"], "n_sentences": receipt["n_sentences"],
             "narrate": receipt_markdown(receipt)}
 
 

@@ -50,6 +50,25 @@ async def test_save_note_rejects_empty(mcp_db, client):
 
 
 @pytest.mark.asyncio
+async def test_edit_note_supersedes_old_version(mcp_db, client):
+    from fastmcp.exceptions import ToolError
+    r1 = await _call(client, "save_note", text=S1, title="memory note")
+    r2 = await _call(client, "edit_note", episode_id=r1["episode_id"], new_text=S2)
+    assert r2["superseded_episode_id"] == r1["episode_id"]
+    assert r2["title"] == "memory note"     # kept when not overridden
+    assert "narrate" in r2
+    notes = await _call(client, "list_recent_notes")
+    ids = [n["id"] for n in notes]
+    assert r2["episode_id"] in ids and r1["episode_id"] not in ids
+    # the old version stays fetchable, flagged with its replacement
+    old = await _call(client, "get_note", episode_id=r1["episode_id"])
+    assert old["superseded_by"] == r2["episode_id"]
+    # editing a superseded version is refused with a pointer to the head
+    with pytest.raises(ToolError, match=r2["episode_id"]):
+        await _call(client, "edit_note", episode_id=r1["episode_id"], new_text=S1)
+
+
+@pytest.mark.asyncio
 async def test_recall_and_context_tools(mcp_db, client, fake_llm):
     from core import store
     conn = store.connect()

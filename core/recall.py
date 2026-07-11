@@ -149,17 +149,29 @@ def get_episode(conn, user_id: str, episode_id: str) -> dict | None:
            JOIN claims c ON c.id = s.claim_id
            WHERE s.episode_id = ? AND s.user_id = ?""",
         (episode_id, user_id))]
-    return {"id": ep["id"], "ts": ep["ts"], "title": ep["title"],
-            "source": ep["source"], "raw_text": ep["raw_text"],
-            "receipt": json.loads(ep["receipt_json"] or "{}"),
-            "blueprint": (json.loads(bp_row["payload_json"])["blueprint"]
-                          if bp_row else None),
-            "claims": claims}
+    out = {"id": ep["id"], "ts": ep["ts"], "title": ep["title"],
+           "source": ep["source"], "raw_text": ep["raw_text"],
+           "receipt": json.loads(ep["receipt_json"] or "{}"),
+           "blueprint": (json.loads(bp_row["payload_json"])["blueprint"]
+                         if bp_row else None),
+           "claims": claims}
+    # Edit lineage: a superseded note stays fetchable (provenance) but flagged;
+    # a revision points back at what it replaced.
+    newer = store.episode_superseded_by(conn, user_id, episode_id)
+    older = store.episode_supersedes(conn, user_id, episode_id)
+    if newer:
+        out["superseded_by"] = newer
+    if older:
+        out["edited_from"] = older
+    return out
 
 
 def list_episodes(conn, user_id: str, limit: int = 20,
                   before: str | None = None) -> list[dict]:
-    q = "SELECT id, ts, title, raw_text FROM episodes WHERE user_id = ?"
+    # superseded (edited-away) versions stay out of browse — get_episode still
+    # fetches them directly for provenance.
+    q = ("SELECT id, ts, title, raw_text FROM episodes WHERE user_id = ? "
+         "AND NOT EXISTS (SELECT 1 FROM episode_supersessions ss WHERE ss.old_id = episodes.id)")
     args: list = [user_id]
     if before:
         q += " AND ts < ?"

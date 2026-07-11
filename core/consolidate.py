@@ -293,6 +293,35 @@ def apply_event(conn, user_id: str, type_: str, payload: dict) -> None:
             for cid in touched:
                 store.recompute_concept_embedding_demand(conn, user_id, cid)
 
+    elif type_ == "EPISODE_SUPERSEDED":
+        # edit_note: the old episode's raw row is immutable and stays (provenance),
+        # but every DERIVED artifact it fed must stop surfacing. All deletes here
+        # hit rebuildable stores only — replay order makes this deterministic (the
+        # old episode's FRAGMENTED/CANONICALIZED events apply first, this event
+        # masks them again). The revised episode re-derives through the normal
+        # refine → consolidate path; deterministic claim ids re-attach any belief
+        # the revised text still asserts.
+        store.mark_episode_superseded(conn, user_id, p["old_id"], p["new_id"], p["ts"])
+        touched_concepts: set = set()
+        for cid in store.claims_for_episode(conn, user_id, p["old_id"]):
+            conn.execute(
+                "DELETE FROM claim_support WHERE claim_id = ? AND episode_id = ? AND user_id = ?",
+                (cid, p["old_id"], user_id))
+            # A claim whose ONLY support was the edited-away text is withdrawn
+            # outright — unlike C8 supersede it must not survive as a held version.
+            if store.claim_support_count(conn, user_id, cid) == 0:
+                touched_concepts.update(r["concept_id"] for r in conn.execute(
+                    "SELECT concept_id FROM concept_members WHERE claim_id = ? AND user_id = ?",
+                    (cid, user_id)))
+                store.delete_claim(conn, user_id, cid)
+        for cpt in touched_concepts:
+            if store.get_concept(conn, user_id, cpt):
+                store.recompute_concept_embedding(conn, user_id, cpt)
+        conn.execute("DELETE FROM fragments WHERE episode_id = ? AND user_id = ?",
+                     (p["old_id"], user_id))
+        conn.execute("DELETE FROM episodes_fts WHERE episode_id = ? AND user_id = ?",
+                     (p["old_id"], user_id))
+
     elif type_ == "RECLUSTERED":
         # C12 — fragment regions reassigned to their nearest consolidated concept.
         # Emitted AFTER the run's FRAGMENTED events (higher seq), so on rebuild it

@@ -243,6 +243,18 @@ CREATE TABLE IF NOT EXISTS episode_consolidations (
     consolidated_at TEXT NOT NULL
 );
 
+-- EDIT (edit_note): episodes are immutable, so an edit saves a NEW episode and
+-- masks the old one behind this map. DERIVED — materialized only by the
+-- EPISODE_SUPERSEDED event applier, truncated + replayed by rebuild(). Read
+-- paths exclude old_id rows so an edited-away note stops surfacing while its
+-- raw row stays for provenance.
+CREATE TABLE IF NOT EXISTS episode_supersessions (
+    old_id   TEXT PRIMARY KEY,
+    user_id  TEXT NOT NULL,
+    new_id   TEXT NOT NULL,
+    ts       TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS replay_map (
     old_source_id TEXT NOT NULL,
     user_id       TEXT NOT NULL,
@@ -572,14 +584,18 @@ def knn_claims(conn: sqlite3.Connection, user_id: str, embedding, k: int = 5) ->
 
 
 def knn_sentences(conn: sqlite3.Connection, user_id: str, embedding, k: int = 5) -> list[dict]:
-    """Nearest prior episode sentences to one sentence embedding, within one user's partition."""
+    """Nearest prior episode sentences to one sentence embedding, within one user's
+    partition. Sentences of superseded (edited-away) episodes are skipped — their
+    vectors stay stored for provenance but must not echo; over-fetch covers the gap."""
     rows = conn.execute(
         "SELECT sent_key, distance FROM vec_sentences WHERE embedding MATCH ? AND k = ? AND user_id = ?",
-        (serialize_float32([float(x) for x in embedding]), k, user_id),
+        (serialize_float32([float(x) for x in embedding]), k * 3, user_id),
     ).fetchall()
     out = []
     for r in rows:
         episode_id, idx = r["sent_key"].rsplit(":", 1)
+        if episode_superseded_by(conn, user_id, episode_id):
+            continue
         meta = conn.execute(
             """SELECT s.text, e.title, e.ts FROM episode_sentences s
                JOIN episodes e ON e.id = s.episode_id
@@ -594,6 +610,8 @@ def knn_sentences(conn: sqlite3.Connection, user_id: str, embedding, k: int = 5)
             "episode_ts": meta["ts"] if meta else None,
             "similarity": _sim(r["distance"]),
         })
+        if len(out) >= k:
+            break
     return out
 
 
@@ -601,6 +619,34 @@ def knn_sentences(conn: sqlite3.Connection, user_id: str, embedding, k: int = 5)
 def get_episode(conn: sqlite3.Connection, user_id: str, episode_id: str) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM episodes WHERE id = ? AND user_id = ?",
                         (episode_id, user_id)).fetchone()
+
+
+def mark_episode_superseded(conn: sqlite3.Connection, user_id: str, old_id: str,
+                            new_id: str, ts: str) -> None:
+    """Materialize one EPISODE_SUPERSEDED event (called ONLY by the applier —
+    PLAN.md §10). Idempotent for refine retries / rebuild replay."""
+    conn.execute(
+        """INSERT INTO episode_supersessions (old_id, user_id, new_id, ts)
+           VALUES (?, ?, ?, ?) ON CONFLICT(old_id) DO NOTHING""",
+        (old_id, user_id, new_id, ts))
+
+
+def episode_superseded_by(conn: sqlite3.Connection, user_id: str,
+                          episode_id: str) -> str | None:
+    """The episode that replaced this one via edit_note, or None if current."""
+    row = conn.execute(
+        "SELECT new_id FROM episode_supersessions WHERE old_id = ? AND user_id = ?",
+        (episode_id, user_id)).fetchone()
+    return row["new_id"] if row else None
+
+
+def episode_supersedes(conn: sqlite3.Connection, user_id: str,
+                       episode_id: str) -> str | None:
+    """The prior version this episode replaced (edit lineage), or None."""
+    row = conn.execute(
+        "SELECT old_id FROM episode_supersessions WHERE new_id = ? AND user_id = ?",
+        (episode_id, user_id)).fetchone()
+    return row["old_id"] if row else None
 
 
 def count_episodes(conn: sqlite3.Connection, user_id: str) -> int:
@@ -626,7 +672,9 @@ def unconsolidated_episodes(conn: sqlite3.Connection, user_id: str) -> list[sqli
     return conn.execute(
         """SELECT e.* FROM episodes e
            LEFT JOIN episode_consolidations c ON c.episode_id = e.id
-           WHERE c.episode_id IS NULL AND e.user_id = ? ORDER BY e.ts""",
+           LEFT JOIN episode_supersessions ss ON ss.old_id = e.id
+           WHERE c.episode_id IS NULL AND ss.old_id IS NULL
+             AND e.user_id = ? ORDER BY e.ts""",
         (user_id,)).fetchall()
 
 
@@ -636,7 +684,8 @@ def users_with_unconsolidated(conn: sqlite3.Connection) -> list[str]:
     return [r["user_id"] for r in conn.execute(
         """SELECT DISTINCT e.user_id FROM episodes e
            LEFT JOIN episode_consolidations c ON c.episode_id = e.id
-           WHERE c.episode_id IS NULL ORDER BY e.user_id""")]
+           LEFT JOIN episode_supersessions ss ON ss.old_id = e.id
+           WHERE c.episode_id IS NULL AND ss.old_id IS NULL ORDER BY e.user_id""")]
 
 
 def all_user_ids(conn: sqlite3.Connection) -> list[str]:
@@ -1126,7 +1175,7 @@ def truncate_semantic(conn: sqlite3.Connection) -> None:
     event log (FRAGMENTED events rebuild the fragments)."""
     for table in ("claim_support", "concept_members", "relations",
                   "claims", "concepts", "vec_claims", "vec_concepts",
-                  "fragments"):
+                  "fragments", "episode_supersessions"):
         conn.execute(f"DELETE FROM {table}")
 
 
@@ -1279,7 +1328,9 @@ def unfragmented_episodes(conn: sqlite3.Connection, user_id: str) -> list[sqlite
     return conn.execute(
         """SELECT e.* FROM episodes e
            LEFT JOIN episode_fragmentations f ON f.episode_id = e.id
-           WHERE f.episode_id IS NULL AND e.user_id = ? ORDER BY e.ts""",
+           LEFT JOIN episode_supersessions ss ON ss.old_id = e.id
+           WHERE f.episode_id IS NULL AND ss.old_id IS NULL
+             AND e.user_id = ? ORDER BY e.ts""",
         (user_id,)).fetchall()
 
 
@@ -1287,7 +1338,8 @@ def users_with_unfragmented(conn: sqlite3.Connection) -> list[str]:
     return [r["user_id"] for r in conn.execute(
         """SELECT DISTINCT e.user_id FROM episodes e
            LEFT JOIN episode_fragmentations f ON f.episode_id = e.id
-           WHERE f.episode_id IS NULL ORDER BY e.user_id""")]
+           LEFT JOIN episode_supersessions ss ON ss.old_id = e.id
+           WHERE f.episode_id IS NULL AND ss.old_id IS NULL ORDER BY e.user_id""")]
 
 
 def mark_fragmented(conn: sqlite3.Connection, user_id: str, episode_id: str,
@@ -1399,6 +1451,9 @@ def stats(conn: sqlite3.Connection, user_id: str) -> dict:
         counts[table] = conn.execute(
             f"SELECT COUNT(*) AS n FROM {table} WHERE user_id = ?",
             (user_id,)).fetchone()["n"]
+    counts["episodes_superseded"] = conn.execute(
+        "SELECT COUNT(*) AS n FROM episode_supersessions WHERE user_id = ?",
+        (user_id,)).fetchone()["n"]
     run = last_run(conn, user_id)
     counts["last_consolidation"] = dict(run) if run else None
     return counts
