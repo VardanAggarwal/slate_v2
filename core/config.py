@@ -77,7 +77,7 @@ CLAUDE_MODEL_JUDGMENT   = os.getenv("CLAUDE_MODEL_JUDGMENT", "claude-sonnet-4-6"
 # OpenRouter model ids (provider-prefixed slugs, e.g. "anthropic/claude-...").
 # Defaults are free-tier (":free" suffix) — this is the primary rung, billed
 # to nothing until a paid model is deliberately chosen.
-OPENROUTER_MODEL_MECHANICAL = os.getenv("OPENROUTER_MODEL_MECHANICAL", "openai/gpt-oss-20b:free")
+OPENROUTER_MODEL_MECHANICAL = os.getenv("OPENROUTER_MODEL_MECHANICAL", "nvidia/nemotron-3-super-120b-a12b:free")
 OPENROUTER_MODEL_JUDGMENT   = os.getenv("OPENROUTER_MODEL_JUDGMENT", "nvidia/nemotron-3-super-120b-a12b:free")
 
 
