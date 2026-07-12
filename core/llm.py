@@ -7,9 +7,15 @@ below it. Port from /Users/vardanaggarwal/slate engine/extract.py + engine/conce
 call() is the sync path (Phase 2 dev iteration); submit_batch()/poll_batch()
 are the nightly Batch API path (50% off). Callers pick the tier; this module
 picks the provider/model and survives rate limits by walking the chain.
+
+OpenRouter's free tier caps at ~20 req/min. We stay under it two ways: a
+client-side pacer (_openrouter_pace) spaces dispatches, and a 429 is caught as
+RateLimitError so call() waits out the window on the openrouter rung instead of
+falling through to the paid claude rung (the billing trap).
 """
 import json
 import re
+import threading
 import time
 
 from core import config
@@ -24,6 +30,53 @@ BATCH_DISCOUNT = 0.5
 
 class LLMError(Exception):
     pass
+
+
+class RateLimitError(LLMError):
+    """A provider hit its request-rate cap (HTTP 429). Carries retry_after
+    (seconds) so call() can wait out the window on the same rung instead of
+    falling through to a paid one."""
+    def __init__(self, message: str, retry_after: float):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+# Serializes openrouter dispatches to keep them ≥ OPENROUTER_MIN_INTERVAL_S
+# apart (client-side pacing under the free-tier req/min cap). Holding the lock
+# across the sleep is intentional: it spaces concurrent callers, not just this
+# thread. Uses a monotonic clock so it is immune to wall-clock jumps.
+_openrouter_lock = threading.Lock()
+_openrouter_last = [0.0]
+
+
+def _openrouter_pace() -> None:
+    interval = config.OPENROUTER_MIN_INTERVAL_S
+    if interval <= 0:
+        return
+    with _openrouter_lock:
+        wait = interval - (time.monotonic() - _openrouter_last[0])
+        if wait > 0:
+            time.sleep(wait)
+        _openrouter_last[0] = time.monotonic()
+
+
+def _retry_after_seconds(resp) -> float:
+    """Seconds to wait per a 429's headers. Retry-After is seconds (or an
+    HTTP-date, which we ignore); OpenRouter's X-RateLimit-Reset is a Unix epoch
+    in milliseconds. Falls back to a fixed default when neither is present."""
+    ra = resp.headers.get("Retry-After")
+    if ra:
+        try:
+            return max(0.0, float(ra))
+        except ValueError:
+            pass  # HTTP-date form — fall through to reset header / default
+    reset = resp.headers.get("X-RateLimit-Reset")
+    if reset:
+        try:
+            return max(0.0, float(reset) / 1000.0 - time.time())
+        except ValueError:
+            pass
+    return config.OPENROUTER_RATELIMIT_DEFAULT_WAIT
 
 
 def _model_for_tier(tier: str) -> str:
@@ -60,6 +113,7 @@ def _call_openrouter(prompt: str, model: str, max_tokens: int, system: str | Non
     """OpenRouter — OpenAI-compatible chat/completions, one key routes to many
     underlying models. Primary rung: tried first, before any direct provider."""
     import requests
+    _openrouter_pace()  # stay under the free-tier req/min cap
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
@@ -76,6 +130,9 @@ def _call_openrouter(prompt: str, model: str, max_tokens: int, system: str | Non
               "usage": {"include": True}},
         timeout=120,
     )
+    if resp.status_code == 429:
+        raise RateLimitError(f"openrouter 429: {resp.text[:200]}",
+                             _retry_after_seconds(resp))
     if resp.status_code != 200:
         raise LLMError(f"openrouter {resp.status_code}: {resp.text[:200]}")
     data = resp.json()
@@ -228,7 +285,9 @@ def call(prompt: str, tier: str = "mechanical", max_tokens: int = 2048,
         # but escalates the budget instead of just waiting — same provider,
         # doubled max_tokens, up to MAX_TOKENS_CEILING.
         cur_max_tokens = max_tokens
-        for attempt in range(attempts):
+        attempt = 0
+        rl_waits = 0  # rate-limit waits are free — they don't consume attempts
+        while attempt < attempts:
             try:
                 if provider == "openrouter":
                     result = _call_openrouter(prompt, _openrouter_model_for_tier(tier),
@@ -254,14 +313,27 @@ def call(prompt: str, tier: str = "mechanical", max_tokens: int = 2048,
                     last_err = LLMError(
                         f"{provider} truncated at max_tokens={cur_max_tokens}")
                     cur_max_tokens = min(cur_max_tokens * 2, MAX_TOKENS_CEILING)
+                    attempt += 1
                     continue  # retry same provider immediately, no backoff sleep
                 if json_out:
                     result["json"] = parse_json(result["text"])
                 return result
+            except RateLimitError as e:
+                # Wait out the rate-limit window on THIS rung rather than
+                # falling through to a paid provider. Cap the wait (a daily-cap
+                # 429 resets hours out — don't block on it) and the retry count.
+                last_err = e
+                if e.retry_after <= config.OPENROUTER_RATELIMIT_MAX_WAIT \
+                        and rl_waits < config.OPENROUTER_RATELIMIT_MAX_RETRIES:
+                    rl_waits += 1
+                    time.sleep(e.retry_after)
+                    continue  # free retry: same attempt index, same budget
+                break  # give up on this provider; fall through to the next
             except Exception as e:
                 last_err = e
-                if attempt < attempts - 1:
-                    time.sleep(config.LLM_BACKOFF_BASE * (2 ** attempt))
+                attempt += 1
+                if attempt < attempts:
+                    time.sleep(config.LLM_BACKOFF_BASE * (2 ** (attempt - 1)))
     raise LLMError(f"all providers failed: {last_err}")
 
 

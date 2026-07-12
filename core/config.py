@@ -98,6 +98,19 @@ GEMINI_MODELS      = _csv("GEMINI_MODELS", ["gemini-2.5-flash", "gemini-2.5-flas
 LLM_MAX_ATTEMPTS = int(os.getenv("LLM_MAX_ATTEMPTS", "3"))
 LLM_BACKOFF_BASE = float(os.getenv("LLM_BACKOFF_BASE", "2.0"))  # seconds
 
+# ── OpenRouter rate-limit handling (free tier ≈ 20 req/min) ───────────────────
+# Client-side pacing: min seconds between openrouter dispatches so bulk loops
+# stay under the per-minute cap instead of firing bursts that 429. 3s ⇒ 20/min.
+# Set to 0 to disable pacing.
+OPENROUTER_MIN_INTERVAL_S = float(os.getenv("OPENROUTER_MIN_INTERVAL_S", "3.0"))
+# On a 429 we wait out the window on openrouter rather than falling through to a
+# paid rung (the billing trap). But a *daily*-cap 429 resets hours out — never
+# block on that; if the reported wait exceeds MAX_WAIT, bail to the next
+# provider. DEFAULT_WAIT is used when the response carries no reset header.
+OPENROUTER_RATELIMIT_MAX_WAIT     = float(os.getenv("OPENROUTER_RATELIMIT_MAX_WAIT", "90"))
+OPENROUTER_RATELIMIT_MAX_RETRIES  = int(os.getenv("OPENROUTER_RATELIMIT_MAX_RETRIES", "6"))
+OPENROUTER_RATELIMIT_DEFAULT_WAIT = float(os.getenv("OPENROUTER_RATELIMIT_DEFAULT_WAIT", "6.0"))
+
 # ── Concept health (ported from v1 health.py state model) ─────────────────────
 HEALTH_SCORES = {
     "grounded": 1.3,

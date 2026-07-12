@@ -224,6 +224,81 @@ def test_truncated_response_retries_with_bigger_budget(monkeypatch):
     assert seen_budgets == [32, 64, 128]  # escalated until it stopped truncating
 
 
+def test_ratelimit_waits_on_openrouter_not_fall_through(monkeypatch):
+    """A 429 must be waited out on the openrouter rung, NOT fall through to the
+    paid claude rung (the billing trap). The rate-limit wait is free — it does
+    not consume the provider's normal attempts."""
+    import core.llm as llm_mod
+
+    calls = {"n": 0}
+
+    def openrouter_429_then_ok(prompt, model, max_tokens, system):
+        calls["n"] += 1
+        if calls["n"] < 3:  # limited twice, then clears
+            raise llm_mod.RateLimitError("openrouter 429: rate limited", retry_after=5.0)
+        return {"text": '{"ok": true}', "provider": "openrouter", "model": model,
+                "input_tokens": 1, "output_tokens": 1, "cost": 0.0}
+
+    sleeps = []
+    monkeypatch.setattr(llm_mod, "_call_openrouter", openrouter_429_then_ok)
+    monkeypatch.setattr(llm_mod, "_call_claude",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("paid rung ran")))
+    monkeypatch.setattr(llm_mod.time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(llm_mod.config, "OPENROUTER_KEY", "key")
+    monkeypatch.setattr(llm_mod.config, "ANTHROPIC_KEY", "key")
+    monkeypatch.setattr(llm_mod.config, "LLM_FALLBACK_ORDER", ["openrouter", "claude"])
+    monkeypatch.setattr(llm_mod.config, "LLM_MAX_ATTEMPTS", 3)
+    monkeypatch.setattr(llm_mod.config, "OPENROUTER_RATELIMIT_MAX_WAIT", 90)
+    monkeypatch.setattr(llm_mod.config, "OPENROUTER_RATELIMIT_MAX_RETRIES", 6)
+
+    result = llm_mod.call("anything")
+    assert result["provider"] == "openrouter"  # never fell through
+    assert calls["n"] == 3                      # two 429s waited out, then ok
+    assert sleeps == [5.0, 5.0]                 # honored retry_after, not backoff
+
+
+def test_ratelimit_daily_cap_falls_through(monkeypatch):
+    """A 429 whose reset is far out (daily cap) exceeds MAX_WAIT — don't block
+    the run for hours; fall through to the next provider."""
+    import core.llm as llm_mod
+
+    def openrouter_daily_capped(prompt, model, max_tokens, system):
+        raise llm_mod.RateLimitError("openrouter 429: daily", retry_after=7200.0)
+
+    def claude_ok(prompt, model, max_tokens, system):
+        return {"text": '{"ok": true}', "provider": "claude", "model": model,
+                "input_tokens": 1, "output_tokens": 1, "cost": 0.0}
+
+    monkeypatch.setattr(llm_mod, "_call_openrouter", openrouter_daily_capped)
+    monkeypatch.setattr(llm_mod, "_call_claude", claude_ok)
+    monkeypatch.setattr(llm_mod.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(llm_mod.config, "OPENROUTER_KEY", "key")
+    monkeypatch.setattr(llm_mod.config, "ANTHROPIC_KEY", "key")
+    monkeypatch.setattr(llm_mod.config, "LLM_FALLBACK_ORDER", ["openrouter", "claude"])
+    monkeypatch.setattr(llm_mod.config, "OPENROUTER_RATELIMIT_MAX_WAIT", 90)
+
+    result = llm_mod.call("anything")
+    assert result["provider"] == "claude"  # bailed past the day-long wait
+
+
+def test_retry_after_header_parsing(monkeypatch):
+    import core.llm as llm_mod
+
+    class Resp:
+        def __init__(self, headers):
+            self.headers = headers
+
+    # Retry-After in plain seconds wins
+    assert llm_mod._retry_after_seconds(Resp({"Retry-After": "12"})) == 12.0
+    # X-RateLimit-Reset is Unix epoch *milliseconds*
+    monkeypatch.setattr(llm_mod.time, "time", lambda: 1000.0)
+    got = llm_mod._retry_after_seconds(Resp({"X-RateLimit-Reset": str(1030 * 1000)}))
+    assert abs(got - 30.0) < 1e-6
+    # no headers → configured default
+    monkeypatch.setattr(llm_mod.config, "OPENROUTER_RATELIMIT_DEFAULT_WAIT", 6.0)
+    assert llm_mod._retry_after_seconds(Resp({})) == 6.0
+
+
 def test_estimate_cost_haiku_batch_half_price():
     full = estimate_cost("claude-haiku-4-5", 1_000_000, 0)
     half = estimate_cost("claude-haiku-4-5", 1_000_000, 0, batch=True)
