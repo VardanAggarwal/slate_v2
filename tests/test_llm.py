@@ -163,6 +163,67 @@ def test_all_providers_fail_raises(monkeypatch):
         llm_mod.call("anything")
 
 
+def test_openrouter_is_configured_and_tried_first(monkeypatch):
+    import core.llm as llm_mod
+
+    def openrouter_ok(prompt, model, max_tokens, system):
+        return {"text": '{"ok": true}', "provider": "openrouter", "model": model,
+                "input_tokens": 1, "output_tokens": 1, "cost": 0.0}
+
+    monkeypatch.setattr(llm_mod, "_call_openrouter", openrouter_ok)
+    monkeypatch.setattr(llm_mod, "_call_claude_cli",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("cli ran")))
+    monkeypatch.setattr(llm_mod.config, "OPENROUTER_KEY", "key")
+    monkeypatch.setattr(llm_mod.config, "CLAUDE_CODE_OAUTH_TOKEN", "tok")
+    monkeypatch.setattr(llm_mod.config, "LLM_FALLBACK_ORDER", ["openrouter", "claude-cli"])
+    result = llm_mod.call("anything")
+    assert result["provider"] == "openrouter"
+
+
+def test_openrouter_unconfigured_falls_through(monkeypatch):
+    import core.llm as llm_mod
+
+    def cli_ok(prompt, model, max_tokens, system):
+        return {"text": '{"ok": true}', "provider": "claude-cli", "model": model,
+                "input_tokens": 1, "output_tokens": 1, "cost": 0.0}
+
+    monkeypatch.setattr(llm_mod, "_call_openrouter",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("openrouter ran")))
+    monkeypatch.setattr(llm_mod, "_call_claude_cli", cli_ok)
+    monkeypatch.setattr(llm_mod.config, "OPENROUTER_KEY", "")
+    monkeypatch.setattr(llm_mod.config, "CLAUDE_CODE_OAUTH_TOKEN", "tok")
+    monkeypatch.setattr(llm_mod.config, "LLM_FALLBACK_ORDER", ["openrouter", "claude-cli"])
+    result = llm_mod.call("anything")
+    assert result["provider"] == "claude-cli"
+
+
+def test_truncated_response_retries_with_bigger_budget(monkeypatch):
+    """A reasoning model that burns hidden CoT tokens can hit max_tokens before
+    the visible answer — call() must escalate the budget and retry, not return
+    a chopped-off response."""
+    import core.llm as llm_mod
+
+    seen_budgets = []
+
+    def openrouter_flaky(prompt, model, max_tokens, system):
+        seen_budgets.append(max_tokens)
+        if max_tokens < 100:
+            return {"text": "", "provider": "openrouter", "model": model,
+                    "input_tokens": 1, "output_tokens": 1, "cost": 0.0, "truncated": True}
+        return {"text": '{"ok": true}', "provider": "openrouter", "model": model,
+                "input_tokens": 1, "output_tokens": 1, "cost": 0.0, "truncated": False}
+
+    monkeypatch.setattr(llm_mod, "_call_openrouter", openrouter_flaky)
+    monkeypatch.setattr(llm_mod.config, "OPENROUTER_KEY", "key")
+    monkeypatch.setattr(llm_mod.config, "LLM_FALLBACK_ORDER", ["openrouter"])
+    monkeypatch.setattr(llm_mod.config, "LLM_MAX_ATTEMPTS", 3)
+    monkeypatch.setattr(llm_mod.time, "sleep", lambda *_: None)
+
+    result = llm_mod.call("anything", max_tokens=32)
+    assert result["json"] == {"ok": True}
+    assert seen_budgets == [32, 64, 128]  # escalated until it stopped truncating
+
+
 def test_estimate_cost_haiku_batch_half_price():
     full = estimate_cost("claude-haiku-4-5", 1_000_000, 0)
     half = estimate_cost("claude-haiku-4-5", 1_000_000, 0, batch=True)

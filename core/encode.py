@@ -132,7 +132,7 @@ def classify_stance(premise: str, hypothesis: str) -> str:
                 f'Premise: "{premise}"\nHypothesis: "{hypothesis}"\n'
                 'Does the hypothesis contradict, entail, or stay neutral to the premise? '
                 'Return ONLY JSON: {"stance": "contradiction"|"entailment"|"neutral"}',
-                tier="mechanical", max_tokens=32)
+                tier="mechanical", max_tokens=2048)
             stance = result["json"].get("stance", "neutral")
             return stance if stance in ("contradiction", "entailment", "neutral") else "neutral"
         except Exception:

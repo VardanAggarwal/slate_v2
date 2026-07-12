@@ -83,7 +83,7 @@ def digest(conn, user_id: str, since_hours: int = 36, polish: bool = False) -> s
     if polish:
         try:
             md = llm.call(PROMPT_DIGEST + md, tier="mechanical",
-                          max_tokens=1024, json_out=False)["text"]
+                          max_tokens=2048, json_out=False)["text"]
         except llm.LLMError:
             pass  # structured digest stands on its own
     return md

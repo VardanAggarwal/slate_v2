@@ -62,7 +62,7 @@ def reconstruct(conn, user_id: str, episode_id: str) -> dict:
     judge = llm.call(PROMPT_FIDELITY
                      .replace("{original}", ep["raw_text"])
                      .replace("{reconstruction}", text),
-                     tier="mechanical", max_tokens=512)
+                     tier="mechanical", max_tokens=2048)
 
     stored_bytes = len(json.dumps(structure).encode())
     original_bytes = len(ep["raw_text"].encode())

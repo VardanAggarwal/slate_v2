@@ -6,6 +6,7 @@ sentence-transformers
 numpy
 anthropic
 google-genai
+requests
 nltk
 pytest
 python-dotenv

@@ -1,4 +1,8 @@
-"""Provider fallback chain (claude→gemini→local) + Batch API helpers. Port from /Users/vardanaggarwal/slate engine/extract.py + engine/concepts.py. See PLAN.md §6.
+"""Provider fallback chain (default: openrouter→claude→gemini→local; claude-cli
+slots in when LLM_FALLBACK_ORDER is overridden with a subscription token) +
+Batch API helpers. openrouter is the primary rung — one key, many underlying
+models, its own internal failover — with the direct provider rungs as fallback
+below it. Port from /Users/vardanaggarwal/slate engine/extract.py + engine/concepts.py. See PLAN.md §6.
 
 call() is the sync path (Phase 2 dev iteration); submit_batch()/poll_batch()
 are the nightly Batch API path (50% off). Callers pick the tier; this module
@@ -26,6 +30,11 @@ def _model_for_tier(tier: str) -> str:
     return config.CLAUDE_MODEL_JUDGMENT if tier == "judgment" else config.CLAUDE_MODEL_MECHANICAL
 
 
+def _openrouter_model_for_tier(tier: str) -> str:
+    return (config.OPENROUTER_MODEL_JUDGMENT if tier == "judgment"
+            else config.OPENROUTER_MODEL_MECHANICAL)
+
+
 def parse_json(raw: str) -> dict:
     """Strip code fences / stray prose and parse the first JSON object."""
     clean = re.sub(r"^```(?:json)?\s*", "", raw.strip())
@@ -47,6 +56,55 @@ def estimate_cost(model: str, input_tokens: int, output_tokens: int,
 
 
 # ── Sync path ─────────────────────────────────────────────────────────────────
+def _call_openrouter(prompt: str, model: str, max_tokens: int, system: str | None) -> dict:
+    """OpenRouter — OpenAI-compatible chat/completions, one key routes to many
+    underlying models. Primary rung: tried first, before any direct provider."""
+    import requests
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+    resp = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {config.OPENROUTER_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={"model": model, "messages": messages, "max_tokens": max_tokens,
+              # Ask OpenRouter to report real dollar cost in usage.cost —
+              # omitted, it silently reads as 0.0 even on paid models.
+              "usage": {"include": True}},
+        timeout=120,
+    )
+    if resp.status_code != 200:
+        raise LLMError(f"openrouter {resp.status_code}: {resp.text[:200]}")
+    data = resp.json()
+    choice = (data.get("choices") or [{}])[0]
+    text = (choice.get("message") or {}).get("content", "")
+    truncated = choice.get("finish_reason") == "length"
+    # Reasoning models (GPT-OSS, Nemotron) can burn the whole max_tokens
+    # budget on hidden chain-of-thought and return EMPTY visible content with
+    # finish_reason="length" — that must flow through as truncated=True so
+    # call() escalates the budget, not raise (which would retry at the same
+    # budget forever via the backoff path instead).
+    if not text and not truncated:
+        raise LLMError(f"openrouter empty response: {str(data)[:200]}")
+    usage = data.get("usage") or {}
+    in_tok, out_tok = usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0)
+    return {
+        "text": text,
+        "provider": "openrouter",
+        "model": model,
+        "input_tokens": in_tok,
+        "output_tokens": out_tok,
+        # OpenRouter reports the real dollar cost per call (0.0 on :free
+        # models) — use it directly instead of our own per-model price table,
+        # which doesn't know OpenRouter's (possibly discounted) rates.
+        "cost": usage.get("cost", 0.0),
+        "truncated": truncated,
+    }
+
+
 def _call_claude_cli(prompt: str, model: str, max_tokens: int, system: str | None) -> dict:
     """Claude Code CLI in print mode — bills the Max/Pro subscription via
     CLAUDE_CODE_OAUTH_TOKEN instead of API keys. Raises LLMError on any
@@ -89,6 +147,10 @@ def _call_claude_cli(prompt: str, model: str, max_tokens: int, system: str | Non
         "input_tokens": usage.get("input_tokens", 0),
         "output_tokens": usage.get("output_tokens", 0),
         "cost": 0.0,  # subscription — no marginal spend
+        # Claude Code CLI's --output-format json has no stop_reason field
+        # (only type/subtype/is_error/result/usage/total_cost_usd/session_id)
+        # — no signal to detect truncation here, so always False.
+        "truncated": False,
     }
 
 
@@ -107,6 +169,7 @@ def _call_claude(prompt: str, model: str, max_tokens: int, system: str | None) -
         "input_tokens": resp.usage.input_tokens,
         "output_tokens": resp.usage.output_tokens,
         "cost": estimate_cost(model, resp.usage.input_tokens, resp.usage.output_tokens),
+        "truncated": resp.stop_reason == "max_tokens",
     }
 
 
@@ -122,6 +185,8 @@ def _call_gemini(prompt: str, model: str, max_tokens: int, system: str | None) -
     )
     resp = client.models.generate_content(model=model, contents=prompt, config=cfg)
     usage = getattr(resp, "usage_metadata", None)
+    candidates = getattr(resp, "candidates", None) or []
+    finish_reason = str(getattr(candidates[0], "finish_reason", "")) if candidates else ""
     return {
         "text": resp.text,
         "provider": "gemini",
@@ -129,7 +194,11 @@ def _call_gemini(prompt: str, model: str, max_tokens: int, system: str | None) -
         "input_tokens": getattr(usage, "prompt_token_count", 0) or 0,
         "output_tokens": getattr(usage, "candidates_token_count", 0) or 0,
         "cost": 0.0,  # gemini free tier; only claude costs are tracked
+        "truncated": "MAX_TOKENS" in finish_reason,
     }
+
+
+MAX_TOKENS_CEILING = 16384  # cap for the truncation-retry escalation below
 
 
 def call(prompt: str, tier: str = "mechanical", max_tokens: int = 2048,
@@ -145,32 +214,47 @@ def call(prompt: str, tier: str = "mechanical", max_tokens: int = 2048,
     attempts = max(1, config.LLM_MAX_ATTEMPTS)
     for provider in config.LLM_FALLBACK_ORDER:
         configured = (
-            (provider == "claude-cli" and config.CLAUDE_CODE_OAUTH_TOKEN)
+            (provider == "openrouter" and config.OPENROUTER_KEY)
+            or (provider == "claude-cli" and config.CLAUDE_CODE_OAUTH_TOKEN)
             or (provider == "claude" and config.ANTHROPIC_KEY)
             or (provider == "gemini" and config.GEMINI_KEY))
         if not configured:
             continue  # provider not set up; next provider
         # Up to `attempts` tries with exponential backoff: a transient 503 /
         # 429 / overload (or a malformed-JSON sampling blip) usually clears in
-        # seconds, so wait before falling through to the next provider.
+        # seconds, so wait before falling through to the next provider. A
+        # response cut off at max_tokens (reasoning models especially burn
+        # hidden CoT tokens before the visible answer) also consumes a retry,
+        # but escalates the budget instead of just waiting — same provider,
+        # doubled max_tokens, up to MAX_TOKENS_CEILING.
+        cur_max_tokens = max_tokens
         for attempt in range(attempts):
             try:
-                if provider == "claude-cli":
+                if provider == "openrouter":
+                    result = _call_openrouter(prompt, _openrouter_model_for_tier(tier),
+                                              cur_max_tokens, system)
+                elif provider == "claude-cli":
                     result = _call_claude_cli(prompt, _model_for_tier(tier),
-                                              max_tokens, system)
+                                              cur_max_tokens, system)
                 elif provider == "claude":
-                    result = _call_claude(prompt, _model_for_tier(tier), max_tokens, system)
+                    result = _call_claude(prompt, _model_for_tier(tier), cur_max_tokens, system)
                 else:  # gemini
                     result = None
                     g_err: Exception | None = None
                     for m in config.GEMINI_MODELS:
                         try:
-                            result = _call_gemini(prompt, m, max_tokens, system)
+                            result = _call_gemini(prompt, m, cur_max_tokens, system)
                             break
                         except Exception as e:  # try next gemini model
                             g_err = e
                     if result is None:  # all gemini models failed — retryable
                         raise g_err or LLMError("no gemini model configured")
+                if result.get("truncated") and cur_max_tokens < MAX_TOKENS_CEILING \
+                        and attempt < attempts - 1:
+                    last_err = LLMError(
+                        f"{provider} truncated at max_tokens={cur_max_tokens}")
+                    cur_max_tokens = min(cur_max_tokens * 2, MAX_TOKENS_CEILING)
+                    continue  # retry same provider immediately, no backoff sleep
                 if json_out:
                     result["json"] = parse_json(result["text"])
                 return result

@@ -58,8 +58,12 @@ WRITE_REINFORCE_BUMP = float(os.getenv("WRITE_REINFORCE_BUMP", "0.25"))  # stren
 WRITE_CONTRADICT_HOLD = float(os.getenv("WRITE_CONTRADICT_HOLD", "2.0"))
 
 # ── API keys ──────────────────────────────────────────────────────────────────
-ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-GEMINI_KEY    = os.getenv("GEMINI_API_KEY", "")
+ANTHROPIC_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
+GEMINI_KEY     = os.getenv("GEMINI_API_KEY", "")
+# OpenRouter — primary rung (single key routes to many underlying models,
+# incl. Anthropic/Gemini/OSS, with its own failover). Falls through to the
+# direct provider rungs below when unset or erroring.
+OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY", "")
 
 # Claude Code subscription token (`claude setup-token`) — enables the
 # claude-cli provider: nightly LLM calls ride the Max/Pro subscription and
@@ -70,13 +74,21 @@ CLAUDE_CODE_OAUTH_TOKEN = os.getenv("CLAUDE_CODE_OAUTH_TOKEN", "")
 CLAUDE_MODEL_MECHANICAL = os.getenv("CLAUDE_MODEL_MECHANICAL", "claude-haiku-4-5")
 CLAUDE_MODEL_JUDGMENT   = os.getenv("CLAUDE_MODEL_JUDGMENT", "claude-sonnet-4-6")
 
+# OpenRouter model ids (provider-prefixed slugs, e.g. "anthropic/claude-...").
+# Defaults are free-tier (":free" suffix) — this is the primary rung, billed
+# to nothing until a paid model is deliberately chosen.
+OPENROUTER_MODEL_MECHANICAL = os.getenv("OPENROUTER_MODEL_MECHANICAL", "openai/gpt-oss-20b:free")
+OPENROUTER_MODEL_JUDGMENT   = os.getenv("OPENROUTER_MODEL_JUDGMENT", "nvidia/nemotron-3-super-120b-a12b:free")
+
 
 def _csv(var: str, default: list[str]) -> list[str]:
     raw = os.getenv(var, "")
     return [m.strip() for m in raw.split(",") if m.strip()] if raw else default
 
 
-LLM_FALLBACK_ORDER = _csv("LLM_FALLBACK_ORDER", ["claude", "gemini", "local"])
+# openrouter tried first: one key, many underlying models + its own failover.
+# Direct rungs (claude-cli/claude/gemini) stay as the fallback chain below it.
+LLM_FALLBACK_ORDER = _csv("LLM_FALLBACK_ORDER", ["openrouter", "claude", "gemini", "local"])
 GEMINI_MODELS      = _csv("GEMINI_MODELS", ["gemini-2.5-flash", "gemini-2.5-flash-lite"])
 
 # ── LLM retry/backoff (absorb transient 503/429/overload within a run) ────────

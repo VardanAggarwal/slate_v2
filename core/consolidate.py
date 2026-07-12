@@ -460,7 +460,7 @@ def blueprint(text: str) -> tuple[dict, float]:
     On the slim server image the LLMError propagates instead — the caller
     skips the episode and the next nightly run retries it."""
     try:
-        result = llm.call(PROMPT_BLUEPRINT + text, tier="mechanical", max_tokens=2048)
+        result = llm.call(PROMPT_BLUEPRINT + text, tier="mechanical", max_tokens=8192)
         bp = result["json"]
         bp["_method"] = result["provider"]
         return bp, result["cost"]
@@ -654,7 +654,7 @@ def _canonicalize_episode(conn, user_id: str, run_id: str, episode, bp: dict,
             f'{i}. NEW: "{c["text"]}"\n   EXISTING: "{best["text"]}"'
             for i, (c, best) in enumerate(chunk))
         try:
-            result = llm.call(PROMPT_CANON + pairs, tier="mechanical", max_tokens=1024)
+            result = llm.call(PROMPT_CANON + pairs, tier="mechanical", max_tokens=8192)
             cost += result["cost"]
             verdicts = {v["i"]: v["same"] for v in result["json"].get("verdicts", [])}
         except llm.LLMError:
@@ -984,7 +984,7 @@ def _resolve_conflicts(pairs: list[tuple[dict, dict]]) -> tuple[list[dict], floa
             f'{i}. NEWER: "{ca["text"]}"\n   OLDER: "{cb["text"]}"'
             for i, (ca, cb) in enumerate(chunk))
         try:
-            result = llm.call(PROMPT_VERSION + body, tier="judgment", max_tokens=2048)
+            result = llm.call(PROMPT_VERSION + body, tier="judgment", max_tokens=8192)
             cost += result["cost"]
             verdicts = result["json"].get("verdicts", [])
         except llm.LLMError:
