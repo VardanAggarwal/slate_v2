@@ -37,6 +37,7 @@ STANCE_PROVIDER = os.getenv("STANCE_PROVIDER", "nli")
 NLI_MODEL       = os.getenv("NLI_MODEL", "cross-encoder/nli-deberta-v3-small")
 # Server-side MNLI model for the 'hf' provider (zero-shot via InferenceClient).
 STANCE_HF_MODEL = os.getenv("STANCE_HF_MODEL", "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli")
+STANCE_HF_TIMEOUT = float(os.getenv("STANCE_HF_TIMEOUT", "30"))
 # Bucketing of P(anchor ⊨ fragment) into entail/contradict/neutral. Calibratable
 # (fitted at consolidation later); these are the profile defaults. NOTE: a single
 # zero-shot entailment score separates entail from not-entail, but not-entailed

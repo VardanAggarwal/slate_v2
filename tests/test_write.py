@@ -427,26 +427,69 @@ def test_refine_pending_all_users_isolated(conn):
 # ══════════════════════════════════════════════════════════════════════════════
 # W6 PROD FIX — HFStance: contradictions survive with NO torch
 # ══════════════════════════════════════════════════════════════════════════════
-def test_hf_stance_buckets_entailment_prob():
+def test_hf_stance_buckets_entailment_prob(monkeypatch):
     from core.encode import HFStance
 
-    class FakeClient:
-        def __init__(self, score):
-            self.score, self.calls = score, []
+    def stub(shape):
+        """Return a _post replacement emitting one of the router's live shapes."""
+        def _post(self, premise, hypothesis):
+            return shape
+        return _post
 
-        def zero_shot_classification(self, premise, labels, multi_label=None,
-                                     hypothesis_template=None, model=None):
-            self.calls.append((premise, labels, hypothesis_template))
-            return [{"label": labels[0], "score": self.score}]
+    def bucket(shape):
+        s = HFStance.__new__(HFStance)
+        s._token, s._model = "t", "m"
+        monkeypatch.setattr(HFStance, "_post", stub(shape))
+        return s.classify("The sky is blue.", "The sky is not blue.")
+
+    # DeBERTa MNLI shape: bare dict with parallel labels/scores. This is the one
+    # huggingface_hub's typed helper rejects — the bug that made 'hf' a no-op.
+    assert bucket({"sequence": "x", "labels": ["y"], "scores": [0.05]}) == "contradiction"
+    assert bucket({"sequence": "x", "labels": ["y"], "scores": [0.92]}) == "entailment"
+    assert bucket({"sequence": "x", "labels": ["y"], "scores": [0.40]}) == "neutral"
+    # bart-large-mnli shape: list of {label, score}
+    assert bucket([{"label": "y", "score": 0.05}]) == "contradiction"
+    assert bucket([{"label": "y", "score": 0.92}]) == "entailment"
+
+
+def test_hf_stance_raises_on_error_payload(monkeypatch):
+    """An error body must raise, not be read as a 0.0 score (= false contradiction)."""
+    from core.encode import HFStance
 
     s = HFStance.__new__(HFStance)
-    s._client, s._model = FakeClient(0.05), "m"             # low entail → contradiction
-    assert s.classify("The sky is blue.", "The sky is not blue.") == "contradiction"
-    assert s._client.calls[0][2] == "{}"                    # pass-through hypothesis template
-    s._client = FakeClient(0.92)                            # high → entailment
-    assert s.classify("a", "b") == "entailment"
-    s._client = FakeClient(0.40)                            # mid → neutral
-    assert s.classify("a", "b") == "neutral"
+    s._token, s._model = "t", "m"
+    monkeypatch.setattr(HFStance, "_post",
+                        lambda self, p, h: {"error": "Model not supported by provider"})
+    with pytest.raises(RuntimeError):
+        s.classify("a", "b")
+
+
+def test_hf_stance_posts_passthrough_template(monkeypatch):
+    """hypothesis_template must stay '{}' — the hypothesis IS the candidate label,
+    not a slot-filled 'This example is {}.' sentence."""
+    from core import encode
+
+    sent = {}
+
+    class FakeResp:
+        def raise_for_status(self): pass
+        def json(self): return {"scores": [0.5]}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        sent.update(url=url, headers=headers, body=json)
+        return FakeResp()
+
+    monkeypatch.setattr("requests.post", fake_post)
+    s = encode.HFStance.__new__(encode.HFStance)
+    s._token, s._model = "tok", "some/model"
+    s._entail_prob("premise text", "hypothesis text")
+
+    assert sent["body"]["parameters"]["hypothesis_template"] == "{}"
+    assert sent["body"]["parameters"]["candidate_labels"] == ["hypothesis text"]
+    assert sent["body"]["parameters"]["multi_label"] is True
+    assert sent["body"]["inputs"] == "premise text"
+    assert sent["headers"]["Authorization"] == "Bearer tok"
+    assert "some/model" in sent["url"]
 
 
 def test_classify_stance_hf_provider_signs_contradiction(monkeypatch):

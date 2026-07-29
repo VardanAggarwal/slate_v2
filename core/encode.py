@@ -7,10 +7,13 @@ Before the first consolidation the claims table is empty, so the receipt also
 reports prior-episode sentence matches ("echoes your March note on X") — claims
 remain the canonical layer once consolidate() has run.
 """
+import logging
 import re
 from datetime import datetime, timezone
 
 from core import config, store
+
+log = logging.getLogger("slate.encode")
 
 # ── Embedder singleton (ported from v1 engine/db.py) ──────────────────────────
 # Production embeds via the HF Inference API (HF_TOKEN set) — no torch on the
@@ -68,10 +71,21 @@ def _get_nli():
     return _nli
 
 
+STANCE_HF_URL = "https://router.huggingface.co/hf-inference/models/{model}"
+
+
 class HFStance:
     """Zero-shot MNLI over the HF Inference API (no torch). P(premise ⊨ hypothesis)
     is read with the hypothesis as the single candidate label and a pass-through
     template, then bucketed high→entail / low→contradict / mid→neutral.
+
+    Deliberately posts to the router directly instead of using the typed
+    InferenceClient.zero_shot_classification helper: huggingface_hub >=1.x
+    validates the response against a list-shaped schema, but the router returns
+    a bare object for some models (a dict with parallel labels/scores) and a
+    list for others. The mismatch raises *inside* the client, which
+    classify_stance() then swallows into a silent "neutral" — i.e. the helper
+    turns every contradiction into an echo with no error surfaced.
 
     LIMITATION (known): a single entailment score separates entail from not-entail,
     but "not entailed" spans BOTH neutral and contradiction — this collapsed read
@@ -83,17 +97,32 @@ class HFStance:
     a follow-up; the 'nli' and 'haiku' providers already read all three."""
 
     def __init__(self, token: str, model: str | None = None):
-        from huggingface_hub import InferenceClient
-        self._client = InferenceClient(api_key=token)
+        self._token = token
         self._model = model or config.STANCE_HF_MODEL
 
+    def _post(self, premise: str, hypothesis: str):
+        import requests
+        res = requests.post(
+            STANCE_HF_URL.format(model=self._model),
+            headers={"Authorization": f"Bearer {self._token}"},
+            json={"inputs": premise,
+                  "parameters": {"candidate_labels": [hypothesis],
+                                 "multi_label": True,
+                                 "hypothesis_template": "{}"}},
+            timeout=config.STANCE_HF_TIMEOUT)
+        res.raise_for_status()
+        return res.json()
+
     def _entail_prob(self, premise: str, hypothesis: str) -> float:
-        res = self._client.zero_shot_classification(
-            premise, [hypothesis], multi_label=True,
-            hypothesis_template="{}", model=self._model)
-        # hub returns either dicts or output objects with .label/.score
-        first = res[0] if isinstance(res, (list, tuple)) else res
-        return float(first["score"] if isinstance(first, dict) else first.score)
+        res = self._post(premise, hypothesis)
+        # Two live response shapes, both seen on the router:
+        #   {"sequence":…, "labels":[…], "scores":[…]}   (DeBERTa MNLI)
+        #   [{"label":…, "score":…}]                     (bart-large-mnli)
+        if isinstance(res, dict):
+            if "error" in res:
+                raise RuntimeError(f"HF stance error: {res['error']}")
+            return float(res["scores"][0] if "scores" in res else res["score"])
+        return float(res[0]["score"])
 
     def classify(self, premise: str, hypothesis: str) -> str:
         p = self._entail_prob(premise, hypothesis)
@@ -113,17 +142,26 @@ def _get_hf_stance():
 
 def classify_stance(premise: str, hypothesis: str) -> str:
     """Return 'contradiction' | 'entailment' | 'neutral' per STANCE_PROVIDER."""
+    # Every failure below degrades to "neutral" so a save is never blocked — but
+    # it MUST be logged: a silent degrade is indistinguishable from "no
+    # contradictions found", which is exactly how a torch-less prod box ran for
+    # two weeks filing every contradiction as an echo.
     if config.STANCE_PROVIDER == "nli":
         try:
             scores = _get_nli().predict([(premise, hypothesis)])[0]
             labels = ["contradiction", "entailment", "neutral"]  # nli-deberta-v3 label order
             return labels[int(scores.argmax())]
-        except Exception:
+        except Exception as e:
+            log.warning("stance 'nli' unavailable (%s: %s) — degrading to neutral; "
+                        "on a server without torch set STANCE_PROVIDER=hf",
+                        type(e).__name__, e)
             return "neutral"  # model unavailable/offline — don't block the save
     if config.STANCE_PROVIDER == "hf":
         try:
             return _get_hf_stance().classify(premise, hypothesis)
-        except Exception:
+        except Exception as e:
+            log.warning("stance 'hf' failed (%s: %s) — degrading to neutral",
+                        type(e).__name__, e)
             return "neutral"  # transient HF failure — degrade, don't block
     if config.STANCE_PROVIDER == "haiku":
         from core import llm
@@ -135,7 +173,9 @@ def classify_stance(premise: str, hypothesis: str) -> str:
                 tier="mechanical", max_tokens=2048)
             stance = result["json"].get("stance", "neutral")
             return stance if stance in ("contradiction", "entailment", "neutral") else "neutral"
-        except Exception:
+        except Exception as e:
+            log.warning("stance 'haiku' failed (%s: %s) — degrading to neutral",
+                        type(e).__name__, e)
             return "neutral"
     return "neutral"
 
