@@ -22,8 +22,22 @@ EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "all-MiniLM-L6-v2")
 EMBED_DIM        = 384
 
 # ── Encode-time receipt thresholds (cosine similarity) ────────────────────────
-ECHO_THRESHOLD    = float(os.getenv("ECHO_THRESHOLD", "0.72"))     # >= : echo / contradiction candidate
+# 0.72 → 0.60 (2026-07-30). One shared gate for the receipt AND the evidence
+# stance sweep, deliberately not split. 0.72 was the binding constraint, not
+# stance quality: a corpus-wide sweep at 0.72 admitted 37 sentence/claim pairs
+# and confirmed ZERO contradictions; at 0.60 it admitted 633 and confirmed real
+# ones (organic-yield reversal, the ₹647-vs-₹0 pricing tension, the staff-locker
+# claim), with stage-1 precision going UP (0.0 → ~0.19), not down. Matches the
+# evidence-lane Gate A finding that every pair reaching 0.72 was labelled
+# correctly and every miss was a REACH failure at cos .44–.64.
+# Cost of the move: ~17x more sentences bucket as echoes, so save receipts are
+# chattier. That was accepted as the price of the gate actually reaching.
+ECHO_THRESHOLD    = float(os.getenv("ECHO_THRESHOLD", "0.60"))     # >= : echo / contradiction candidate
 NOVELTY_THRESHOLD = float(os.getenv("NOVELTY_THRESHOLD", "0.55"))  # <  : novelty
+# NOTE: [NOVELTY_THRESHOLD, ECHO_THRESHOLD) is a reporting dead zone — a sentence
+# there is neither an echo nor a novelty and produces NO receipt line at all
+# (encode.py _build_receipt). Lowering ECHO shrank it from [0.55,0.72) to
+# [0.55,0.60); it is not yet closed.
 SENT_MIN_CHARS    = int(os.getenv("SENT_MIN_CHARS", "40"))
 RECEIPT_TOP_N     = int(os.getenv("RECEIPT_TOP_N", "5"))
 

@@ -87,6 +87,24 @@ SELECT_CANDIDATES = """
 """
 
 
+def classify_strict(premise: str, hypothesis: str) -> str:
+    """Stance that RAISES on provider failure instead of degrading to "neutral".
+
+    encode.classify_stance() deliberately swallows failures so a save is never
+    blocked. In a bulk offline run that is exactly wrong: a 503-exhausted call
+    comes back "neutral", reads as "not a contradiction", and is silently dropped
+    — while the failure counter stays at 0 because nothing raised. Two runs over
+    identical data disagreed 13 vs 48 on the shortlist for this reason. Offline,
+    a failure must be a failure.
+    """
+    if config.STANCE_PROVIDER == "hf":
+        return encode._get_hf_stance().classify(premise, hypothesis)
+    if config.STANCE_PROVIDER == "nli":
+        scores = encode._get_nli().predict([(premise, hypothesis)])[0]
+        return ["contradiction", "entailment", "neutral"][int(scores.argmax())]
+    return encode.classify_stance(premise, hypothesis)
+
+
 def _candidates(conn, limit=None):
     try:
         rows = conn.execute(SELECT_CANDIDATES).fetchall()
@@ -105,7 +123,7 @@ def classify_all(rows, sleep=0.0, verbose=True):
     results, failures = [], []
     for i, r in enumerate(rows, 1):
         try:
-            stance = encode.classify_stance(r["anchor_text"], r["text"])
+            stance = classify_strict(r["anchor_text"], r["text"])
         except Exception as e:                # noqa: BLE001 — recorded, then retried later
             failures.append({"id": r["id"], "error": f"{type(e).__name__}: {e}"})
             continue

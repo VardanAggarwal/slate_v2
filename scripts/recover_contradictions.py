@@ -67,7 +67,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from backfill_stance import adjudicate  # noqa: E402  — shared stage-2 adjudicator
+from backfill_stance import adjudicate, classify_strict  # noqa: E402  — shared stages
 from core import config, consolidate, encode, store  # noqa: E402
 
 AUDIT_DDL = """
@@ -109,8 +109,34 @@ def _users(conn):
         "SELECT DISTINCT user_id FROM claims").fetchall()]
 
 
+def _nearest_claim(conn, user_id, claim_ids, emb, cache):
+    """The ONE claim among claim_ids closest to emb.
+
+    Without this, a contradicting sentence expands to every claim in its episode:
+    12 confirmed findings became 250 claim pairs, which would write 250
+    'contradicts' edges and version-group unrelated beliefs. _relations has the
+    same flaw (it takes episode_claim_ids[0], i.e. an arbitrary one) — nearest is
+    strictly better than either.
+    """
+    import numpy as np
+    best, best_sim = None, -2.0
+    v = np.asarray(emb, dtype=float)
+    nv = np.linalg.norm(v) or 1.0
+    for cid in claim_ids:
+        if cid not in cache:
+            cache[cid] = store.claim_embedding(conn, user_id, cid)
+        ce = cache[cid]
+        if ce is None:
+            continue
+        c = np.asarray(ce, dtype=float)
+        sim = float(v @ c / (nv * (np.linalg.norm(c) or 1.0)))
+        if sim > best_sim:
+            best, best_sim = cid, sim
+    return best, (round(best_sim, 3) if best else None)
+
+
 def sweep_candidates(conn, user_id, first_seen, ep_claims, count_only=False,
-                     limit=None, verbose=True):
+                     limit=None, verbose=True, gate=None, k=3):
     """Option 2: every episode sentence vs canonical claims, gated at ECHO_THRESHOLD.
 
     Mirrors _build_receipt's comparison, with two exclusions it also needs:
@@ -123,13 +149,15 @@ def sweep_candidates(conn, user_id, first_seen, ep_claims, count_only=False,
     if limit:
         episodes = episodes[:limit]
 
+    gate = config.ECHO_THRESHOLD if gate is None else gate
     gated, cands = 0, []
+    emb_cache = {}
     for n, ep in enumerate(episodes, 1):
         own = set(ep_claims.get(ep["id"], []))
         sents = store.episode_sentences_with_vectors(conn, user_id, ep["id"])
         for s in sents:
-            for hit in store.knn_claims(conn, user_id, s["embedding"], k=3):
-                if hit["similarity"] < config.ECHO_THRESHOLD or not hit["text"]:
+            for hit in store.knn_claims(conn, user_id, s["embedding"], k=k):
+                if hit["similarity"] < gate or not hit["text"]:
                     continue
                 cid = hit["claim_id"]
                 if cid in own:
@@ -140,11 +168,18 @@ def sweep_candidates(conn, user_id, first_seen, ep_claims, count_only=False,
                 gated += 1
                 if count_only:
                     continue
+                # ONE challenger: the episode's claim nearest this sentence, not
+                # all 18-44 of them (see _nearest_claim).
+                newer, newer_sim = _nearest_claim(conn, user_id, own,
+                                                  s["embedding"], emb_cache)
+                if not newer:
+                    continue
                 cands.append({
                     "id": f"{ep['id']}:{s['idx']}",
                     "episode_id": ep["id"], "ts": ep["ts"], "title": ep["title"],
                     "older_claim_id": cid,
-                    "newer_claim_ids": sorted(own),
+                    "newer_claim_ids": [newer],
+                    "newer_claim_sim": newer_sim,
                     # adjudicate() reads these two keys
                     "anchor_text": hit["text"], "text": s["text"],
                     "similarity": round(hit["similarity"], 3),
@@ -157,26 +192,67 @@ def sweep_candidates(conn, user_id, first_seen, ep_claims, count_only=False,
     return gated, cands
 
 
+def gate_curve(conn, user_id, first_seen, ep_claims, gates, k=3, limit=None):
+    """How many pairs each ECHO_THRESHOLD would admit. Pure vector search — no
+    model calls — so the reach/cost tradeoff can be priced before spending any.
+
+    Reported alongside the retrieval-side meaning of the same knob: ECHO_THRESHOLD
+    also decides what the live receipt calls an echo, so moving it is not a
+    sweep-only change.
+    """
+    lowest = min(gates)
+    episodes = conn.execute(
+        "SELECT id, ts FROM episodes WHERE user_id = ? ORDER BY ts", (user_id,)).fetchall()
+    if limit:
+        episodes = episodes[:limit]
+    sims = []
+    for ep in episodes:
+        own = set(ep_claims.get(ep["id"], []))
+        for s in store.episode_sentences_with_vectors(conn, user_id, ep["id"]):
+            for hit in store.knn_claims(conn, user_id, s["embedding"], k=k):
+                if not hit["text"] or hit["claim_id"] in own:
+                    continue
+                older = first_seen.get(hit["claim_id"])
+                if not older or older >= ep["ts"]:
+                    continue
+                if hit["similarity"] >= lowest:
+                    sims.append(hit["similarity"])
+    return {f"{g:.2f}": sum(1 for x in sims if x >= g) for g in sorted(gates, reverse=True)}
+
+
 def fragment_candidates(conn, user_id, report_path, first_seen, ep_claims):
     """Option 1: a backfill_stance report's confirmed rows -> claim pairs."""
     report = json.loads(Path(report_path).read_text())
-    out = []
+    out, cache = [], {}
     for r in report.get("confirmed_rows", []):
         if r.get("user_id") != user_id:
             continue
-        newer = sorted(ep_claims.get(r["episode_id"], []))
+        newer_pool = sorted(ep_claims.get(r["episode_id"], []))
         older_pool = [c for c in ep_claims.get(r["anchor_episode_id"], [])
-                      if c not in set(newer)]
-        if not newer or not older_pool:
+                      if c not in set(newer_pool)]
+        if not newer_pool or not older_pool:
             continue
         # orient by the anchor episode actually being older
         if not (r.get("anchor_ts") and r["anchor_ts"] < r["ts"]):
             continue
-        for older in older_pool:
+        # Fragments carry no stored vector (store.py: "deliberately NO
+        # vec_fragments"), so embed the two texts once to pick ONE claim a side.
+        # Without this the pool crossed both episodes' claims — a double fan-out.
+        try:
+            embs = encode.get_embedder().encode(
+                [r["text"], r["anchor_text"]], normalize_embeddings=True,
+                show_progress_bar=False)
+        except Exception as e:                     # noqa: BLE001
+            print(f"  embed failed for {r['id']}: {type(e).__name__}", file=sys.stderr)
+            continue
+        newer, n_sim = _nearest_claim(conn, user_id, newer_pool, embs[0], cache)
+        older, o_sim = _nearest_claim(conn, user_id, older_pool, embs[1], cache)
+        if newer and older and newer != older:
             out.append({
                 "id": r["id"], "episode_id": r["episode_id"], "ts": r["ts"],
                 "title": r["title"], "older_claim_id": older,
-                "newer_claim_ids": newer,
+                "newer_claim_ids": [newer],
+                "newer_claim_sim": n_sim, "older_claim_sim": o_sim,
                 "anchor_text": r["anchor_text"], "text": r["text"],
                 "similarity": None, "anchor_ts": r["anchor_ts"],
                 "intra_note": r.get("intra_note", False),
@@ -193,7 +269,10 @@ def stage1_filter(cands, verbose=True):
     keep, failures = [], []
     for i, c in enumerate(cands, 1):
         try:
-            if encode.classify_stance(c["anchor_text"], c["text"]) == "contradiction":
+            # classify_strict, NOT classify_stance: the latter swallows provider
+            # failures into "neutral", which silently suppresses findings while
+            # reporting zero failures (see backfill_stance.classify_strict).
+            if classify_strict(c["anchor_text"], c["text"]) == "contradiction":
                 keep.append(c)
         except Exception as e:                     # noqa: BLE001 — never silent
             failures.append({"id": c["id"], "error": f"{type(e).__name__}: {e}"})
@@ -286,6 +365,12 @@ def main():
     ap.add_argument("--from-fragments", metavar="REPORT")
     ap.add_argument("--count-only", action="store_true",
                     help="how many pairs clear the gate, with zero model calls")
+    ap.add_argument("--gate", type=float,
+                    help=f"override ECHO_THRESHOLD for the sweep only "
+                         f"(default {config.ECHO_THRESHOLD})")
+    ap.add_argument("--gate-curve", metavar="G", type=float, nargs="+",
+                    help="pairs admitted at each threshold; no model calls")
+    ap.add_argument("--k", type=int, default=3, help="claims per sentence (knn)")
     ap.add_argument("--apply", action="store_true")
     ap.add_argument("--limit", type=int, help="first N episodes (sweep only)")
     ap.add_argument("--report", default="contradiction_recovery_report.json")
@@ -297,6 +382,19 @@ def main():
 
     if args.revert:
         return revert(conn, args.revert)
+
+    if args.gate_curve:
+        for user_id in _users(conn):
+            curve = gate_curve(conn, user_id, _claim_first_seen(conn, user_id),
+                               _episode_claims(conn, user_id), args.gate_curve,
+                               k=args.k, limit=args.limit)
+            print(f"\n[{user_id}]  (k={args.k})")
+            for g, n in curve.items():
+                print(f"   >= {g}   {n:6d} pairs")
+        print(f"\nlive ECHO_THRESHOLD = {config.ECHO_THRESHOLD} "
+              f"(NOVELTY_THRESHOLD = {config.NOVELTY_THRESHOLD})")
+        return
+
     if not (args.from_sweep or args.from_fragments):
         sys.exit("pick a source: --from-sweep and/or --from-fragments REPORT")
 
@@ -317,8 +415,10 @@ def main():
         cands = []
         if args.from_sweep:
             gated, sc = sweep_candidates(conn, user_id, first_seen, ep_claims,
-                                         count_only=args.count_only, limit=args.limit)
+                                         count_only=args.count_only, limit=args.limit,
+                                         gate=args.gate, k=args.k)
             u["gated"] = gated
+            u["gate"] = args.gate if args.gate is not None else config.ECHO_THRESHOLD
             print(f"[{user_id}] sweep gated {gated} sentence/claim pairs",
                   file=sys.stderr)
             if args.count_only:
