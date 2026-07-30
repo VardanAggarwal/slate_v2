@@ -156,8 +156,13 @@ def _get_hf_stance():
     return _hf_stance
 
 
-def stance_health() -> dict:
+def stance_health(probe: bool = True) -> dict:
     """Is the configured STANCE_PROVIDER actually runnable here? (P0)
+
+    probe=True issues ONE real classification. Called once at startup and cached
+    (server.py), so the cost is per-boot, not per-request. Set probe=False only
+    where a network call is unacceptable — an unprobed 'ok' means "configured",
+    not "working".
 
     `nli` needs torch, which the 1GB prod image does not ship. When the import
     fails classify_stance() degrades to "neutral" for EVERY pair — _build_receipt
@@ -181,11 +186,45 @@ def stance_health() -> dict:
             return {"provider": p, "ok": False,
                     "detail": "STANCE_PROVIDER=hf but HF_TOKEN is empty — every stance "
                               "call will degrade to 'neutral'."}
-        return {"provider": p, "ok": True, "detail": "HF Inference API MNLI"}
+        if not probe:
+            return {"provider": p, "ok": True, "detail": "HF Inference API MNLI (unprobed)"}
+        return _probe(p, "HF Inference API MNLI")
+    if p == "openrouter":
+        if not config.OPENROUTER_KEY:
+            return {"provider": p, "ok": False,
+                    "detail": "STANCE_PROVIDER=openrouter but OPENROUTER_API_KEY is "
+                              "empty — every stance call will degrade to 'neutral'."}
+        if not probe:
+            return {"provider": p, "ok": True, "detail": "OpenRouter (unprobed)"}
+        return _probe(p, f"OpenRouter {config.OPENROUTER_MODEL_MECHANICAL}")
     if p == "haiku":
         return {"provider": p, "ok": True,
                 "detail": "billed per pair — never use with the evidence sweep"}
     return {"provider": p, "ok": True, "detail": "stance disabled"}
+
+
+def _probe(provider: str, detail: str) -> dict:
+    """One real call, because a reachable-looking config is not a working provider.
+
+    Checking only that HF_TOKEN is non-empty reported ok=True while every call
+    returned 402 Payment Required (exhausted credits) and classify_stance degraded
+    every pair to "neutral" — the original silent failure, reached by a different
+    route and shown as green on /health. A credential that exists but cannot buy a
+    call has to read as broken.
+    """
+    try:
+        verdict = classify_stance("I love working in the office.",
+                                  "I hate working in the office.")
+    except Exception as e:  # noqa: BLE001 — classify_stance shouldn't raise, but never trust that
+        return {"provider": provider, "ok": False,
+                "detail": f"{detail} — probe raised {type(e).__name__}: {e}"}
+    if verdict != "contradiction":
+        return {"provider": provider, "ok": False,
+                "detail": f"{detail} — probe returned {verdict!r} for a blatant "
+                          f"contradiction, so the provider is unreachable or out of "
+                          f"quota and every stance call is silently 'neutral'. "
+                          f"Check the server log for the degrade warning."}
+    return {"provider": provider, "ok": True, "detail": detail}
 
 
 def check_stance_provider() -> dict:
@@ -221,8 +260,17 @@ def classify_stance(premise: str, hypothesis: str) -> str:
             log.warning("stance 'hf' failed (%s: %s) — degrading to neutral",
                         type(e).__name__, e)
             return "neutral"  # transient HF failure — degrade, don't block
-    if config.STANCE_PROVIDER == "haiku":
+    if config.STANCE_PROVIDER in ("haiku", "openrouter"):
+        # 'openrouter' is 'haiku' with the fallback chain PINNED. The chain's whole
+        # point elsewhere is to survive a provider outage, but for stance at sweep
+        # volume it is a billing trap: OpenRouter's free tier fails, the next rung
+        # is the paid Anthropic API, and a few thousand pairs quietly bill. Pinned,
+        # a provider failure is a failure — which is the safe direction here.
         from core import llm
+        pinned = config.STANCE_PROVIDER == "openrouter"
+        saved = config.LLM_FALLBACK_ORDER
+        if pinned:
+            config.LLM_FALLBACK_ORDER = ["openrouter"]
         try:
             result = llm.call(
                 f'Premise: "{premise}"\nHypothesis: "{hypothesis}"\n'
@@ -232,9 +280,12 @@ def classify_stance(premise: str, hypothesis: str) -> str:
             stance = result["json"].get("stance", "neutral")
             return stance if stance in ("contradiction", "entailment", "neutral") else "neutral"
         except Exception as e:
-            log.warning("stance 'haiku' failed (%s: %s) — degrading to neutral",
-                        type(e).__name__, e)
+            log.warning("stance %r failed (%s: %s) — degrading to neutral",
+                        config.STANCE_PROVIDER, type(e).__name__, e)
             return "neutral"
+        finally:
+            if pinned:
+                config.LLM_FALLBACK_ORDER = saved
     return "neutral"
 
 
@@ -293,6 +344,11 @@ def _build_receipt(conn, user_id: str, sentences: list[str], embeddings,
     evidence receipt narrates and the sweep persists."""
     is_evidence = source == store.EVIDENCE_SOURCE
     echoes, contradictions, novelties, prior_matches = [], [], [], []
+    # [NOVELTY_THRESHOLD, ECHO_THRESHOLD) used to hit NEITHER branch below, so a
+    # sentence there produced no receipt line at all — an on-topic-but-unconfident
+    # match was invisible rather than hedged, which is why evidence saves read as
+    # "backs nothing you've written yet" when they did touch something.
+    weak = []
 
     for i, sent in enumerate(sentences):
         emb = embeddings[i]
@@ -314,6 +370,10 @@ def _build_receipt(conn, user_id: str, sentences: list[str], embeddings,
                 echoes.append(entry)
         elif not best or best["similarity"] < config.NOVELTY_THRESHOLD:
             novelties.append(sent)
+        else:  # NOVELTY <= sim < ECHO — too close to call novel, too far to assert
+            weak.append({"sentence": sent, "claim_id": best["claim_id"],
+                         "claim_text": best["text"],
+                         "similarity": round(best["similarity"], 3)})
 
         sent_hits = store.knn_sentences(conn, user_id, emb, k=2)
         for hit in sent_hits:
@@ -344,6 +404,10 @@ def _build_receipt(conn, user_id: str, sentences: list[str], embeddings,
         "contradictions": sorted(contradictions, key=lambda e: -e["similarity"]),
         "novelties": novelties,
         "n_novelties": len(novelties),
+        # Sub-threshold near-misses. NOT consolidation input — no 'contradicts'
+        # edge is ever minted from these (that needs a stance call, which the gate
+        # skipped). Display only, so the receipt can hedge instead of going silent.
+        "weak_matches": sorted(weak, key=lambda e: -e["similarity"]),
         "prior_episode_matches": prior_matches,
     }
 

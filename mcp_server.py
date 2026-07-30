@@ -276,6 +276,14 @@ def receipt_markdown(receipt: dict) -> str:
                      f"(sim {e['similarity']}) — your new line: “{e['sentence']}”")
     for e in receipt.get("echoes", [])[:top]:
         lines.append(f"🔁 **Echoes** stored claim: “{e['claim_text']}” (sim {e['similarity']})")
+    # [NOVELTY_THRESHOLD, ECHO_THRESHOLD): below the gate, so no stance was
+    # computed and neither echo nor contradiction may be claimed. Previously this
+    # band produced NO line at all — a note that did touch stored thinking read as
+    # touching none. Hedge instead of going silent.
+    for e in receipt.get("weak_matches", [])[:top]:
+        lines.append(f"**Relates to** stored claim “{e['claim_text']}” "
+                     f"(sim {e['similarity']}) — unverified: below the gate, so "
+                     f"not checked for agreement.")
     for m in receipt.get("prior_episode_matches", [])[:top]:
         lines.append(_prior_match_line(m))
     n_nov = receipt.get("n_novelties", 0)
@@ -311,6 +319,14 @@ def _evidence_receipt_markdown(receipt: dict) -> str:
         lines.append(f"**Relates to** your claim “{e['claim_text']}” "
                      f"(sim {e['similarity']}) — unverified: the source is on the "
                      f"topic but does not entail it.")
+    # Same band as the note path, but this is the case that actually bit: an
+    # evidence save whose every sentence landed in [NOVELTY, ECHO) reported only
+    # 🗄️ "backs nothing you've written yet", which was false — it backed something
+    # the gate declined to check.
+    for e in receipt.get("weak_matches", [])[:top]:
+        lines.append(f"**Relates to** your claim “{e['claim_text']}” "
+                     f"(sim {e['similarity']}) — unverified: too far below the "
+                     f"gate to check whether the source backs or refutes it.")
     for m in receipt.get("prior_episode_matches", [])[:top]:
         lines.append(_prior_match_line(m))
     n_nov = receipt.get("n_novelties", 0)

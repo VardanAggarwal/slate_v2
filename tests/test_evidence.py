@@ -516,3 +516,58 @@ def test_stance_health_flags_hf_without_a_token(monkeypatch):
     monkeypatch.setattr(config, "STANCE_PROVIDER", "hf")
     monkeypatch.setattr(config, "HF_TOKEN", "")
     assert stance_health()["ok"] is False
+
+
+def test_stance_health_probe_catches_a_present_but_dead_credential(monkeypatch):
+    """A token that exists but cannot buy a call must read as BROKEN.
+
+    Checking HF_TOKEN non-empty reported ok=True on prod while every call returned
+    402 Payment Required and classify_stance degraded every pair to "neutral" —
+    the original silent failure showing green on /health.
+    """
+    from core import encode as enc
+
+    monkeypatch.setattr(config, "STANCE_PROVIDER", "hf")
+    monkeypatch.setattr(config, "HF_TOKEN", "looks-fine-but-broke")
+    monkeypatch.setattr(enc, "classify_stance", lambda p, h: "neutral")  # degraded
+    h = enc.stance_health()
+    assert h["ok"] is False
+    assert "quota" in h["detail"] and "neutral" in h["detail"]
+
+    # and it passes when the provider genuinely works
+    monkeypatch.setattr(enc, "classify_stance", lambda p, h: "contradiction")
+    assert enc.stance_health()["ok"] is True
+    # probe=False must NOT be mistaken for a working provider
+    monkeypatch.setattr(enc, "classify_stance", lambda p, h: "neutral")
+    assert "unprobed" in enc.stance_health(probe=False)["detail"]
+
+
+def test_openrouter_stance_pins_the_fallback_chain(monkeypatch):
+    """The free rung failing must NOT escalate to the paid API — that escalation at
+    sweep volume is the documented way this account got drained."""
+    from core import encode as enc, llm
+
+    seen = {}
+    monkeypatch.setattr(config, "STANCE_PROVIDER", "openrouter")
+    monkeypatch.setattr(config, "LLM_FALLBACK_ORDER", ["openrouter", "claude", "gemini"])
+
+    def fake_call(prompt, tier=None, max_tokens=None, system=None):
+        seen["order"] = list(config.LLM_FALLBACK_ORDER)
+        return {"json": {"stance": "contradiction"}, "cost": 0.0}
+
+    monkeypatch.setattr(llm, "call", fake_call)
+    assert enc.classify_stance("a", "b") == "contradiction"
+    assert seen["order"] == ["openrouter"]                       # pinned during the call
+    assert config.LLM_FALLBACK_ORDER == ["openrouter", "claude", "gemini"]  # and restored
+
+
+def test_sweep_guard_allows_pinned_openrouter_but_not_haiku(monkeypatch):
+    from core.evidence import _stance_budget_guard
+
+    monkeypatch.setattr(config, "STANCE_PROVIDER", "haiku")
+    with pytest.raises(RuntimeError, match="bills per pair"):
+        _stance_budget_guard()
+
+    for p in ("openrouter", "hf", "nli"):
+        monkeypatch.setattr(config, "STANCE_PROVIDER", p)
+        _stance_budget_guard()                                   # must not raise

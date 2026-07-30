@@ -173,6 +173,56 @@ def test_empty_evidence_receipt_has_its_own_wording():
     assert md == "Filed. Nothing in your corpus touches this yet."
 
 
+def test_weak_match_is_reported_not_swallowed_note_path():
+    """[NOVELTY_THRESHOLD, ECHO_THRESHOLD) used to hit neither receipt branch, so a
+    near-miss produced NO line at all and a note that did touch stored thinking
+    read as touching nothing. It must hedge, and must not claim agreement."""
+    import mcp_server
+    receipt = {"source": "mcp", "n_novelties": 0, "echoes": [], "contradictions": [],
+               "weak_matches": [{"claim_text": "RAG degrades at scale",
+                                 "sentence": "…", "similarity": 0.57}],
+               "prior_episode_matches": []}
+    md = mcp_server.receipt_markdown(receipt)
+    assert "**Relates to**" in md and "unverified" in md
+    assert "0.57" in md
+    assert "🔁" not in md and "⚡" not in md          # no stance was computed
+    assert md != "Saved. No overlaps with stored thinking detected."
+
+
+def test_weak_match_is_reported_not_swallowed_evidence_path():
+    """The case that actually bit: every sentence of an evidence save landed in the
+    band, so the receipt said only 'backs nothing you've written yet' — false."""
+    import mcp_server
+    receipt = {"source": "research", "n_novelties": 0, "echoes": [],
+               "contradictions": [],
+               "weak_matches": [{"claim_text": "spacing works", "sentence": "…",
+                                 "similarity": 0.58}],
+               "prior_episode_matches": []}
+    md = mcp_server.receipt_markdown(receipt)
+    assert "**Relates to**" in md and "unverified" in md
+    assert "📎" not in md                              # backing was never verified
+    assert "backs nothing you've written yet" not in md
+    assert md != "Filed. Nothing in your corpus touches this yet."
+
+
+def test_build_receipt_buckets_the_dead_zone(monkeypatch):
+    """Bucketing itself: sim in the band goes to weak_matches, NOT novelties —
+    calling it novel would assert 'nothing like this is stored', which is false."""
+    from core import encode as enc
+
+    monkeypatch.setattr(config, "ECHO_THRESHOLD", 0.60)
+    monkeypatch.setattr(config, "NOVELTY_THRESHOLD", 0.55)
+    monkeypatch.setattr(enc.store, "knn_claims", lambda *a, **k: [
+        {"claim_id": "c1", "text": "a stored claim", "similarity": 0.57}])
+    monkeypatch.setattr(enc.store, "knn_sentences", lambda *a, **k: [])
+
+    r = enc._build_receipt(None, "u1", ["a sentence long enough to survive."],
+                           [[0.0] * 384])
+    assert r["weak_matches"] and r["weak_matches"][0]["similarity"] == 0.57
+    assert r["novelties"] == [] and r["n_novelties"] == 0
+    assert r["echoes"] == [] and r["contradictions"] == []
+
+
 def test_a_note_receipt_attributes_a_research_match_to_the_source():
     """E7 is NOT confined to the evidence receipt: knn_sentences spans all episodes,
     so a NOTE receipt must not render a paper as 'your note'."""

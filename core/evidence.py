@@ -39,12 +39,20 @@ CLAIM_CHANGING_EVENTS = ("CANONICALIZED", "VERSIONED", "PRUNED", "EPISODE_SUPERS
 
 def _stance_budget_guard() -> None:
     """A per-pair-billed provider at sweep volume is the trap that drained credits
-    twice before (see the prod-LLM incident notes). Refuse rather than bill."""
+    twice before (see the prod-LLM incident notes). Refuse rather than bill.
+
+    'openrouter' is permitted where 'haiku' is not, even though both issue one LLM
+    call per pair: the openrouter provider PINS LLM_FALLBACK_ORDER to the free rung,
+    so a provider failure fails instead of escalating to the paid Anthropic API.
+    'haiku' keeps the full chain, which is exactly the escalation this guard exists
+    to stop.
+    """
     if config.STANCE_PROVIDER == "haiku":
         raise RuntimeError(
             "STANCE_PROVIDER=haiku bills per pair — the evidence sweep would issue one "
-            "LLM call per (evidence sentence, claim) candidate. Set STANCE_PROVIDER=nli "
-            "(local) or hf (Inference API) before sweeping.")
+            "LLM call per (evidence sentence, claim) candidate, and its fallback chain "
+            "escalates to the paid API when the free rung fails. Set STANCE_PROVIDER=nli "
+            "(local), hf (Inference API), or openrouter (free rung, pinned) before sweeping.")
 
 
 def _changed_claim_ids(conn, user_id: str, seq: int) -> list[str]:
