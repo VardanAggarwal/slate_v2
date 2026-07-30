@@ -101,17 +101,33 @@ class HFStance:
         self._model = model or config.STANCE_HF_MODEL
 
     def _post(self, premise: str, hypothesis: str):
+        # The router 503s on cold-start//throttle. Without a retry those become
+        # degrade-to-neutral, i.e. silently dropped contradictions — the same
+        # failure this class exists to fix, just intermittent instead of total.
+        import time
+
         import requests
-        res = requests.post(
-            STANCE_HF_URL.format(model=self._model),
-            headers={"Authorization": f"Bearer {self._token}"},
-            json={"inputs": premise,
-                  "parameters": {"candidate_labels": [hypothesis],
-                                 "multi_label": True,
-                                 "hypothesis_template": "{}"}},
-            timeout=config.STANCE_HF_TIMEOUT)
-        res.raise_for_status()
-        return res.json()
+        last = None
+        for attempt in range(config.STANCE_HF_RETRIES):
+            try:
+                res = requests.post(
+                    STANCE_HF_URL.format(model=self._model),
+                    headers={"Authorization": f"Bearer {self._token}"},
+                    json={"inputs": premise,
+                          "parameters": {"candidate_labels": [hypothesis],
+                                         "multi_label": True,
+                                         "hypothesis_template": "{}"}},
+                    timeout=config.STANCE_HF_TIMEOUT)
+                res.raise_for_status()
+                return res.json()
+            except Exception as e:  # noqa: BLE001 — re-raised below if all attempts fail
+                last = e
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                if status is not None and 400 <= status < 500 and status != 429:
+                    raise  # permanent (bad model/task/auth) — retrying just wastes time
+                if attempt < config.STANCE_HF_RETRIES - 1:
+                    time.sleep(config.STANCE_HF_BACKOFF * (2 ** attempt))
+        raise last
 
     def _entail_prob(self, premise: str, hypothesis: str) -> float:
         res = self._post(premise, hypothesis)

@@ -492,6 +492,66 @@ def test_hf_stance_posts_passthrough_template(monkeypatch):
     assert "some/model" in sent["url"]
 
 
+def test_hf_stance_retries_transient_then_succeeds(monkeypatch):
+    """A router 503 must be retried, not degraded to neutral — an intermittent
+    silent-neutral drops contradictions just as surely as a total outage."""
+    from core import encode
+
+    calls = []
+
+    class Resp:
+        def __init__(self, status):
+            self.status_code = status
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                err = Exception(f"{self.status_code} Server Error")
+                err.response = self
+                raise err
+
+        def json(self):
+            return {"scores": [0.02]}
+
+    def fake_post(url, **kw):
+        calls.append(1)
+        return Resp(503 if len(calls) < 3 else 200)
+
+    monkeypatch.setattr("requests.post", fake_post)
+    monkeypatch.setattr(config, "STANCE_HF_BACKOFF", 0.0)   # no real sleeping
+    monkeypatch.setattr(config, "STANCE_HF_RETRIES", 3)
+    s = encode.HFStance.__new__(encode.HFStance)
+    s._token, s._model = "t", "m"
+    assert s.classify("a", "b") == "contradiction"
+    assert len(calls) == 3                                   # two 503s, then success
+
+
+def test_hf_stance_does_not_retry_permanent_4xx(monkeypatch):
+    """A 400 ('model not supported by provider') is permanent — fail fast."""
+    from core import encode
+
+    calls = []
+
+    class Resp:
+        status_code = 400
+
+        def raise_for_status(self):
+            err = Exception("400 Bad Request")
+            err.response = self
+            raise err
+
+    def fake_post(url, **kw):
+        calls.append(1)
+        return Resp()
+
+    monkeypatch.setattr("requests.post", fake_post)
+    monkeypatch.setattr(config, "STANCE_HF_BACKOFF", 0.0)
+    s = encode.HFStance.__new__(encode.HFStance)
+    s._token, s._model = "t", "m"
+    with pytest.raises(Exception):
+        s.classify("a", "b")
+    assert len(calls) == 1                                   # no retries burned
+
+
 def test_classify_stance_hf_provider_signs_contradiction(monkeypatch):
     """The prod path: STANCE_PROVIDER='hf' detects a contradiction with no torch,
     and resolve_direction signs it −1 (held strongest)."""
