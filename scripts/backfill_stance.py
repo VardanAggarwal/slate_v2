@@ -102,7 +102,30 @@ def classify_strict(premise: str, hypothesis: str) -> str:
     if config.STANCE_PROVIDER == "nli":
         scores = encode._get_nli().predict([(premise, hypothesis)])[0]
         return ["contradiction", "entailment", "neutral"][int(scores.argmax())]
+    if config.STANCE_PROVIDER in ("openrouter", "haiku"):
+        from core import llm
+        saved = config.LLM_FALLBACK_ORDER
+        if config.STANCE_PROVIDER == "openrouter":
+            config.LLM_FALLBACK_ORDER = ["openrouter"]   # never escalate to a paid rung
+        try:
+            res = llm.call(
+                f'Premise: "{premise}"\nHypothesis: "{hypothesis}"\n'
+                'Does the hypothesis contradict, entail, or stay neutral to the premise? '
+                'Return ONLY JSON: {"stance": "contradiction"|"entailment"|"neutral"}',
+                tier="mechanical", max_tokens=2048)
+        finally:
+            config.LLM_FALLBACK_ORDER = saved
+        s = (res["json"] or {}).get("stance", "")
+        if s not in ("contradiction", "entailment", "neutral"):
+            raise RuntimeError(f"unusable stance {s!r} from {config.STANCE_PROVIDER}")
+        return s
     return encode.classify_stance(premise, hypothesis)
+
+
+# Providers whose stance call IS an LLM call. For these, a cheap-recall stage 1
+# followed by an LLM stage 2 pays the 20 req/min cap TWICE for no added signal —
+# stage 1 only existed because hf zero-shot was nearly free. Adjudicate directly.
+LLM_STANCE_PROVIDERS = ("openrouter", "haiku")
 
 
 def _candidates(conn, limit=None):

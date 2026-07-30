@@ -67,7 +67,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from backfill_stance import adjudicate, classify_strict  # noqa: E402  — shared stages
+from backfill_stance import (  # noqa: E402  — shared stages
+    LLM_STANCE_PROVIDERS, adjudicate, classify_strict)
 from core import config, consolidate, encode, store  # noqa: E402
 
 AUDIT_DDL = """
@@ -424,9 +425,21 @@ def main():
             if args.count_only:
                 report["users"][user_id] = u
                 continue
-            shortlist, f1 = stage1_filter(sc)
-            u["stage1"], u["stage1_failed"] = len(shortlist), len(f1)
-            cands += shortlist
+            if config.STANCE_PROVIDER in LLM_STANCE_PROVIDERS:
+                # Stage 1 is a CHEAP recall filter; with an LLM provider it is not
+                # cheap, and it charges the same 20 req/min budget stage 2 needs.
+                # Adjudicate every gated pair once, with the stricter rubric.
+                print(f"[{user_id}] provider {config.STANCE_PROVIDER!r} is LLM-backed "
+                      f"— skipping stage 1, adjudicating all {len(sc)} gated pairs",
+                      file=sys.stderr)
+                u["stage1"] = None
+                u["stage1_skipped_reason"] = f"{config.STANCE_PROVIDER} is LLM-backed"
+                cands += sc
+            else:
+                shortlist, f1 = stage1_filter(sc)
+                u["stage1"], u["stage1_failed"] = len(shortlist), len(f1)
+                u["stage1_failure_rows"] = f1          # detail, not just a count
+                cands += shortlist
 
         pre_confirmed = []
         if args.from_fragments:
@@ -442,8 +455,8 @@ def main():
             ok, rejected, f2 = adjudicate(cands)
             confirmed += ok
             u.update(stage2_confirmed=len(ok), stage2_rejected=len(rejected),
-                     stage2_failed=len(f2),
-                     stage1_precision=(round(len(ok) / len(cands), 3) if cands else None))
+                     stage2_failed=len(f2), stage2_failure_rows=f2,
+                     precision_of_input=(round(len(ok) / len(cands), 3) if cands else None))
             # Keep the rejections: when the run confirms nothing, these ARE the
             # result, and a reader has to be able to check the adjudicator was
             # right rather than take a zero on faith.
