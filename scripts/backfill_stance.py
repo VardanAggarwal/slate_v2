@@ -74,10 +74,12 @@ CREATE TABLE IF NOT EXISTS stance_backfill (
 # and never called resolve_direction, so they are correctly NULL — excluded.
 SELECT_CANDIDATES = """
     SELECT f.id, f.text, f.direction, f.strength, f.user_id, f.episode_id,
-           a.text AS anchor_text, e.ts, e.title
+           a.text AS anchor_text, a.episode_id AS anchor_episode_id,
+           e.ts, e.title, ae.ts AS anchor_ts
       FROM fragments f
-      JOIN fragments a ON a.id = f.anchor_id
-      JOIN episodes  e ON e.id = f.episode_id
+      JOIN fragments a  ON a.id  = f.anchor_id
+      JOIN episodes  e  ON e.id  = f.episode_id
+      JOIN episodes  ae ON ae.id = a.episode_id
      WHERE f.anchor_id IS NOT NULL
        AND f.direction = 'refine'
        AND f.id NOT IN (SELECT fragment_id FROM stance_backfill)
@@ -120,6 +122,11 @@ def classify_all(rows, sleep=0.0, verbose=True):
             "old_direction": r["direction"], "old_strength": r["strength"],
             "new_direction": direction, "new_strength": strength,
             "anchor_text": r["anchor_text"], "text": r["text"],
+            "anchor_episode_id": r["anchor_episode_id"], "anchor_ts": r["anchor_ts"],
+            # An anchor inside the SAME note is usually rhetorical structure (an
+            # essay arguing both sides), not a change of mind. Recorded, not
+            # filtered — stage 2 still adjudicates it — so the split is visible.
+            "intra_note": r["episode_id"] == r["anchor_episode_id"],
         })
         if verbose and i % 50 == 0:
             print(f"  {i}/{len(rows)} classified", file=sys.stderr, flush=True)
@@ -261,6 +268,9 @@ def main():
         "stage2_failed": len(llm_failures),
         "stage1_precision": (round(len(confirmed) / len(shortlist), 3)
                              if args.adjudicate and shortlist else None),
+        "confirmed_intra_note": sum(1 for r in confirmed if r["intra_note"]),
+        "confirmed_cross_note": sum(1 for r in confirmed if not r["intra_note"]),
+        "candidate_intra_note": sum(1 for r in results if r["intra_note"]),
         "to_write": len(changed),
         "confirmed_rows": confirmed,
         "rejected_rows": rejected,
@@ -290,8 +300,9 @@ def main():
         json.dump(report, fh, indent=2, ensure_ascii=False)
     print(json.dumps({k: v for k, v in report.items()
                       if k not in ("confirmed_rows", "rejected_rows", "failures")}, indent=2))
-    for r in confirmed[:15]:
-        print(f"\n  [{r['ts'][:10]}] {(r['title'] or '')[:60]}"
+    for r in confirmed[:25]:
+        tag = "intra-note" if r["intra_note"] else f"anchor {r['anchor_ts'][:10]}"
+        print(f"\n  [{r['ts'][:10]}] {(r['title'] or '')[:60]}  ({tag})"
               f"\n  ANCHOR: {r['anchor_text'][:90]}"
               f"\n  FRAG  : {r['text'][:90]}"
               f"\n  WHY   : {r['llm_why']}")
