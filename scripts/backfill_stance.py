@@ -24,9 +24,24 @@ WHAT IT DOES NOT TOUCH
   insert-only `stance_backfill` audit table before any UPDATE, so every write
   is reversible from data this script itself records.
 
+TWO STAGES, AND WHY
+-------------------
+Stage 1 (hf zero-shot) is a RECALL filter ONLY. Its single entailment score
+cannot separate neutral from contradiction — measured on real fragment pairs it
+fired on elaborations, proposed fixes, topic shifts and raw metadata blobs. It
+exists here just to cheaply shortlist the "not entailed" rows.
+
+Stage 2 (OpenRouter free-tier Nemotron) does a genuine 3-class read over that
+shortlist, and only rows BOTH stages call a contradiction get written. The
+fragment path needs this because — unlike the receipt path, which is gated at
+similarity >= ECHO_THRESHOLD — `write.py` resolves direction against the merely
+NEAREST memory row with no similarity gate, so a low entailment score there
+often means "unrelated", not "opposed".
+
 USAGE
-    python scripts/backfill_stance.py                  # dry run, writes a report
-    python scripts/backfill_stance.py --apply          # audit + update
+    python scripts/backfill_stance.py                  # stage 1 only, dry run
+    python scripts/backfill_stance.py --adjudicate     # both stages, dry run
+    python scripts/backfill_stance.py --adjudicate --apply
     python scripts/backfill_stance.py --revert <run>   # undo a run from the audit table
 """
 import argparse
@@ -35,8 +50,11 @@ import sqlite3
 import sys
 import time
 from collections import Counter
+from pathlib import Path
 
-from core import config, encode, store
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # run from anywhere
+
+from core import config, encode, store  # noqa: E402
 
 AUDIT_DDL = """
 CREATE TABLE IF NOT EXISTS stance_backfill (
@@ -110,14 +128,79 @@ def classify_all(rows, sleep=0.0, verbose=True):
     return results, failures
 
 
+ADJUDICATE_PROMPT = """You are labelling the logical relation between two excerpts \
+from one person's personal notes, written at different times.
+
+EARLIER NOTE (premise):
+{anchor}
+
+LATER NOTE (hypothesis):
+{fragment}
+
+Label the LATER note's relation to the EARLIER one:
+- "contradiction" — the later note asserts something that cannot both be true \
+alongside the earlier one. A genuine reversal of position, a refuted claim, an \
+incompatible fact. NOT merely a different topic.
+- "entailment" — the later note restates or follows from the earlier one.
+- "neutral" — anything else: a different subject, an elaboration or added detail, \
+a proposed solution to a problem the earlier note raised, a narrower or broader \
+case, or unrelated metadata/boilerplate.
+
+Be strict. Most pairs are "neutral". Only call it a contradiction if you could \
+point to the specific pair of incompatible assertions.
+
+Return ONLY JSON: {{"stance": "contradiction"|"entailment"|"neutral", "why": "<12 words max>"}}"""
+
+
+def adjudicate(rows, verbose=True):
+    """Stage 2: real 3-class read over stage-1's shortlist, via OpenRouter only.
+
+    LLM_FALLBACK_ORDER is pinned to openrouter for the duration: the default
+    order falls through to `claude`, and a bulk run silently billing the
+    Anthropic API is a documented way to drain the account. If OpenRouter is
+    down the row is recorded as a failure and retried on a later run instead.
+    """
+    from core import llm
+
+    saved_order = config.LLM_FALLBACK_ORDER
+    config.LLM_FALLBACK_ORDER = ["openrouter"]
+    kept, rejected, failures = [], [], []
+    try:
+        for i, r in enumerate(rows, 1):
+            try:
+                res = llm.call(
+                    ADJUDICATE_PROMPT.format(anchor=r["anchor_text"], fragment=r["text"]),
+                    tier="mechanical", max_tokens=2048)
+                stance = (res["json"] or {}).get("stance", "neutral")
+                why = (res["json"] or {}).get("why", "")
+            except Exception as e:                # noqa: BLE001 — retried on a later run
+                failures.append({"id": r["id"], "error": f"{type(e).__name__}: {e}"})
+                continue
+            r = {**r, "llm_stance": stance, "llm_why": why}
+            (kept if stance == "contradiction" else rejected).append(r)
+            if verbose and i % 20 == 0:
+                print(f"  adjudicated {i}/{len(rows)} — {len(kept)} confirmed",
+                      file=sys.stderr, flush=True)
+    finally:
+        config.LLM_FALLBACK_ORDER = saved_order
+    return kept, rejected, failures
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true", help="write changes (default: dry run)")
+    ap.add_argument("--adjudicate", action="store_true",
+                    help="stage 2: LLM 3-class read over stage-1's shortlist (required for --apply)")
     ap.add_argument("--limit", type=int, help="only process the first N candidates")
     ap.add_argument("--sleep", type=float, default=0.0, help="seconds between API calls")
     ap.add_argument("--report", default="stance_backfill_report.json")
     ap.add_argument("--revert", metavar="RUN_ID", help="undo a previous --apply run")
     args = ap.parse_args()
+
+    if args.apply and not args.adjudicate:
+        sys.exit("--apply requires --adjudicate: stage 1 alone has poor precision on real "
+                 "fragment pairs (it fires on elaborations and metadata), so writing from it "
+                 "would invent contradictions. See the module docstring.")
 
     conn = store.connect(config.DB_PATH) if hasattr(store, "connect") else sqlite3.connect(config.DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -147,20 +230,41 @@ def main():
     print(f"provider {config.STANCE_PROVIDER!r} self-check ok", file=sys.stderr)
 
     rows = _candidates(conn, args.limit)
-    print(f"{len(rows)} candidate fragments", file=sys.stderr)
+    print(f"{len(rows)} candidate fragments — stage 1 (hf shortlist)", file=sys.stderr)
     results, failures = classify_all(rows, sleep=args.sleep)
-
     counts = Counter(r["stance"] for r in results)
-    changed = [r for r in results if r["new_direction"] != r["old_direction"]]
-    contradictions = [r for r in results if r["new_direction"] == "contradict"]
+
+    # SCOPE: only contradictions are repaired. 'refine' vs 'reinforce' both map to
+    # sign +1.0 and strength 1.0 in resolve_direction, so relabelling those would
+    # rewrite ~40% of the corpus for no functional change — and stage 1's
+    # entailment calls on real pairs are just as unvalidated as its contradiction
+    # calls. 'refine' stays the conservative default for every non-contradiction.
+    shortlist = [r for r in results if r["stance"] == "contradiction"]
+    print(f"stage 1 shortlisted {len(shortlist)} of {len(results)} classified",
+          file=sys.stderr)
+
+    confirmed, rejected, llm_failures = [], [], []
+    if args.adjudicate and shortlist:
+        print(f"stage 2 (LLM 3-class) over {len(shortlist)} — OpenRouter only, "
+              "~20 req/min paced", file=sys.stderr)
+        confirmed, rejected, llm_failures = adjudicate(shortlist)
+
+    changed = [r for r in confirmed if r["new_direction"] != r["old_direction"]]
 
     report = {
-        "provider": config.STANCE_PROVIDER,
-        "candidates": len(rows), "classified": len(results), "failed": len(failures),
-        "stance_counts": dict(counts), "changed": len(changed),
-        "contradictions": len(contradictions),
-        "contradiction_rows": contradictions,
-        "failures": failures,
+        "stage1_provider": config.STANCE_PROVIDER,
+        "candidates": len(rows), "classified": len(results),
+        "stage1_failed": len(failures), "stage1_counts": dict(counts),
+        "stage1_shortlist": len(shortlist),
+        "adjudicated": bool(args.adjudicate),
+        "stage2_confirmed": len(confirmed), "stage2_rejected": len(rejected),
+        "stage2_failed": len(llm_failures),
+        "stage1_precision": (round(len(confirmed) / len(shortlist), 3)
+                             if args.adjudicate and shortlist else None),
+        "to_write": len(changed),
+        "confirmed_rows": confirmed,
+        "rejected_rows": rejected,
+        "failures": failures + llm_failures,
         "applied": bool(args.apply),
     }
 
@@ -185,7 +289,12 @@ def main():
     with open(args.report, "w") as fh:
         json.dump(report, fh, indent=2, ensure_ascii=False)
     print(json.dumps({k: v for k, v in report.items()
-                      if k not in ("contradiction_rows", "failures")}, indent=2))
+                      if k not in ("confirmed_rows", "rejected_rows", "failures")}, indent=2))
+    for r in confirmed[:15]:
+        print(f"\n  [{r['ts'][:10]}] {(r['title'] or '')[:60]}"
+              f"\n  ANCHOR: {r['anchor_text'][:90]}"
+              f"\n  FRAG  : {r['text'][:90]}"
+              f"\n  WHY   : {r['llm_why']}")
     print(f"\nfull report -> {args.report}")
 
 
