@@ -9,14 +9,16 @@ def test_schema_init_creates_all_tables(conn):
               "concepts", "concept_members", "relations", "events",
               "consolidation_runs", "episode_consolidations", "replay_map",
               "vec_sentences", "vec_claims", "vec_concepts", "episodes_fts",
-              "oauth_clients", "oauth_access_tokens", "oauth_refresh_tokens"):
+              "oauth_clients", "oauth_access_tokens", "oauth_refresh_tokens",
+              "evidence_attachments", "evidence_sweeps"):
         assert t in tables, f"missing table {t}"
 
 
 def test_every_table_carries_user_id(conn):
     for t in ("episodes", "episode_sentences", "claims", "claim_support",
               "concepts", "concept_members", "relations", "events",
-              "consolidation_runs", "episode_consolidations", "replay_map"):
+              "consolidation_runs", "episode_consolidations", "replay_map",
+              "evidence_attachments", "evidence_sweeps"):
         cols = {r[1] for r in conn.execute(f"PRAGMA table_info({t})")}
         assert "user_id" in cols, f"{t} lacks user_id"
 

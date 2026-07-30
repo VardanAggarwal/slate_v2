@@ -98,6 +98,98 @@ async def test_recall_and_context_tools(mcp_db, client, fake_llm):
     assert s["episodes"] == 2 and s["concepts"] >= 1
 
 
+# ── Evidence lane: E6 (save_evidence) + E7 (receipt variant) ─────────────────
+SOURCE = ("Across 29 trials, spaced repetition was the most reliable method for "
+          "retaining knowledge over multi-year intervals (Cepeda et al., 2006).")
+
+
+@pytest.mark.asyncio
+async def test_save_evidence_lands_as_a_research_episode(mcp_db, client):
+    from core import store
+    r = await _call(client, "save_evidence", text=SOURCE,
+                    source_url="https://example.org/spacing",
+                    source_title="Distributed practice meta-analysis",
+                    retrieved_at="2026-07-30")
+    conn = store.connect()
+    ep = store.get_episode(conn, UID, r["episode_id"])
+    assert ep["source"] == "research"
+    assert store.episode_citation(conn, UID, r["episode_id"])["url"] == \
+        "https://example.org/spacing"
+    # E6: no synchronous refine (fragmentation is about YOUR surprise, not a source's)
+    n_frags = conn.execute("SELECT COUNT(*) AS n FROM fragments").fetchone()["n"]
+    assert n_frags == 0
+    # and no engagement vote — a source save is not the user's thinking spawning writing
+    n_eng = conn.execute(
+        "SELECT COUNT(*) AS n FROM events WHERE type = 'ENGAGEMENT'").fetchone()["n"]
+    assert n_eng == 0
+
+
+@pytest.mark.asyncio
+async def test_save_evidence_requires_provenance(mcp_db, client):
+    from fastmcp.exceptions import ToolError
+    with pytest.raises(ToolError, match="provenance"):
+        await _call(client, "save_evidence", text=SOURCE, source_url="",
+                    source_title="x", retrieved_at="2026-07-30")
+    with pytest.raises(ToolError, match="provenance"):
+        await _call(client, "save_evidence", text=SOURCE,
+                    source_url="https://example.org", source_title="  ",
+                    retrieved_at="2026-07-30")
+
+
+def test_evidence_receipt_never_quotes_a_source_as_the_user():
+    """`— your new line: "…"` is a misattribution on the evidence path: it renders a
+    source's sentence as something the user wrote. Fix, not restyle."""
+    import mcp_server
+    receipt = {"source": "research", "n_novelties": 0,
+               "contradictions": [{"claim_text": "sleep is optional",
+                                   "sentence": "Sleep loss impaired recall by 40%.",
+                                   "similarity": 0.81}],
+               "echoes": [], "prior_episode_matches": []}
+    md = mcp_server.receipt_markdown(receipt)
+    assert "your new line" not in md
+    assert "A source refutes your claim" in md
+    assert "⚡" in md
+
+
+def test_evidence_receipt_splits_backs_from_relates():
+    import mcp_server
+    receipt = {"source": "research", "n_novelties": 1, "contradictions": [],
+               "echoes": [{"claim_text": "spacing works", "sentence": "…",
+                           "similarity": 0.9, "stance": "entailment"},
+                          {"claim_text": "sleep matters", "sentence": "…",
+                           "similarity": 0.75, "stance": "neutral"}],
+               "prior_episode_matches": []}
+    md = mcp_server.receipt_markdown(receipt)
+    assert "📎 **Backs your claim**" in md
+    assert "**Relates to**" in md and "unverified" in md
+    assert "🗄️" in md and "parked for the nightly sweep" in md
+
+
+def test_empty_evidence_receipt_has_its_own_wording():
+    import mcp_server
+    md = mcp_server.receipt_markdown({"source": "research", "n_novelties": 0,
+                                      "echoes": [], "contradictions": [],
+                                      "prior_episode_matches": []})
+    assert md == "Filed. Nothing in your corpus touches this yet."
+
+
+def test_a_note_receipt_attributes_a_research_match_to_the_source():
+    """E7 is NOT confined to the evidence receipt: knn_sentences spans all episodes,
+    so a NOTE receipt must not render a paper as 'your note'."""
+    import mcp_server
+    receipt = {"source": "mcp", "n_novelties": 0, "echoes": [], "contradictions": [],
+               "prior_episode_matches": [
+                   {"episode_title": "Cepeda 2006", "episode_ts": "2026-07-30",
+                    "episode_source": "research", "matched_sentence": "…",
+                    "similarity": 0.8},
+                   {"episode_title": "my old note", "episode_ts": "2026-01-01",
+                    "episode_source": "mcp", "matched_sentence": "…",
+                    "similarity": 0.75}]}
+    md = mcp_server.receipt_markdown(receipt)
+    assert "📚 **Resonates with** another source “Cepeda 2006”" in md
+    assert "🕰️ **Resonates with** your note “my old note”" in md
+
+
 @pytest.mark.asyncio
 async def test_digest_tool(mcp_db, client, fake_llm):
     from core import store

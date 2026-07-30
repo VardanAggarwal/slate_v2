@@ -73,8 +73,14 @@ CREATE TABLE IF NOT EXISTS episodes (
     ts           TEXT NOT NULL,             -- ISO; replayed notes keep original created_at
     raw_text     TEXT NOT NULL,
     title        TEXT,
-    source       TEXT,                      -- 'mcp' | 'replay' | 'import' | ...
-    receipt_json TEXT
+    source       TEXT,                      -- 'mcp' | 'replay' | 'import' | 'research' | ...
+    receipt_json TEXT,
+    -- Evidence lane (E1): provenance of a source='research' episode
+    -- {url, title, retrieved_at}. NEVER prepended to raw_text — citation text in
+    -- the body would pollute the sentence embeddings and mint a junk claim.
+    -- Origin of a claim stays joinable via claim_support → episodes.source, which
+    -- is why no `voice` column exists on claims.
+    citation_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS episode_sentences (
@@ -129,7 +135,10 @@ CREATE TABLE IF NOT EXISTS concept_members (
     user_id    TEXT NOT NULL,
     claim_id   TEXT NOT NULL,
     weight     REAL DEFAULT 1.0,
-    kind       TEXT DEFAULT 'primary',   -- 'primary' | 'redundant' (channel-code attach) | 'query' (query-claim hub)
+    kind       TEXT DEFAULT 'primary',   -- 'primary' | 'redundant' (channel-code attach)
+                                         -- | 'query' (query-claim hub) | 'evidence' (E3:
+                                         -- claim minted from a source='research' episode —
+                                         -- a member, never a representative)
     PRIMARY KEY (concept_id, claim_id)
 );
 
@@ -179,6 +188,34 @@ CREATE TABLE IF NOT EXISTS episode_fragmentations (
     user_id       TEXT NOT NULL,
     fragmented_at TEXT NOT NULL,
     n_fragments   INTEGER
+);
+
+-- EVIDENCE LANE (E4): one row per (evidence sentence, claim) pair that cleared
+-- ECHO_THRESHOLD, with its precomputed stance. DERIVED state — truncated and
+-- recomputed like claims/concept_members, so a re-canonicalised claim id can never
+-- strand a row. The durable record is the EVIDENCE_ATTACHED event, which carries
+-- the claim TEXT (not just the id) so rebuild() can replay it across a
+-- canonicalisation change — the same reason MERGED stores both concept snapshots.
+-- Read-path only: recall renders the stance, it never computes one.
+CREATE TABLE IF NOT EXISTS evidence_attachments (
+    evidence_episode_id TEXT NOT NULL,
+    user_id             TEXT NOT NULL,
+    sentence_idx        INTEGER NOT NULL,
+    claim_id            TEXT NOT NULL,
+    stance              TEXT NOT NULL,      -- 'entailment' | 'contradiction' | 'neutral'
+    similarity          REAL,
+    created_at          TEXT,
+    PRIMARY KEY (evidence_episode_id, sentence_idx, claim_id)
+);
+
+-- Sweep watermark (E4): last event seq the nightly sweep consumed, per user. NOT
+-- truncated by rebuild — it is bookkeeping like episode_consolidations. Load-bearing:
+-- the attachments table is truncated on rebuild, so without a watermark every night
+-- re-evaluates every (evidence sentence × claim) pair with no memo to skip them.
+CREATE TABLE IF NOT EXISTS evidence_sweeps (
+    user_id      TEXT PRIMARY KEY,
+    last_seq     INTEGER NOT NULL,
+    swept_at     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS relations (
@@ -362,8 +399,11 @@ _ADD_COLUMNS = {"fragments": {"cluster": "TEXT", "medoid_idx": "INTEGER"},
                 "claims": {"status": "TEXT DEFAULT 'current'", "superseded_by": "TEXT",
                            "qualifier": "TEXT", "version_group": "TEXT",
                            "background": "INTEGER DEFAULT 0"},
+                # E1: additive + nullable, so an existing DB is harmless if unused.
+                "episodes": {"citation_json": "TEXT"},
                 # 'primary' = the LLM-decided home; 'redundant' = a channel-code
-                # coverage-hole attach (Consolidate step 6c). Redundant rows feed
+                # coverage-hole attach (Consolidate step 6c); 'evidence' = a claim whose
+                # support is a source='research' episode (E3). All non-primary kinds feed
                 # retrieval spread/materialize but are excluded from center/baseline
                 # computation, so they never corrupt the concept vector.
                 "concept_members": {"kind": "TEXT DEFAULT 'primary'"}}
@@ -537,11 +577,18 @@ def new_episode_id(ts_unix: float | None = None) -> str:
 
 def insert_episode(conn: sqlite3.Connection, user_id: str, episode_id: str, ts: str,
                    raw_text: str, title: str | None, source: str, receipt: dict,
-                   sentences: list[str], embeddings) -> None:
-    """Write one episode + its sentences + vectors + FTS row. Caller owns the transaction."""
+                   sentences: list[str], embeddings,
+                   citation: dict | None = None) -> None:
+    """Write one episode + its sentences + vectors + FTS row. Caller owns the transaction.
+
+    `citation` (E1) is stored as its own column — deliberately NOT prepended to
+    raw_text, which would embed and mint the citation as if it were content."""
     conn.execute(
-        "INSERT INTO episodes (id, user_id, ts, raw_text, title, source, receipt_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (episode_id, user_id, ts, raw_text, title, source, json.dumps(receipt, ensure_ascii=False)),
+        "INSERT INTO episodes (id, user_id, ts, raw_text, title, source, receipt_json, citation_json)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (episode_id, user_id, ts, raw_text, title, source,
+         json.dumps(receipt, ensure_ascii=False),
+         json.dumps(citation, ensure_ascii=False) if citation else None),
     )
     for idx, sent in enumerate(sentences):
         conn.execute(
@@ -597,7 +644,7 @@ def knn_sentences(conn: sqlite3.Connection, user_id: str, embedding, k: int = 5)
         if episode_superseded_by(conn, user_id, episode_id):
             continue
         meta = conn.execute(
-            """SELECT s.text, e.title, e.ts FROM episode_sentences s
+            """SELECT s.text, e.title, e.ts, e.source FROM episode_sentences s
                JOIN episodes e ON e.id = s.episode_id
                WHERE s.episode_id = ? AND s.idx = ? AND e.user_id = ?""",
             (episode_id, int(idx), user_id),
@@ -608,6 +655,9 @@ def knn_sentences(conn: sqlite3.Connection, user_id: str, embedding, k: int = 5)
             "text": meta["text"] if meta else None,
             "episode_title": meta["title"] if meta else None,
             "episode_ts": meta["ts"] if meta else None,
+            # E7: the receipt narrates a research match as "another source", not as
+            # "your note" — once research episodes exist this fires on the NOTE path too.
+            "episode_source": meta["source"] if meta else None,
             "similarity": _sim(r["distance"]),
         })
         if len(out) >= k:
@@ -743,6 +793,17 @@ def bump_claim_strength(conn: sqlite3.Connection, user_id: str, claim_id: str,
     conn.execute(
         "UPDATE claims SET strength = strength + ?, last_seen = ? WHERE id = ? AND user_id = ?",
         (delta, ts, claim_id, user_id))
+
+
+def touch_claim(conn: sqlite3.Connection, user_id: str, claim_id: str, ts: str) -> None:
+    """Refresh last_seen WITHOUT touching strength — the decay clock only.
+
+    Used by the evidence sweep (E4): evidence gets no decay exemption, it refreshes on
+    usage or a new attachment. Strength deliberately stays put: bumping it per
+    attachment would degree-boost a retrieval target, which is the failure mode the
+    distant-bridge work already refuted."""
+    conn.execute("UPDATE claims SET last_seen = ? WHERE id = ? AND user_id = ?",
+                 (ts, claim_id, user_id))
 
 
 def get_claim(conn: sqlite3.Connection, user_id: str, claim_id: str) -> sqlite3.Row | None:
@@ -1167,15 +1228,168 @@ def insert_relation(conn: sqlite3.Connection, user_id: str, from_id: str, to_id:
         (from_id, to_id, user_id, relation, weight, ts, evidence_episode_id))
 
 
+# ── Evidence lane (E1/E3/E4) ──────────────────────────────────────────────────
+# Origin is never stored on the claim: it is joined through claim_support →
+# episodes.source, so a claim asserted by BOTH a note and a source reads as the
+# user's (the stronger origin wins) with no column to keep in sync.
+EVIDENCE_SOURCE = "research"
+
+
+def episode_citation(conn: sqlite3.Connection, user_id: str,
+                     episode_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT citation_json FROM episodes WHERE id = ? AND user_id = ?",
+        (episode_id, user_id)).fetchone()
+    return json.loads(row["citation_json"]) if row and row["citation_json"] else None
+
+
+def is_evidence_claim(conn: sqlite3.Connection, user_id: str, claim_id: str) -> bool:
+    """True when EVERY episode supporting this claim is a research episode. A claim
+    the user also wrote themselves is theirs — a source's words never become the
+    user's, but the user's words are never demoted to a source's either."""
+    row = conn.execute(
+        """SELECT COUNT(*) AS n,
+                  SUM(CASE WHEN e.source = ? THEN 1 ELSE 0 END) AS n_research
+           FROM claim_support cs JOIN episodes e ON e.id = cs.episode_id
+           WHERE cs.claim_id = ? AND cs.user_id = ?""",
+        (EVIDENCE_SOURCE, claim_id, user_id)).fetchone()
+    return bool(row and row["n"] and row["n"] == row["n_research"])
+
+
+def research_episode_ids(conn: sqlite3.Connection, user_id: str) -> list[str]:
+    """Research episodes, oldest first. Dormancy gates recall, not the sweep — a 2026
+    source must stay eligible to back a 2028 claim, so nothing is filtered here."""
+    return [r["id"] for r in conn.execute(
+        "SELECT id FROM episodes WHERE user_id = ? AND source = ? ORDER BY ts, id",
+        (user_id, EVIDENCE_SOURCE))]
+
+
+def clear_evidence_attachments(conn: sqlite3.Connection, user_id: str,
+                               episode_ids: list[str] | None = None) -> None:
+    """Drop attachment rows so the sweep can rewrite them. `episode_ids=None` wipes
+    the user's whole table (rebuild); a list scopes it to the episodes being re-swept."""
+    if episode_ids is None:
+        conn.execute("DELETE FROM evidence_attachments WHERE user_id = ?", (user_id,))
+        return
+    if not episode_ids:
+        return
+    ph = ",".join("?" * len(episode_ids))
+    conn.execute(
+        f"DELETE FROM evidence_attachments WHERE user_id = ? AND evidence_episode_id IN ({ph})",
+        (user_id, *episode_ids))
+
+
+def add_evidence_attachment(conn: sqlite3.Connection, user_id: str, episode_id: str,
+                            sentence_idx: int, claim_id: str, stance: str,
+                            similarity: float, ts: str) -> None:
+    conn.execute(
+        """INSERT INTO evidence_attachments
+             (evidence_episode_id, user_id, sentence_idx, claim_id, stance, similarity, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(evidence_episode_id, sentence_idx, claim_id) DO UPDATE SET
+             stance = excluded.stance, similarity = excluded.similarity""",
+        (episode_id, user_id, sentence_idx, claim_id, stance, similarity, ts))
+
+
+def evidence_for_claims(conn: sqlite3.Connection, user_id: str,
+                        claim_ids: list[str]) -> dict[str, list[dict]]:
+    """{claim_id: [{episode_id, sentence_idx, stance, similarity, text, title, ts}]} —
+    the precomputed verdicts recall renders. Pure SQL: no stance call on the read path."""
+    if not claim_ids:
+        return {}
+    ph = ",".join("?" * len(claim_ids))
+    rows = conn.execute(
+        f"""SELECT a.claim_id, a.evidence_episode_id, a.sentence_idx, a.stance,
+                   a.similarity, s.text, e.title, e.ts
+            FROM evidence_attachments a
+            JOIN episode_sentences s ON s.episode_id = a.evidence_episode_id
+                                    AND s.idx = a.sentence_idx
+            JOIN episodes e ON e.id = a.evidence_episode_id
+            WHERE a.user_id = ? AND a.claim_id IN ({ph})
+            ORDER BY a.claim_id, a.similarity DESC""",
+        (user_id, *claim_ids)).fetchall()
+    out: dict[str, list[dict]] = {}
+    for r in rows:
+        out.setdefault(r["claim_id"], []).append(
+            {"episode_id": r["evidence_episode_id"], "sentence_idx": r["sentence_idx"],
+             "stance": r["stance"], "similarity": r["similarity"], "text": r["text"],
+             "title": r["title"], "ts": r["ts"]})
+    return out
+
+
+def knn_evidence_sentences(conn: sqlite3.Connection, user_id: str, embedding,
+                           k: int = 5, overfetch: int = 8) -> list[dict]:
+    """Nearest RESEARCH-episode sentences to one embedding — the reverse direction of
+    the evidence sweep.
+
+    The forward direction (evidence sentence → knn_claims) costs one query per new
+    evidence sentence. For standing evidence the sweep must instead ask "which sources
+    touch this NEW claim?", which is this: one query per changed claim, not a full
+    cross-product. That decomposition is what keeps the nightly cost proportional to
+    the delta rather than to the corpus.
+
+    vec0 has no partial index on episode source, so over-fetch and filter."""
+    rows = conn.execute(
+        "SELECT sent_key, distance FROM vec_sentences WHERE embedding MATCH ? AND k = ? AND user_id = ?",
+        (serialize_float32([float(x) for x in embedding]), k * overfetch, user_id),
+    ).fetchall()
+    out = []
+    for r in rows:
+        episode_id, idx = r["sent_key"].rsplit(":", 1)
+        meta = conn.execute(
+            """SELECT s.text FROM episode_sentences s JOIN episodes e ON e.id = s.episode_id
+               WHERE s.episode_id = ? AND s.idx = ? AND e.user_id = ? AND e.source = ?""",
+            (episode_id, int(idx), user_id, EVIDENCE_SOURCE)).fetchone()
+        if not meta:
+            continue
+        out.append({"episode_id": episode_id, "idx": int(idx), "text": meta["text"],
+                    "similarity": _sim(r["distance"])})
+        if len(out) >= k:
+            break
+    return out
+
+
+def evidence_attachments_for_episode(conn: sqlite3.Connection, user_id: str,
+                                     episode_id: str) -> list[dict]:
+    """Current attachment rows for one research episode, as event-payload dicts
+    (claim TEXT included). The sweep merges its delta onto these so each
+    EVIDENCE_ATTACHED event stays a full per-episode snapshot — which is what makes
+    the replace-whole applier and `rebuild` replay correct."""
+    return [{"sentence_idx": r["sentence_idx"], "claim_id": r["claim_id"],
+             "claim_text": r["text"], "stance": r["stance"], "similarity": r["similarity"]}
+            for r in conn.execute(
+                """SELECT a.sentence_idx, a.claim_id, a.stance, a.similarity, c.text
+                   FROM evidence_attachments a JOIN claims c ON c.id = a.claim_id
+                                                            AND c.user_id = a.user_id
+                   WHERE a.user_id = ? AND a.evidence_episode_id = ?
+                   ORDER BY a.sentence_idx, a.claim_id""", (user_id, episode_id))]
+
+
+def evidence_watermark(conn: sqlite3.Connection, user_id: str) -> int:
+    row = conn.execute("SELECT last_seq FROM evidence_sweeps WHERE user_id = ?",
+                       (user_id,)).fetchone()
+    return int(row["last_seq"]) if row else 0
+
+
+def set_evidence_watermark(conn: sqlite3.Connection, user_id: str, seq: int,
+                           ts: str) -> None:
+    conn.execute(
+        """INSERT INTO evidence_sweeps (user_id, last_seq, swept_at) VALUES (?, ?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET last_seq = excluded.last_seq,
+                                              swept_at = excluded.swept_at""",
+        (user_id, seq, ts))
+
+
 def truncate_semantic(conn: sqlite3.Connection) -> None:
     """Wipe the materialized semantic store (claims/concepts/relations + the
     Write-side fragments, plus their vectors) for ALL users. Episodes, events,
-    runs, and bookkeeping (episode_consolidations / episode_fragmentations) are
-    untouched — this is the first half of `rebuild`, which then re-applies the
-    event log (FRAGMENTED events rebuild the fragments)."""
+    runs, and bookkeeping (episode_consolidations / episode_fragmentations /
+    evidence_sweeps) are untouched — this is the first half of `rebuild`, which then
+    re-applies the event log (FRAGMENTED events rebuild the fragments,
+    EVIDENCE_ATTACHED the evidence attachments)."""
     for table in ("claim_support", "concept_members", "relations",
                   "claims", "concepts", "vec_claims", "vec_concepts",
-                  "fragments", "episode_supersessions"):
+                  "fragments", "episode_supersessions", "evidence_attachments"):
         conn.execute(f"DELETE FROM {table}")
 
 

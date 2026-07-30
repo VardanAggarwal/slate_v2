@@ -248,7 +248,27 @@ button{{width:100%;padding:10px;font-size:16px;cursor:pointer}}
 
 
 # ── Receipt → renderable markdown (engineered for Claude to narrate back) ─────
+def _prior_match_line(m: dict) -> str:
+    """One 🕰️ resonance line, attributed to whoever actually wrote it (E7).
+
+    NOT confined to the evidence receipt. `knn_sentences` ranks across ALL episodes,
+    so the moment research episodes exist a NOTE receipt would render a paper as
+    "resonates with your note" — the source-aware branch has to live on both paths.
+    Correct rows narrated with the wrong verb read as a broken feature."""
+    title = m.get("episode_title") or "untitled"
+    date = (m.get("episode_ts") or "")[:10]
+    if m.get("episode_source") == "research":
+        return (f"📚 **Resonates with** another source “{title}” ({date}): "
+                f"“{m['matched_sentence']}”")
+    return (f"🕰️ **Resonates with** your note “{title}” ({date}): "
+            f"“{m['matched_sentence']}”")
+
+
 def receipt_markdown(receipt: dict) -> str:
+    """Narratable receipt. `source='research'` inverts the narration (E7): same
+    receipt dict, but the incoming sentence is a SOURCE's line, not the user's."""
+    if receipt.get("source") == "research":
+        return _evidence_receipt_markdown(receipt)
     top = config.RECEIPT_TOP_N
     lines = []
     for e in receipt.get("contradictions", [])[:top]:
@@ -257,15 +277,50 @@ def receipt_markdown(receipt: dict) -> str:
     for e in receipt.get("echoes", [])[:top]:
         lines.append(f"🔁 **Echoes** stored claim: “{e['claim_text']}” (sim {e['similarity']})")
     for m in receipt.get("prior_episode_matches", [])[:top]:
-        title = m.get("episode_title") or "untitled note"
-        date = (m.get("episode_ts") or "")[:10]
-        lines.append(f"🕰️ **Resonates with** your note “{title}” ({date}): "
-                     f"“{m['matched_sentence']}”")
+        lines.append(_prior_match_line(m))
     n_nov = receipt.get("n_novelties", 0)
     if n_nov:
         lines.append(f"✨ {n_nov} new claim(s) — nothing like them stored yet.")
     if not lines:
         lines.append("Saved. No overlaps with stored thinking detected.")
+    return "\n".join(lines)
+
+
+def _evidence_receipt_markdown(receipt: dict) -> str:
+    """The evidence variant (E7). Same rows, inverted narration.
+
+    The note path's `— your new line: "…"` is a MISATTRIBUTION here: it quotes the
+    incoming sentence as something the user wrote, when it is a quotation from a
+    source. That is a fix, not a restyle.
+
+    `echoes` splits on the stance the flipped classifier produced (E2): entailment is
+    real backing (📎), everything else is topical adjacency (relates to — unverified).
+    """
+    top = config.RECEIPT_TOP_N
+    lines = []
+    for e in receipt.get("contradictions", [])[:top]:
+        lines.append(f"⚡ **A source refutes your claim**: “{e['claim_text']}” "
+                     f"(sim {e['similarity']}) — the source says: “{e['sentence']}”")
+    echoes = receipt.get("echoes", [])
+    backs = [e for e in echoes if e.get("stance") == "entailment"]
+    relates = [e for e in echoes if e.get("stance") != "entailment"]
+    for e in backs[:top]:
+        lines.append(f"📎 **Backs your claim**: “{e['claim_text']}” "
+                     f"(sim {e['similarity']}) — the source says: “{e['sentence']}”")
+    for e in relates[:top]:
+        lines.append(f"**Relates to** your claim “{e['claim_text']}” "
+                     f"(sim {e['similarity']}) — unverified: the source is on the "
+                     f"topic but does not entail it.")
+    for m in receipt.get("prior_episode_matches", [])[:top]:
+        lines.append(_prior_match_line(m))
+    n_nov = receipt.get("n_novelties", 0)
+    if n_nov:
+        # An orphan is not a failure: it parks until the nightly sweep pairs it with
+        # a claim you write later. Dormancy gates recall, not the sweep.
+        lines.append(f"🗄️ {n_nov} line(s) back nothing you've written yet — "
+                     f"parked for the nightly sweep.")
+    if not lines:
+        lines.append("Filed. Nothing in your corpus touches this yet.")
     return "\n".join(lines)
 
 
@@ -345,6 +400,66 @@ def save_note(text: str, title: str) -> dict:
     _log_engagement(user_id, spawned_write=True)
     return {"episode_id": receipt["episode_id"], "title": title.strip(),
             "n_sentences": receipt["n_sentences"],
+            "narrate": receipt_markdown(receipt)}
+
+
+@mcp.tool
+def save_evidence(text: str, source_url: str, source_title: str,
+                  retrieved_at: str) -> dict:
+    """Save an external source that backs or refutes the user's thinking.
+
+    Use for research, papers, docs, articles, data — anything NOT written by the
+    user. `text` must be a VERBATIM excerpt from the source, copied exactly. Never
+    your own summary, never a fact you recall being true, never a paraphrase
+    "for brevity" — a model-recollected fact looks like verification and isn't.
+    If you cannot quote it, do not save it.
+
+    This is the mirror of save_note's contract: save_note takes only the user's
+    own words, save_evidence only the source's. Both ban paraphrase, from
+    opposite sides.
+
+    Evidence runs the same path as a note: it mints claims, joins concepts as a
+    member, and is paired against the user's claims by the nightly sweep — so it
+    can later surface as 📎 backs / ⚡ refutes on a specific claim. It never
+    becomes the voice of a concept.
+
+    The `narrate` field says what this source does to the user's stored thinking
+    (backs a claim, refutes one, or lands as an orphan awaiting a future claim).
+    Always relay it — that verdict is the product.
+
+    Args:
+        text: verbatim excerpt from the source, in the source's words.
+        source_url: where it came from. Required — evidence without provenance
+            is just an assertion.
+        source_title: the source's own title (paper, article, doc).
+        retrieved_at: ISO date you fetched it, e.g. "2026-07-30".
+    """
+    url = (source_url or "").strip()
+    stitle = (source_title or "").strip()
+    if not url or not stitle:
+        raise ToolError("save_evidence requires source_url and source_title — "
+                        "evidence without provenance is an assertion, not evidence.")
+    citation = {"url": url, "title": stitle,
+                "retrieved_at": (retrieved_at or "").strip() or None}
+    user_id = _user_id()
+    conn = _conn()
+    try:
+        receipt = encode(conn, user_id, text, title=stitle, source="research",
+                         citation=citation)
+    except ValueError as e:
+        raise ToolError(str(e))
+    finally:
+        conn.close()
+    # Deliberately NOT trigger_refine_async, and no _log_engagement:
+    #   • fragmentation is working memory about YOUR surprise at your own writing —
+    #     running the predictor over a source is a wasted async LLM call at save time.
+    #     The nightly refine_pending still picks the episode up, which is what lets
+    #     consolidation mint its claims.
+    #   • a save_evidence is not the user's thinking spawning new writing, so it must
+    #     not be logged as the strongest engagement signal (it would poison the
+    #     demand-side votes _relevance_net consumes).
+    return {"episode_id": receipt["episode_id"], "title": stitle,
+            "citation": citation, "n_sentences": receipt["n_sentences"],
             "narrate": receipt_markdown(receipt)}
 
 

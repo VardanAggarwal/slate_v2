@@ -1,0 +1,51 @@
+{
+  "_what": "Gate B (docs/evidence-lane-plan.md §7). Deterministic Coverage@B, no LLM judge.",
+  "user": "usr_01KTXAYR20J4R6F7PT3DP10W3W",
+  "system": "resonance",
+  "tau": 0.54,
+  "budget_tokens": 2000,
+  "dated": "2026-07-30",
+  "corpora": {
+    "baseline": "data/engine.prod-20260730.db — prod backup, 305 episodes / 1708 fragments, NO research episodes",
+    "with_evidence": "data/engine.gateb.db — baseline + 30 research episodes (eval/gold_evidence.jsonl + eval/evidence_corpus.jsonl), refined + consolidated + swept. 7 kind='evidence' members, 6 attachments (3 entail / 2 contradict / 1 neutral). Built by scratchpad/gate_b_build.py; consolidation cost $0.00 on free-tier openrouter."
+  },
+  "runs": {
+    "baseline / EVIDENCE_LANE=0": {
+      "narrow": {"coverage": 75.0, "tail": 67, "n": 16},
+      "broad": {"coverage": 21.1, "tail": 21, "n": 19},
+      "paragraph": {"coverage": 77.8, "tail": 75, "n": 9}
+    },
+    "baseline / EVIDENCE_LANE=1": {
+      "narrow": {"coverage": 75.0, "tail": 67, "n": 16},
+      "broad": {"coverage": 21.1, "tail": 21, "n": 19},
+      "paragraph": {"coverage": 77.8, "tail": 75, "n": 9}
+    },
+    "with_evidence / EVIDENCE_LANE=0": {
+      "narrow": {"coverage": 81.2, "tail": 83, "n": 16},
+      "broad": {"coverage": 21.1, "tail": 21, "n": 19},
+      "paragraph": {"coverage": 77.8, "tail": 75, "n": 9}
+    },
+    "with_evidence / EVIDENCE_LANE=1": {
+      "narrow": {"coverage": 81.2, "tail": 83, "n": 16},
+      "broad": {"coverage": 21.1, "tail": 21, "n": 19},
+      "paragraph": {"coverage": 77.8, "tail": 75, "n": 9}
+    }
+  },
+  "verdict": "PASS on the stated criterion — self-lane coverage does not regress anywhere when evidence enters the corpus or when the lane is switched on.",
+  "_caveats": [
+    "The +6.2 narrow (75.0 -> 81.2, tail 67 -> 83) is NOT evidence that the partition works.",
+    "Coverage@B scores whether the assembled context covers the gold's key_facts; it cannot",
+    "tell a fact covered by the user's own note from one covered by a source. The topical",
+    "sources in evidence_corpus.jsonl were written around the gold's subject matter, so they",
+    "legitimately cover some key_facts. Read the gain as 'added content covered more facts',",
+    "not as a retrieval-quality result.",
+    "",
+    "LANE=0 and LANE=1 are identical on all three sets, which means the partition was not",
+    "meaningfully exercised rather than proven inert: only 6 of 44 gold queries surfaced an",
+    "Evidence section at all, and none of those carried a computed verdict (the co-surfaced",
+    "claim was never also in the result set). At 30 research episodes against 1097 self",
+    "fragments, evidence simply does not reach the budget often enough to crowd anything out.",
+    "Re-run this once real evidence volume is closer to note volume — that is when",
+    "EVIDENCE_SHARE starts to bind and this comparison becomes informative."
+  ]
+}

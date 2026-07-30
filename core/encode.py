@@ -156,6 +156,48 @@ def _get_hf_stance():
     return _hf_stance
 
 
+def stance_health() -> dict:
+    """Is the configured STANCE_PROVIDER actually runnable here? (P0)
+
+    `nli` needs torch, which the 1GB prod image does not ship. When the import
+    fails classify_stance() degrades to "neutral" for EVERY pair — _build_receipt
+    then buckets every contradiction into `echoes` and the ⚡ line never fires,
+    with nothing raised and nothing logged at boot. That ran live 2026-07-09 → 07-30.
+    Local dev has torch in .venv, so it never reproduces in tests: hence a startup
+    check rather than a test. Returns {provider, ok, detail}."""
+    p = config.STANCE_PROVIDER
+    if p == "nli":
+        try:
+            import sentence_transformers  # noqa: F401
+        except Exception as e:  # noqa: BLE001
+            return {"provider": p, "ok": False,
+                    "detail": f"STANCE_PROVIDER=nli but sentence_transformers is "
+                              f"unimportable ({type(e).__name__}: {e}) — every stance "
+                              f"call will silently return 'neutral' and no contradiction "
+                              f"will ever fire. Set STANCE_PROVIDER=hf + HF_TOKEN."}
+        return {"provider": p, "ok": True, "detail": "local CrossEncoder available"}
+    if p == "hf":
+        if not config.HF_TOKEN:
+            return {"provider": p, "ok": False,
+                    "detail": "STANCE_PROVIDER=hf but HF_TOKEN is empty — every stance "
+                              "call will degrade to 'neutral'."}
+        return {"provider": p, "ok": True, "detail": "HF Inference API MNLI"}
+    if p == "haiku":
+        return {"provider": p, "ok": True,
+                "detail": "billed per pair — never use with the evidence sweep"}
+    return {"provider": p, "ok": True, "detail": "stance disabled"}
+
+
+def check_stance_provider() -> dict:
+    """stance_health(), logged loudly when broken. Called at server/CLI startup."""
+    h = stance_health()
+    if not h["ok"]:
+        log.error("STANCE PROVIDER BROKEN — %s", h["detail"])
+    else:
+        log.info("stance provider %s ok (%s)", h["provider"], h["detail"])
+    return h
+
+
 def classify_stance(premise: str, hypothesis: str) -> str:
     """Return 'contradiction' | 'entailment' | 'neutral' per STANCE_PROVIDER."""
     # Every failure below degrades to "neutral" so a save is never blocked — but
@@ -221,25 +263,51 @@ def split_sentences(text: str, min_chars: int | None = None) -> list[str]:
 
 
 # ── Receipt ───────────────────────────────────────────────────────────────────
+def stance_for(claim_text: str, sentence: str, *, is_evidence: bool) -> str:
+    """Stance of one (stored claim, incoming sentence) pair, with the premise chosen
+    by which side is the warrant (E2).
+
+    A NOTE is the user thinking again: the stored claim is the premise, the new line
+    the hypothesis — "does what I now say follow from what I believed?".
+
+    EVIDENCE is the reverse. The source is the warrant and the claim is what is on
+    trial: evidence ⊨ claim. Entailment is directional — a specific finding entails a
+    general claim, not the other way round — so run unflipped, genuine backing scores
+    `neutral` and lands in `echoes`, indistinguishable from mere topical adjacency."""
+    if not claim_text:
+        return "neutral"
+    return (classify_stance(sentence, claim_text) if is_evidence
+            else classify_stance(claim_text, sentence))
+
+
 def _build_receipt(conn, user_id: str, sentences: list[str], embeddings,
-                   exclude_episode_ids: frozenset | set = frozenset()) -> dict:
+                   exclude_episode_ids: frozenset | set = frozenset(),
+                   source: str = "mcp") -> dict:
     """Classify each sentence against canonical claims (echo/novelty/contradiction)
     and against prior episode sentences (pre-consolidation echo signal).
 
     exclude_episode_ids: episodes whose sentences must not count as prior matches —
-    edit_note passes the note being replaced, else every edit echoes itself."""
+    edit_note passes the note being replaced, else every edit echoes itself.
+    source: 'research' flips the stance direction (E2) and splits `echoes` into
+    entailment (backs a claim) vs neutral (merely relates to it) — the split the
+    evidence receipt narrates and the sweep persists."""
+    is_evidence = source == store.EVIDENCE_SOURCE
     echoes, contradictions, novelties, prior_matches = [], [], [], []
 
     for i, sent in enumerate(sentences):
         emb = embeddings[i]
 
+        # k=3 is kept deliberately: one evidence sentence legitimately attaches to
+        # several claims with different verdicts (the sweep walks all of them).
         claim_hits = store.knn_claims(conn, user_id, emb, k=3)
         best = claim_hits[0] if claim_hits else None
         if best and best["similarity"] >= config.ECHO_THRESHOLD:
-            stance = classify_stance(best["text"], sent) if best["text"] else "neutral"
+            stance = stance_for(best["text"], sent, is_evidence=is_evidence)
             entry = {"sentence": sent, "claim_id": best["claim_id"],
                      "claim_text": best["text"],
                      "similarity": round(best["similarity"], 3)}
+            if is_evidence:
+                entry["stance"] = stance
             if stance == "contradiction":
                 contradictions.append(entry)
             else:
@@ -257,6 +325,11 @@ def _build_receipt(conn, user_id: str, sentences: list[str], embeddings,
                     "episode_id": hit["episode_id"],
                     "episode_title": hit["episode_title"],
                     "episode_ts": hit["episode_ts"],
+                    # E7: whose words the match is. Needed on the NOTE path too —
+                    # knn_sentences spans every episode, so once research episodes
+                    # exist a note receipt would otherwise render a paper as
+                    # "resonates with YOUR note".
+                    "episode_source": hit.get("episode_source"),
                     "matched_sentence": hit["text"],
                     "similarity": round(hit["similarity"], 3),
                 })
@@ -266,6 +339,7 @@ def _build_receipt(conn, user_id: str, sentences: list[str], embeddings,
     prior_matches.sort(key=lambda m: -m["similarity"])
     return {
         "n_sentences": len(sentences),
+        "source": source,
         "echoes": sorted(echoes, key=lambda e: -e["similarity"]),
         "contradictions": sorted(contradictions, key=lambda e: -e["similarity"]),
         "novelties": novelties,
@@ -278,7 +352,8 @@ def _build_receipt(conn, user_id: str, sentences: list[str], embeddings,
 def encode(conn, user_id: str, text: str, ts: str | None = None,
            title: str | None = None, source: str = "mcp",
            replay_key: str | None = None,
-           exclude_episode_ids: frozenset | set = frozenset()) -> dict:
+           exclude_episode_ids: frozenset | set = frozenset(),
+           citation: dict | None = None) -> dict:
     """Append an episode for one user, classify novelty, return the receipt.
 
     ts: ISO timestamp; replayed notes pass their original created_at.
@@ -286,6 +361,8 @@ def encode(conn, user_id: str, text: str, ts: str | None = None,
     transaction as the episode, so replay is idempotent even across crashes.
     exclude_episode_ids: keep these episodes out of the receipt's prior-episode
     matches (edit_note passes the note being replaced).
+    citation: E1 provenance for source='research' evidence ({url, title,
+    retrieved_at}). Stored in its own column, never folded into the text.
     """
     text = (text or "").strip()
     if not text:
@@ -309,13 +386,14 @@ def encode(conn, user_id: str, text: str, ts: str | None = None,
                                        show_progress_bar=False)
 
     receipt = _build_receipt(conn, user_id, sentences, embeddings,
-                             exclude_episode_ids=exclude_episode_ids)
+                             exclude_episode_ids=exclude_episode_ids,
+                             source=source)
     episode_id = store.new_episode_id(ts_unix)
     receipt["episode_id"] = episode_id
 
     with conn:
         store.insert_episode(conn, user_id, episode_id, ts, text, title, source,
-                             receipt, sentences, embeddings)
+                             receipt, sentences, embeddings, citation=citation)
         if replay_key is not None:
             store.mark_replayed(conn, user_id, replay_key, episode_id)
         store.append_event(conn, user_id, "ENCODED", {

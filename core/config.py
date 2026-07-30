@@ -50,6 +50,21 @@ STANCE_HF_BACKOFF = float(os.getenv("STANCE_HF_BACKOFF", "1.5"))  # seconds, dou
 STANCE_ENTAIL_MIN     = float(os.getenv("STANCE_ENTAIL_MIN", "0.60"))   # >= : entailment
 STANCE_CONTRADICT_MAX = float(os.getenv("STANCE_CONTRADICT_MAX", "0.10"))  # <= : contradiction
 
+# ── Evidence lane (docs/evidence-lane-plan.md) ────────────────────────────────
+# External research/facts saved as episodes with source='research'. The master
+# flag gates the GRAPH + RETRIEVAL half (E3 membership kind, E4 sweep, E5 recall
+# labels + budget partition). The save path (E1/E2/E6/E7) is inert without a
+# research episode existing, so it carries no flag.
+EVIDENCE_LANE = os.getenv("EVIDENCE_LANE", "0") == "1"
+# Share of the assemble_context specifics budget reserved for evidence. Partitioned
+# like res_depth_share: evidence gets its own slice instead of bidding freely, so
+# self-lane Coverage@B stays measurable against the existing gold sets.
+EVIDENCE_SHARE = float(os.getenv("EVIDENCE_SHARE", "0.20"))
+# Cap on stance calls per nightly sweep. A consolidation run that re-canonicalises
+# many claims makes that night's sweep proportionally large; what the cap drops is
+# logged, never silently truncated (it is picked up next run).
+EVIDENCE_SWEEP_MAX_PAIRS = int(os.getenv("EVIDENCE_SWEEP_MAX_PAIRS", "2000"))
+
 # ── Write refine pass (W2–W8; core/write.py) ──────────────────────────────────
 # W1 (persist raw + cheap receipt) is sync. The predictor-driven fragmentation /
 # routing is async + retryable: save_note kicks it off best-effort in a thread,

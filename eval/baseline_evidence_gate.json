@@ -1,0 +1,172 @@
+{
+  "stance_provider": {
+    "provider": "nli",
+    "ok": true,
+    "detail": "local CrossEncoder available"
+  },
+  "rows": [
+    {
+      "id": "ev01",
+      "field": "near",
+      "expect": "backs",
+      "observed": "backs",
+      "ok": true,
+      "best_sim": 0.845,
+      "reached_threshold": true,
+      "matched_target": true,
+      "best_claim": "Reducing polarizing news reach discourages susceptible audience exposu"
+    },
+    {
+      "id": "ev02",
+      "field": "near",
+      "expect": "backs",
+      "observed": "backs",
+      "ok": true,
+      "best_sim": 0.766,
+      "reached_threshold": true,
+      "matched_target": true,
+      "best_claim": "Food delivery industry grew exponentially over one decade"
+    },
+    {
+      "id": "ev03",
+      "field": "near",
+      "expect": "backs",
+      "observed": "backs",
+      "ok": true,
+      "best_sim": 0.833,
+      "reached_threshold": true,
+      "matched_target": true,
+      "best_claim": "Scarce medical professionals cause prolonged wait times and hefty fees"
+    },
+    {
+      "id": "ev04",
+      "field": "near",
+      "expect": "backs",
+      "observed": "backs",
+      "ok": true,
+      "best_sim": 0.817,
+      "reached_threshold": true,
+      "matched_target": true,
+      "best_claim": "Consumer awareness of healthy eating drives transparency."
+    },
+    {
+      "id": "ev05",
+      "field": "near",
+      "expect": "backs",
+      "observed": "backs",
+      "ok": true,
+      "best_sim": 0.908,
+      "reached_threshold": true,
+      "matched_target": true,
+      "best_claim": "Multi-restaurant platforms provide alternatives to Swiggy and Zomato w"
+    },
+    {
+      "id": "ev06",
+      "field": "near",
+      "expect": "refutes",
+      "observed": "refutes",
+      "ok": true,
+      "best_sim": 0.896,
+      "reached_threshold": true,
+      "matched_target": true,
+      "best_claim": "Human legacies have predominantly caused environmental harm"
+    },
+    {
+      "id": "ev07",
+      "field": "near",
+      "expect": "refutes",
+      "observed": "orphan",
+      "ok": false,
+      "best_sim": 0.641,
+      "reached_threshold": false,
+      "matched_target": true,
+      "best_claim": "Reservation is meant to heal damage done to communities over generatio"
+    },
+    {
+      "id": "ev08",
+      "field": "near",
+      "expect": "refutes",
+      "observed": "refutes",
+      "ok": true,
+      "best_sim": 0.799,
+      "reached_threshold": true,
+      "matched_target": true,
+      "best_claim": "Collective achievement exceeds individual capability"
+    },
+    {
+      "id": "ev09",
+      "field": "near",
+      "expect": "relates",
+      "observed": "relates",
+      "ok": true,
+      "best_sim": 0.778,
+      "reached_threshold": true,
+      "matched_target": true,
+      "best_claim": "Government involvement is unavoidable in natural resource allocation"
+    },
+    {
+      "id": "ev10",
+      "field": "near",
+      "expect": "relates",
+      "observed": "orphan",
+      "ok": false,
+      "best_sim": 0.603,
+      "reached_threshold": false,
+      "matched_target": false,
+      "best_claim": "Continuing voided relationships through effort creates toxicity"
+    },
+    {
+      "id": "ev11",
+      "field": "near",
+      "expect": "orphan",
+      "observed": "orphan",
+      "ok": true,
+      "best_sim": 0.398,
+      "reached_threshold": false,
+      "matched_target": false,
+      "best_claim": "Better launch strategy execution could have improved outcomes"
+    },
+    {
+      "id": "ev12",
+      "field": "near",
+      "expect": "orphan",
+      "observed": "orphan",
+      "ok": true,
+      "best_sim": 0.334,
+      "reached_threshold": false,
+      "matched_target": false,
+      "best_claim": "India's richest mineral deposits are concentrated in historically Maoi"
+    },
+    {
+      "id": "ev13",
+      "field": "far",
+      "expect": "backs",
+      "observed": "orphan",
+      "ok": false,
+      "best_sim": 0.506,
+      "reached_threshold": false,
+      "matched_target": false,
+      "best_claim": "Selective deployment determines competitive success"
+    },
+    {
+      "id": "ev14",
+      "field": "far",
+      "expect": "backs",
+      "observed": "orphan",
+      "ok": false,
+      "best_sim": 0.443,
+      "reached_threshold": false,
+      "matched_target": false,
+      "best_claim": "Scaling fair pricing required doubling commission rates, which restaur"
+    }
+  ],
+  "summary": {
+    "near_correct": "10/12",
+    "far_correct": "0/2",
+    "far_below_threshold": 2,
+    "near_below_threshold": 4,
+    "inverted_verdicts": 0,
+    "backs_recall": "5/7",
+    "refutes_recall": "2/3"
+  }
+}

@@ -161,6 +161,46 @@ Claude".
 Check after two nights: `consolidation_runs` has two `ok` rows; morning
 digest reflects the previous day's saves.
 
+The evidence sweep needs no cron line of its own — `consolidate` runs it at the
+end of each user's run, once the claim set for that run is final.
+
+## 8. Evidence lane (docs/evidence-lane-plan.md)
+
+**ON in production.** `docker-compose.yml` sets `EVIDENCE_LANE=${EVIDENCE_LANE:-1}`
+in the `environment:` block, which overrides `env_file`. That placement is the point:
+`.env.example` ships `EVIDENCE_LANE=0` (the safe default for local dev and for anyone
+running the code as a library), so if the flag lived only in `.env`, re-copying the
+example during a rebuild would silently ship the feature disabled. Compose can't be
+re-copied — it's in git.
+
+```bash
+EVIDENCE_LANE=1        # concept membership kind, nightly stance sweep, 📎/⚡ recall
+EVIDENCE_SHARE=0.20    # share of the assemble_context specifics budget
+```
+
+Verify it after every deploy — one call, no auth:
+
+```bash
+curl -s localhost:8100/health | python -m json.tool
+# want: "evidence_lane": true   AND   "stance": {"ok": true, ...}
+```
+
+Both matter together. `evidence_lane: true` with a broken stance provider gives you
+the lane with every verdict silently collapsed to `neutral` — sources would file as
+"relates to" and never as 📎 or ⚡ (§2 is the same failure, and it ran live for three
+weeks). The sweep is inert in that state.
+
+Rollback needs no code change: set `EVIDENCE_LANE=0` in the host `.env` and restart —
+`${EVIDENCE_LANE:-1}` reads it. No data fix-up, no episode is touched. To also drop
+the derived `kind='evidence'` memberships, run `python -m cli rebuild`.
+
+`STANCE_PROVIDER=haiku` + the sweep is a hard no — it bills per pair, and the
+sweep refuses to start on it.
+
+Gate evidence for turning it on is recorded in `eval/baseline_evidence_gate.json`
+(verdict quality) and `eval/baseline_evidence_coverage.json` (Coverage@B). Re-run
+either with `python -m eval.evidence_gate` / `python -m eval.coverage`.
+
 ## Coexistence + rollback
 
 - v1 is untouched: its container, port, data dir, and domain stay as-is.

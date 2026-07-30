@@ -21,6 +21,14 @@ mcp_app = mcp.http_app(path="/")
 app = FastAPI(title="slate-engine", lifespan=mcp_app.lifespan)
 app.mount("/mcp", mcp_app)
 
+# P0: shout at boot if the configured stance provider cannot actually run here.
+# The failure mode is silent — classify_stance() degrades to "neutral" for every
+# pair, so every contradiction files as an echo and the ⚡ line simply never fires.
+# That ran live 2026-07-09 → 07-30 with nothing in the logs (DEPLOY.md §2).
+from core.encode import check_stance_provider  # noqa: E402
+
+_STANCE_HEALTH = check_stance_provider()
+
 _basic = HTTPBasic(auto_error=False)
 
 
@@ -154,7 +162,11 @@ def health() -> dict:
     conn = store.connect()
     return {"status": "ok",
             "episodes": conn.execute("SELECT COUNT(*) AS n FROM episodes").fetchone()["n"],
-            "concepts": conn.execute("SELECT COUNT(*) AS n FROM concepts").fetchone()["n"]}
+            "concepts": conn.execute("SELECT COUNT(*) AS n FROM concepts").fetchone()["n"],
+            # P0: surfaced so a broken stance provider is visible from outside the
+            # container, not only in the boot log.
+            "stance": _STANCE_HEALTH,
+            "evidence_lane": config.EVIDENCE_LANE}
 
 
 _PAGE = """<!doctype html>

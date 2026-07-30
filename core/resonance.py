@@ -36,7 +36,7 @@ import re
 
 import numpy as np
 
-from core import assembly, calibration as calib, predict, retrieve, store
+from core import assembly, calibration as calib, config, predict, retrieve, store
 
 # Clause delimiters — when sentence-decomposition yields one probe (a single-sentence
 # query), split it into independent CLAUSE probes so confluence still fires: each
@@ -117,6 +117,13 @@ DEPTH_SHARE = 0.30      # share of specifics reserved for depth. 0.30 measured b
 # skips-and-continues past any block that overflows, packing smaller blocks after
 # a big one. Default OFF → prod render byte-identical.
 RENDER_PACKED = False
+# Evidence lane (E5): external sources get their OWN slice of the specifics budget,
+# the same containment depth_share applies to deep-read. Evidence is cheap to add and
+# notes are not, so letting it bid freely would let it crowd out the user's own
+# thinking — the partition is what keeps self-lane Coverage@B measurable against the
+# existing gold sets. With no research episode in the corpus this is a no-op and the
+# render is byte-identical.
+EVIDENCE_SHARE = config.EVIDENCE_SHARE
 
 DEFAULT_CALIBRATION = {
     "res_seed_claims": SEED_CLAIMS, "res_seed_concepts": SEED_CONCEPTS,
@@ -132,6 +139,7 @@ DEFAULT_CALIBRATION = {
     "res_deep_top_n": DEEP_TOP_N, "res_deep_frags": DEEP_FRAGS,
     "res_breadth_frags_per_node": BREADTH_FRAGS_PER_NODE, "res_depth_share": DEPTH_SHARE,
     "res_coverage_notes": COVERAGE_NOTES, "res_render_packed": RENDER_PACKED,
+    "res_evidence_share": EVIDENCE_SHARE,
     "gain_floor": ASSEMBLE_GAIN_FLOOR, "max_items": ASSEMBLE_MAX_ITEMS,
     "value_floor": None, "per_cluster": {},
     # ablation switches — flip to isolate each mechanism (see design doc test plan)
@@ -438,6 +446,16 @@ def resonance_recall(conn, user_id: str, query: str, *,
                                              seed=[], truncated=False, run_id=run_id)
         return {"nodes": nodes, "fragments": [], "frame": frame, "probes": field["probes"]}
 
+    # E5: tag which candidates came from a research episode, and look up the verdicts
+    # the nightly sweep precomputed against the claims this query lit up. One query
+    # each, and only when the lane is on — flag off → path untouched.
+    evidence_verdicts: dict[str, dict] = {}
+    if config.EVIDENCE_LANE and cand:
+        _tag_evidence(conn, user_id, cand.values())
+        evidence_verdicts = _evidence_verdicts(
+            conn, user_id, [n for n, _ in ranked if n.startswith("clm_")],
+            {c["episode_id"] for c in cand.values() if c.get("_evidence")})
+
     candidates = list(cand.values())
     smax = max(c["_sal"] for c in candidates) or 1.0
     weights = [c["_sal"] / smax for c in candidates]  # parent-salience, normalised
@@ -457,7 +475,49 @@ def resonance_recall(conn, user_id: str, query: str, *,
                                          truncated=not res.get("stopped", False),
                                          run_id=run_id)
     return {"nodes": nodes, "fragments": out, "frame": frame,
-            "probes": field["probes"]}
+            "probes": field["probes"], "evidence_verdicts": evidence_verdicts}
+
+
+# ── Evidence lane helpers (E5) ────────────────────────────────────────────────
+def _tag_evidence(conn, user_id: str, candidates) -> None:
+    """Mark each candidate fragment `_evidence` when its episode is source='research'.
+    One query for the whole pool; sets the flag to False elsewhere so the partition
+    below can split on it without a per-fragment lookup."""
+    cands = list(candidates)
+    eps = sorted({c["episode_id"] for c in cands})
+    if not eps:
+        return
+    ph = ",".join("?" * len(eps))
+    research = {r["id"] for r in conn.execute(
+        f"SELECT id FROM episodes WHERE user_id = ? AND source = ? AND id IN ({ph})",
+        (user_id, store.EVIDENCE_SOURCE, *eps))}
+    for c in cands:
+        c["_evidence"] = c["episode_id"] in research
+
+
+def _evidence_verdicts(conn, user_id: str, bright_claim_ids: list[str],
+                       evidence_episodes: set[str]) -> dict[str, dict]:
+    """{research episode_id: {stance, claim_text}} — the precomputed verdict for the
+    claims THIS query lit up, so an evidence block can render "backs/refutes this"
+    rather than the standalone "might". Contradiction dominates the merge: rendering a
+    refutation as support is the one genuinely harmful collapse."""
+    if not bright_claim_ids or not evidence_episodes:
+        return {}
+    out: dict[str, dict] = {}
+    rank = {"contradiction": 2, "entailment": 1, "neutral": 0}
+    for claim_id, atts in store.evidence_for_claims(
+            conn, user_id, bright_claim_ids).items():
+        claim = store.get_claim(conn, user_id, claim_id)
+        for a in atts:
+            ep = a["episode_id"]
+            if ep not in evidence_episodes:
+                continue
+            prev = out.get(ep)
+            if prev is None or rank[a["stance"]] > rank[prev["stance"]]:
+                out[ep] = {"stance": a["stance"],
+                           "claim_text": claim["text"] if claim else "",
+                           "claim_id": claim_id}
+    return out
 
 
 def _concept_members(conn, user_id: str, concept_id: str, n: int) -> list[dict]:
@@ -483,6 +543,54 @@ def _concept_members(conn, user_id: str, concept_id: str, n: int) -> list[dict]:
             (r["id"], user_id)).fetchone()
         out.append({"text": r["text"], "title": src["title"] if src else None})
     return out
+
+
+_EVIDENCE_VERBS = {"entailment": "📎 backs", "contradiction": "⚡ refutes",
+                   "neutral": "📎 relates to"}
+
+
+def _emit_evidence(frag_list: list[dict], budget: int,
+                   verdicts: dict[str, dict]) -> tuple[list[str], int]:
+    """Render the evidence slice: one block per source, headed by its verdict against
+    the claims this query lit up. Returns (lines, chars_used).
+
+    A source with a verdict says what it DOES ("backs"/"refutes" that claim); one
+    without says only what it MIGHT do. The distinction is not decoration — a
+    standalone source has no computed relationship to anything on screen, and
+    asserting one would be a fabricated citation."""
+    if budget <= 0 or not frag_list:
+        return [], 0
+    groups: dict[str, list[dict]] = {}
+    order: list[str] = []
+    for f in frag_list:
+        ep = f["episode_id"]
+        if ep not in groups:
+            groups[ep] = []
+            order.append(ep)
+        groups[ep].append(f)
+
+    rendered, used = ["### Evidence"], len("### Evidence") + 1
+    for ep in order:
+        head = groups[ep][0]
+        title = head.get("title") or "untitled source"
+        when = (head.get("ts") or "")[:10]
+        v = verdicts.get(ep)
+        if v:
+            verb = _EVIDENCE_VERBS.get(v["stance"], "📎 relates to")
+            note = f"{verb} “{v['claim_text']}”"
+        else:
+            note = "📎 might back you — no verdict against anything else on screen"
+        block = [f"#### {title} _({when})_ — {note}"]
+        block += [f"- {f['text']}" for f in groups[ep]]
+        block.append("")
+        blen = sum(len(x) + 1 for x in block)
+        if used + blen > budget and len(rendered) > 1:
+            break
+        rendered += block
+        used += blen
+    if len(rendered) == 1:      # header only — nothing fitted
+        return [], 0
+    return rendered, used
 
 
 def resonance_context(conn, user_id: str, topic: str, max_chars: int = 6000, *,
@@ -564,6 +672,22 @@ def resonance_context(conn, user_id: str, topic: str, max_chars: int = 6000, *,
     specifics_budget = max(0, max_chars - frame_chars)
     render_packed = bool(calibration.get("res_render_packed", RENDER_PACKED))
 
+    # ── EVIDENCE partition (E5) ──
+    # Split evidence OUT of the pool first and render it against its own reserved
+    # slice; the self lane then gets the remainder. Evidence never bids against the
+    # user's own thinking for the same chars. No research episode → no split, and the
+    # rest of this function runs on exactly the list it ran on before.
+    evidence_lines: list[str] = []
+    if config.EVIDENCE_LANE:
+        ev_frags = [f for f in frags if f.get("_evidence")]
+        if ev_frags:
+            frags = [f for f in frags if not f.get("_evidence")]
+            share = float(calibration.get("res_evidence_share", EVIDENCE_SHARE))
+            verdicts = res.get("evidence_verdicts", {})
+            evidence_lines, ev_used = _emit_evidence(
+                ev_frags, int(specifics_budget * share), verdicts)
+            specifics_budget = max(0, specifics_budget - ev_used)
+
     if render_packed:
         # ONE rank-ordered pool (assembly order = most-informative first), full
         # specifics budget, skip-and-continue — no depth/breadth char split.
@@ -583,6 +707,9 @@ def resonance_context(conn, user_id: str, topic: str, max_chars: int = 6000, *,
         if depth_lines or breadth_lines:
             lines.append("### Specifics")
             lines += depth_lines + breadth_lines  # focused depth first, then coverage
+
+    if evidence_lines:
+        lines += evidence_lines
 
     out, total = [], 0
     for line in lines:

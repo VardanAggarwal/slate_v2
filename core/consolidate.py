@@ -10,10 +10,13 @@ text at apply time — same local model, same vectors.
 """
 import hashlib
 import json
+import logging
 from datetime import datetime, timezone
 
 from core import config, guard, llm, predict, store
 from core.encode import get_embedder, split_sentences
+
+log = logging.getLogger("slate.consolidate")
 
 # Strength deltas (spaced-repetition pressure)
 SUPPORT_BUMP = 0.5   # claim re-encountered via a new episode at canonicalization
@@ -146,6 +149,24 @@ def emit(conn, user_id: str, run_id: str | None, type_: str, payload: dict) -> N
     apply_event(conn, user_id, type_, payload)
 
 
+def _member_kind(conn, user_id: str, claim_id: str) -> str:
+    """Membership kind for a claim joining a concept (E3).
+
+    A claim whose every supporting episode is source='research' joins as
+    kind='evidence'. Every centre/baseline path ALLOWLISTS kind (concept vector:
+    `kind IN ('primary','query')`; medoid/anchor/baselines: `kind = 'primary'`), so a
+    new value is excluded from concept identity by construction — exactly as
+    'redundant' is. Unfiltered paths (retrieval spread/materialize) still see it,
+    which is the point: evidence stays reachable through the concept and can counter
+    bias, without ever representing it.
+
+    Deterministic on replay: CANONICALIZED events (which write claim_support) always
+    apply before the concept events that read it, so rebuild reproduces the kind."""
+    if not config.EVIDENCE_LANE:
+        return "primary"
+    return "evidence" if store.is_evidence_claim(conn, user_id, claim_id) else "primary"
+
+
 def apply_event(conn, user_id: str, type_: str, payload: dict) -> None:
     """Materialize one event into the semantic tables. Deterministic."""
     p = payload
@@ -161,12 +182,14 @@ def apply_event(conn, user_id: str, type_: str, payload: dict) -> None:
     elif type_ == "CONCEPT_CREATED":
         store.insert_concept(conn, user_id, p["concept_id"], p["label"], p["canonical"], p["ts"])
         for cid in p["claim_ids"]:
-            store.add_concept_member(conn, user_id, p["concept_id"], cid)
+            store.add_concept_member(conn, user_id, p["concept_id"], cid,
+                                     kind=_member_kind(conn, user_id, cid))
         store.recompute_concept_embedding(conn, user_id, p["concept_id"])
 
     elif type_ == "ATTACHED":
         for cid in p["claim_ids"]:
-            store.add_concept_member(conn, user_id, p["concept_id"], cid)
+            store.add_concept_member(conn, user_id, p["concept_id"], cid,
+                                     kind=_member_kind(conn, user_id, cid))
         store.update_concept(conn, user_id, p["concept_id"], last_activity=p["ts"])
         store.recompute_concept_embedding(conn, user_id, p["concept_id"])
 
@@ -179,7 +202,8 @@ def apply_event(conn, user_id: str, type_: str, payload: dict) -> None:
         fold_ids = p.get("fold_claim_ids", all_members)
         kept_ids = p.get("kept_claim_ids", [])
         for cid in fold_ids:
-            store.add_concept_member(conn, user_id, p["winner_id"], cid)
+            store.add_concept_member(conn, user_id, p["winner_id"], cid,
+                                     kind=_member_kind(conn, user_id, cid))
         if kept_ids:  # nuance remains → loser is not emptied, only the folded leave
             for cid in fold_ids:
                 store.remove_concept_member(conn, user_id, p["loser_id"], cid)
@@ -197,7 +221,8 @@ def apply_event(conn, user_id: str, type_: str, payload: dict) -> None:
             store.insert_concept(conn, user_id, child["concept_id"], child["label"],
                                  child["canonical"], p["ts"])
             for cid in child["claim_ids"]:
-                store.add_concept_member(conn, user_id, child["concept_id"], cid)
+                store.add_concept_member(conn, user_id, child["concept_id"], cid,
+                                         kind=_member_kind(conn, user_id, cid))
             store.recompute_concept_embedding(conn, user_id, child["concept_id"])
 
     elif type_ == "RELATED":
@@ -265,6 +290,13 @@ def apply_event(conn, user_id: str, type_: str, payload: dict) -> None:
         # (embeddings recomputed from the fragment text, like CANONICALIZED claims).
         from core import write
         write.apply_fragmented(conn, user_id, p)
+
+    elif type_ == "EVIDENCE_ATTACHED":
+        # E4 — the nightly evidence sweep's (evidence sentence, claim, stance) pairs.
+        # Derived state, replace-whole per research episode; the event carries the
+        # claim TEXT so replay survives re-canonicalisation.
+        from core import evidence
+        evidence.apply_evidence_attached(conn, user_id, p)
 
     elif type_ == "CHANNEL_REDUNDANCY":
         # Step 6c — replace all of this user's redundant (channel-code) memberships
@@ -1741,12 +1773,29 @@ def consolidate(conn, user_id: str, max_episodes: int = 50) -> dict:
         with conn:
             _fit_baselines(conn, user_id, run_id, ts)
 
+        # E4: the claim set is final for this run — re-pair standing evidence against
+        # it. Local/HF stance only (asserted inside), so no LLM cost. LAST, because the
+        # watermark must record a claim set that will not move again this run.
+        evidence_report = None
+        if config.EVIDENCE_LANE:
+            from core import evidence as _evidence
+            with conn:
+                evidence_report = _evidence.sweep(conn, user_id)
+            ratios = _evidence.member_ratios(conn, user_id)
+            if ratios:
+                # E3 risk watch: medoid/anchor exclusion protects concept identity, not
+                # the membership MIX. Logged every run so drift is seen, not inferred.
+                log.info("evidence:self member ratio — %s",
+                         ", ".join(f"{r['label']}={r['n_evidence']}:{r['n_self']}"
+                                   for r in ratios[:10]))
+
         with conn:
             for ep, _, _ in per_episode:  # skipped episodes stay unconsolidated
                 store.mark_consolidated(conn, user_id, ep["id"], run_id)
             store.finish_run(conn, run_id, "ok", round(cost, 4))
         return {"status": "ok", "run_id": run_id, "episodes": len(per_episode),
                 "skipped": skipped, "claims_touched": len(set(new_claim_ids)),
+                "evidence": evidence_report,
                 "cost": round(cost, 4)}
     except Exception:
         with conn:

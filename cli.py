@@ -52,6 +52,16 @@ def main(argv=None):
     p_ref.add_argument("--max-episodes", type=int, default=200)
     add_user_arg(p_ref, default=None)  # default: every user with pending episodes
 
+    p_evd = sub.add_parser("evidence", help="evidence lane (docs/evidence-lane-plan.md): "
+                                            "nightly stance sweep + health")
+    evd_sub = p_evd.add_subparsers(dest="evidence_cmd", required=True)
+    e_swp = evd_sub.add_parser("sweep", help="pair research episodes with claims")
+    e_swp.add_argument("--max-pairs", type=int, default=None)
+    add_user_arg(e_swp, default=None)   # default: every user
+    e_rat = evd_sub.add_parser("ratios", help="evidence:self member ratio per concept")
+    add_user_arg(e_rat)
+    evd_sub.add_parser("stance", help="is STANCE_PROVIDER actually runnable here? (P0)")
+
     p_dig = sub.add_parser("digest", help="morning digest from recent events")
     p_dig.add_argument("--since-hours", type=int, default=36)
     p_dig.add_argument("--polish", action="store_true", help="LLM prose pass")
@@ -140,6 +150,28 @@ def main(argv=None):
                 progress = any(r.get("episodes", 0) > 0 for r in reports)
                 if not args.all or not reports or not progress:
                     break
+
+    elif args.cmd == "evidence":
+        from core import evidence, store
+        if args.evidence_cmd == "stance":
+            from core.encode import stance_health
+            h = stance_health()
+            print(json.dumps(h, indent=2))
+            sys.exit(0 if h["ok"] else 1)
+        conn = store.connect()
+        if args.evidence_cmd == "sweep":
+            if not config.EVIDENCE_LANE:
+                sys.exit("EVIDENCE_LANE is off — set EVIDENCE_LANE=1 to sweep.")
+            if args.user:
+                with conn:
+                    out = evidence.sweep(conn, _resolve_user(conn, args.user),
+                                         max_pairs=args.max_pairs)
+            else:
+                out = evidence.sweep_all_users(conn, max_pairs=args.max_pairs)
+            print(json.dumps(out, indent=2))
+        elif args.evidence_cmd == "ratios":
+            print(json.dumps(evidence.member_ratios(
+                conn, _resolve_user(conn, args.user)), indent=2, ensure_ascii=False))
 
     elif args.cmd == "digest":
         from core import store

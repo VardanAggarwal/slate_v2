@@ -19,6 +19,11 @@ services:
     environment:
       - DB_PATH=/app/data/engine.db
       - SLATE_V1_DB=/old/slate.db
+      # Evidence lane ON in production. Declared HERE, not only in .env: `environment`
+      # overrides `env_file`, so re-copying .env.example (which ships the safe 0 for
+      # library/dev use) can never silently ship this disabled. Still overridable —
+      # set EVIDENCE_LANE=0 in .env on the host to roll back without editing git.
+      - EVIDENCE_LANE=${EVIDENCE_LANE:-1}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]

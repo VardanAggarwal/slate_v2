@@ -25,6 +25,26 @@ FREQUENT_STRENGTH = 2.0   # 🔁 claim re-encountered (1.0 + 2×SUPPORT_BUMP)
 TIME_GAP_DAYS = 45        # 🕰️ resurfacing after this long
 BACKGROUND_SCORE_FACTOR = 0.5  # 🌫️ C9: demote a folded-into-theme claim's standalone pull
 
+# ── Evidence lane (E5) — three labels, one pool ───────────────────────────────
+# Origin is a DISPLAY attribute, not a filter and not a promotion threshold:
+# evidence competes in the same pool, it is just labelled differently.
+#
+# Collapsing ⚡ into 📎 is the one genuinely harmful outcome — a refutation rendered
+# as support — so contradiction always wins the verdict merge below.
+#
+# "Might" vs "does": evidence surfacing STANDALONE has no verdict for this pairing,
+# so it reads as *might*. Evidence surfacing alongside a claim that is also in the
+# result set has a precomputed verdict in `evidence_attachments`, so it reads as *does*.
+#
+# The key is `origin_label`, not `label`: a CONCEPT headline already uses `label` for
+# the concept's name, and one key meaning two things across result types is how a
+# consumer ends up rendering a concept name as a provenance badge.
+SELF_LABEL = "🧠 yours"
+EVIDENCE_STANDALONE = "📎 evidence — might back you"
+EVIDENCE_LABELS = {"entailment":    "📎 evidence — backs this",
+                   "contradiction": "⚡ evidence — refutes this",
+                   "neutral":       "📎 evidence — relates to this"}
+
 
 def _days_since(iso_ts: str | None) -> int:
     if not iso_ts:
@@ -77,7 +97,40 @@ def recall(conn, user_id: str, query: str, k: int = 8) -> list[dict]:
         if entry:
             results.append(entry)
     results.sort(key=lambda r: -r["score"])
-    return results[:k]
+    out = results[:k]
+    if config.EVIDENCE_LANE:
+        label_evidence(conn, user_id, out)
+    return out
+
+
+def label_evidence(conn, user_id: str, results: list[dict]) -> None:
+    """Attach the 🧠/📎/⚡ label to each headline, in place (E5).
+
+    Reads `evidence_attachments` only — precomputed by the nightly sweep. No stance
+    call, no API call: recall stays local and free."""
+    ev = [r for r in results if r.get("origin") == "evidence"]
+    for r in results:
+        if r["type"] == "claim" and r.get("origin") != "evidence":
+            r["origin_label"] = SELF_LABEL
+    if not ev:
+        return
+    self_ids = [r["id"] for r in results
+                if r["type"] == "claim" and r.get("origin") != "evidence"]
+    by_episode: dict[str, list[dict]] = {}
+    for claim_id, atts in store.evidence_for_claims(conn, user_id, self_ids).items():
+        for a in atts:
+            by_episode.setdefault(a["episode_id"], []).append({**a, "claim_id": claim_id})
+    for r in ev:
+        hits = [h for e in store.claim_source_episodes(conn, user_id, r["id"])
+                for h in by_episode.get(e, [])]
+        if not hits:
+            r["origin_label"] = EVIDENCE_STANDALONE   # no co-surfaced claim → "might"
+            continue
+        # contradiction dominates: a refutation must never render as support.
+        verdict = next((h for h in hits if h["stance"] == "contradiction"),
+                       next((h for h in hits if h["stance"] == "entailment"), hits[0]))
+        r["origin_label"] = EVIDENCE_LABELS.get(verdict["stance"], EVIDENCE_STANDALONE)
+        r["verdict"] = {"claim_id": verdict["claim_id"], "stance": verdict["stance"]}
 
 
 def _score_node(conn, user_id: str, node: str, activation: float, via: str) -> dict | None:
@@ -107,6 +160,14 @@ def _score_node(conn, user_id: str, node: str, activation: float, via: str) -> d
                "strength": round(c["strength"], 2), "n_episodes": n_support,
                "score": round(score, 4), "signals": signals,
                "status": c["status"]}
+        # E5: single pool, origin as a display attribute — no filter, no promotion.
+        # Joined through claim_support → episodes.source (there is no voice column).
+        if config.EVIDENCE_LANE and store.is_evidence_claim(conn, user_id, node):
+            out["origin"] = "evidence"
+            eps = store.claim_source_episodes(conn, user_id, node)
+            cite = store.episode_citation(conn, user_id, eps[0]) if eps else None
+            if cite:
+                out["citation"] = cite
         # C8: the current view is returned, but contestation is always surfaced.
         if c["version_group"] and len(store.claim_versions(conn, user_id,
                                                             c["version_group"])) > 1:
