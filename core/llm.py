@@ -259,8 +259,16 @@ MAX_TOKENS_CEILING = 16384  # cap for the truncation-retry escalation below
 
 
 def call(prompt: str, tier: str = "mechanical", max_tokens: int = 2048,
-         system: str | None = None, json_out: bool = True) -> dict:
+         system: str | None = None, json_out: bool = True,
+         providers: list[str] | None = None) -> dict:
     """Walk LLM_FALLBACK_ORDER; within claude, use the tier's model.
+
+    `providers` restricts this ONE call to a subset of the chain. Per-call rather
+    than by assigning config.LLM_FALLBACK_ORDER: the write path runs its refine
+    pass in a thread (write.py), so mutating the module global races with any
+    concurrent call — and a save/restore pair that interleaves can capture an
+    already-narrowed order and leave the chain permanently narrowed, silently
+    costing every other caller its fallback.
 
     Returns {json?, text, provider, model, input_tokens, output_tokens, cost}.
     Raises LLMError when every remote provider fails — callers that have a
@@ -269,7 +277,7 @@ def call(prompt: str, tier: str = "mechanical", max_tokens: int = 2048,
     """
     last_err: Exception | None = None
     attempts = max(1, config.LLM_MAX_ATTEMPTS)
-    for provider in config.LLM_FALLBACK_ORDER:
+    for provider in (providers if providers is not None else config.LLM_FALLBACK_ORDER):
         configured = (
             (provider == "openrouter" and config.OPENROUTER_KEY)
             or (provider == "claude-cli" and config.CLAUDE_CODE_OAUTH_TOKEN)

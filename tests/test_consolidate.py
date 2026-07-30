@@ -1049,3 +1049,78 @@ def test_c12_recluster_reverts_on_rollback(conn, fake_llm):
     rebuild(conn)
     after = {f["id"]: f["cluster"] for f in store.fragment_pool(conn, UID)}
     assert after == bootstrap                            # rolled-back RECLUSTERED is excluded
+
+
+# ── Contradiction challenger attribution (activated by ECHO_THRESHOLD 0.72→0.60) ─
+from core.consolidate import _challengers_by_sentence, _relations  # noqa: E402
+
+
+def test_each_contradiction_is_attributed_to_its_own_claim(conn, monkeypatch):
+    """Two contradictions in one episode must mint two edges from DIFFERENT claims.
+
+    _relations used to hard-code episode_claim_ids[0] as the challenger for every
+    contradiction, so claim[0] got a 'contradicts' edge to every contradicted
+    incumbent — and _reconcile version_groups each pair, chaining unrelated beliefs
+    into one rival-view group. Latent at ECHO_THRESHOLD=0.72 (almost nothing was
+    gated); routine at 0.60."""
+    ts = "2026-01-01T00:00:00+00:00"
+    ep = encode(conn, UID, f"{S1} {S2}", source="test")["episode_id"]
+
+    # two incumbents the episode's two sentences each contradict
+    for cid, text in (("clm_old_a", S1), ("clm_old_b", S2)):
+        emit(conn, UID, "seed", "CANONICALIZED",
+             {"action": "new", "claim_id": cid, "text": text, "episode_id": "ep_prior",
+              "verbatim": text, "cluster": "main", "ts": ts})
+    # the episode's own two claims, one per sentence
+    for cid, text in (("clm_new_a", S1), ("clm_new_b", S2)):
+        emit(conn, UID, "seed", "CANONICALIZED",
+             {"action": "new", "claim_id": cid, "text": text, "episode_id": ep,
+              "verbatim": text, "cluster": "main", "ts": ts})
+    conn.commit()
+
+    sents = split_sentences(f"{S1} {S2}")
+    receipt = {"contradictions": [{"sentence": sents[0], "claim_id": "clm_old_a"},
+                                 {"sentence": sents[1], "claim_id": "clm_old_b"}]}
+    # episodes are immutable (store.py trigger), so hand _relations the row it would
+    # have read rather than rewriting receipt_json
+    episode = {"id": ep, "ts": ts, "receipt_json": json.dumps(receipt)}
+    _relations(conn, UID, "run_x", episode, {},
+               [("main", "clm_new_a"), ("main", "clm_new_b")])
+    conn.commit()
+
+    edges = [json.loads(r["payload_json"]) for r in
+             store.events_since(conn, UID, 0, types=["RELATED"])]
+    edges = [e for e in edges if e["relation"] == "contradicts"]
+    pairs = {(e["from_id"], e["to_id"]) for e in edges}
+    assert pairs == {("clm_new_a", "clm_old_a"), ("clm_new_b", "clm_old_b")}
+    # the actual regression: not every edge from the same challenger
+    assert len({f for f, _ in pairs}) == 2
+
+
+def test_challenger_attribution_falls_back_not_raises(conn, monkeypatch):
+    """Attribution is an improvement, never a gate — a broken vector lookup must
+    degrade to the old first-claim behaviour, not lose the edge."""
+    monkeypatch.setattr(store, "episode_sentences_with_vectors",
+                        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("vec down")))
+    assert _challengers_by_sentence(conn, UID, "ep_x",
+                                    [("main", "clm_a")], [{"sentence": "x"}]) == {}
+
+
+def test_a_claim_never_contradicts_itself(conn, monkeypatch):
+    """A sentence whose nearest episode claim IS the contradicted incumbent (the
+    claim was re-canonicalised to the same id) must not mint a self-edge."""
+    ts = "2026-01-01T00:00:00+00:00"
+    ep = encode(conn, UID, S1, source="test")["episode_id"]
+    emit(conn, UID, "seed", "CANONICALIZED",
+         {"action": "new", "claim_id": "clm_self", "text": S1, "episode_id": ep,
+          "verbatim": S1, "cluster": "main", "ts": ts})
+    conn.commit()
+    receipt = {"contradictions": [{"sentence": split_sentences(S1)[0],
+                                  "claim_id": "clm_self"}]}
+    _relations(conn, UID, "run_y",
+               {"id": ep, "ts": ts, "receipt_json": json.dumps(receipt)}, {},
+               [("main", "clm_self")])
+    conn.commit()
+    edges = [json.loads(r["payload_json"]) for r in
+             store.events_since(conn, UID, 0, types=["RELATED"])]
+    assert not [e for e in edges if e["relation"] == "contradicts"]

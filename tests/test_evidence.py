@@ -160,7 +160,7 @@ def stance_counter(monkeypatch):
         calls["n"] += 1
         return "entailment"
 
-    monkeypatch.setattr(evidence, "classify_stance", fake)
+    monkeypatch.setattr(evidence, "classify_stance_strict", fake)
     return calls
 
 
@@ -544,21 +544,66 @@ def test_stance_health_probe_catches_a_present_but_dead_credential(monkeypatch):
 
 def test_openrouter_stance_pins_the_fallback_chain(monkeypatch):
     """The free rung failing must NOT escalate to the paid API — that escalation at
-    sweep volume is the documented way this account got drained."""
+    sweep volume is the documented way this account got drained.
+
+    Pinned via llm.call(providers=...), NOT by assigning config.LLM_FALLBACK_ORDER:
+    the write path builds receipts while its refine pass runs in a thread, so a
+    save/restore pair around the module global races, and an interleaving that
+    captures an already-pinned order leaves the chain pinned for every caller."""
     from core import encode as enc, llm
 
     seen = {}
     monkeypatch.setattr(config, "STANCE_PROVIDER", "openrouter")
     monkeypatch.setattr(config, "LLM_FALLBACK_ORDER", ["openrouter", "claude", "gemini"])
 
-    def fake_call(prompt, tier=None, max_tokens=None, system=None):
-        seen["order"] = list(config.LLM_FALLBACK_ORDER)
+    def fake_call(prompt, tier=None, max_tokens=None, system=None, providers=None):
+        seen["providers"] = providers
+        seen["global"] = list(config.LLM_FALLBACK_ORDER)
         return {"json": {"stance": "contradiction"}, "cost": 0.0}
 
     monkeypatch.setattr(llm, "call", fake_call)
     assert enc.classify_stance("a", "b") == "contradiction"
-    assert seen["order"] == ["openrouter"]                       # pinned during the call
-    assert config.LLM_FALLBACK_ORDER == ["openrouter", "claude", "gemini"]  # and restored
+    assert seen["providers"] == ["openrouter"]                    # pinned for this call
+    # never touched, so a concurrent caller keeps its full chain
+    assert seen["global"] == ["openrouter", "claude", "gemini"]
+    assert config.LLM_FALLBACK_ORDER == ["openrouter", "claude", "gemini"]
+
+
+def test_haiku_stance_keeps_the_full_chain(monkeypatch):
+    """Only 'openrouter' pins. 'haiku' is the deliberately-unpinned provider the
+    sweep guard refuses; it must not silently acquire the pin."""
+    from core import encode as enc, llm
+
+    seen = {}
+    monkeypatch.setattr(config, "STANCE_PROVIDER", "haiku")
+
+    def fake_call(prompt, tier=None, max_tokens=None, system=None, providers=None):
+        seen["providers"] = providers
+        return {"json": {"stance": "entailment"}, "cost": 0.0}
+
+    monkeypatch.setattr(llm, "call", fake_call)
+    assert enc.classify_stance("a", "b") == "entailment"
+    assert seen["providers"] is None                              # full chain
+
+
+def test_llm_call_providers_overrides_the_chain_without_mutating_it(monkeypatch):
+    """The mechanism itself: a per-call subset, global left alone."""
+    from core import llm as llm_mod
+
+    monkeypatch.setattr(llm_mod.config, "LLM_FALLBACK_ORDER", ["claude", "gemini"])
+    monkeypatch.setattr(llm_mod.config, "OPENROUTER_KEY", "k")
+    monkeypatch.setattr(llm_mod.config, "ANTHROPIC_KEY", "k")
+    tried = []
+    monkeypatch.setattr(llm_mod, "_call_openrouter",
+                        lambda *a, **kw: tried.append("openrouter") or
+                        {"text": '{"ok":1}', "input_tokens": 1, "output_tokens": 1})
+    monkeypatch.setattr(llm_mod, "_call_claude",
+                        lambda *a, **kw: tried.append("claude") or
+                        {"text": '{"ok":1}', "input_tokens": 1, "output_tokens": 1})
+
+    llm_mod.call("p", providers=["openrouter"])
+    assert tried == ["openrouter"]                                # not in the global chain
+    assert llm_mod.config.LLM_FALLBACK_ORDER == ["claude", "gemini"]
 
 
 def test_sweep_guard_allows_pinned_openrouter_but_not_haiku(monkeypatch):
@@ -571,3 +616,96 @@ def test_sweep_guard_allows_pinned_openrouter_but_not_haiku(monkeypatch):
     for p in ("openrouter", "hf", "nli"):
         monkeypatch.setattr(config, "STANCE_PROVIDER", p)
         _stance_budget_guard()                                   # must not raise
+
+
+# ── A failing provider must DEFER, never persist a fake "neutral" ──────────────
+def _boom(*_a, **_kw):
+    raise RuntimeError("openrouter 429: free-models-per-day-high-balance")
+
+
+def test_stance_failure_does_not_persist_a_neutral_verdict(conn, fake_llm, lane_on,
+                                                           monkeypatch):
+    """The release-blocker. classify_stance() swallows failures into "neutral", which
+    IS a real verdict ("related, but neither backs nor refutes"). Storing that means
+    one exhausted OpenRouter daily cap buries genuine backing as mere adjacency AND
+    emits EVIDENCE_ATTACHED, marking the episode swept forever."""
+    tried = {"n": 0}
+
+    def boom(premise, hypothesis):
+        tried["n"] += 1
+        return _boom()
+
+    monkeypatch.setattr(evidence, "classify_stance_strict", boom)
+    _seed(conn, UID, S1)
+    ev = _seed_evidence(conn)
+    consolidate(conn, UID)            # runs the sweep, whose every stance call fails
+    conn.commit()
+
+    assert tried["n"] > 0, "vacuous: no pair ever reached a stance call"
+    rows = store.evidence_attachments_for_episode(conn, UID, ev["episode_id"])
+    assert not rows, "a failed classification was persisted as a verdict"
+    # NOT marked swept — that is what makes tomorrow retry it
+    assert ev["episode_id"] not in evidence._swept_episode_ids(conn, UID)
+
+
+def test_sweep_reports_failures_and_defers_the_episode(conn, fake_llm, lane_on,
+                                                       monkeypatch):
+    _seed(conn, UID, S1)
+    _seed_evidence(conn)
+    consolidate(conn, UID)                          # settle, with the lane working
+    monkeypatch.setattr(evidence, "classify_stance_strict", _boom)
+    _seed_evidence(conn, text=S2, title="second source")
+    with conn:
+        r = evidence.sweep(conn, UID)
+    assert r["stance_failures"] > 0                 # counted, not hidden
+    assert r["deferred"], "a failed episode must be held for the next run"
+
+
+def test_sweep_gives_up_after_consecutive_failures(conn, fake_llm, lane_on, monkeypatch):
+    """A daily cap does not clear mid-run, so every further call is guaranteed to
+    fail. 110 consecutive 429s actually happened (2026-07-30)."""
+    calls = {"n": 0}
+
+    def boom(premise, hypothesis):
+        calls["n"] += 1
+        raise RuntimeError("openrouter 429")
+
+    monkeypatch.setattr(evidence, "classify_stance_strict", boom)
+    monkeypatch.setattr(evidence, "STANCE_GIVE_UP_AFTER", 2)
+    _seed(conn, UID, S1)
+    _seed(conn, UID, S2)
+    _seed_evidence(conn)
+    consolidate(conn, UID)
+    assert calls["n"] <= 2, f"kept calling a dead provider {calls['n']} times"
+
+
+def test_a_recovered_provider_still_sweeps_the_deferred_episode(conn, fake_llm,
+                                                                lane_on, monkeypatch):
+    """Deferral must be temporary: once the quota resets the held-back episode is
+    swept normally. Otherwise 'defer' is just a slower way to lose the data."""
+    monkeypatch.setattr(evidence, "classify_stance_strict", _boom)
+    _seed(conn, UID, S1)
+    ev = _seed_evidence(conn)
+    consolidate(conn, UID)
+    conn.commit()
+    assert ev["episode_id"] not in evidence._swept_episode_ids(conn, UID)
+
+    monkeypatch.setattr(evidence, "classify_stance_strict", lambda p, h: "entailment")
+    with conn:
+        r = evidence.sweep(conn, UID)
+    conn.commit()
+    assert r["stance_failures"] == 0
+    assert r["attachments"] > 0
+    assert ev["episode_id"] in evidence._swept_episode_ids(conn, UID)
+
+
+def test_classify_stance_strict_raises_where_classify_stance_swallows(monkeypatch):
+    """The two contracts side by side — the distinction the whole fix rests on."""
+    from core import encode as enc, llm
+
+    monkeypatch.setattr(config, "STANCE_PROVIDER", "openrouter")
+    monkeypatch.setattr(config, "OPENROUTER_KEY", "k")
+    monkeypatch.setattr(llm, "call", _boom)
+    assert enc.classify_stance("a", "b") == "neutral"       # a save is never blocked
+    with pytest.raises(RuntimeError):
+        enc.classify_stance_strict("a", "b")               # persistence must know

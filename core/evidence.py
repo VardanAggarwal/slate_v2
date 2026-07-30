@@ -27,7 +27,7 @@ import json
 import logging
 
 from core import config, store
-from core.encode import classify_stance
+from core.encode import classify_stance_strict
 
 log = logging.getLogger("slate.evidence")
 
@@ -53,6 +53,13 @@ def _stance_budget_guard() -> None:
             "LLM call per (evidence sentence, claim) candidate, and its fallback chain "
             "escalates to the paid API when the free rung fails. Set STANCE_PROVIDER=nli "
             "(local), hf (Inference API), or openrouter (free rung, pinned) before sweeping.")
+
+
+# Stop calling the provider after this many failures in a row. The failure that
+# actually happened was OpenRouter's free-tier DAILY cap (1000 requests; observed
+# 2026-07-30 with 110 consecutive 429s) — that does not clear within a run, so every
+# further call is a guaranteed failure. Bail, defer, log; retry tomorrow.
+STANCE_GIVE_UP_AFTER = 5
 
 
 def _changed_claim_ids(conn, user_id: str, seq: int) -> list[str]:
@@ -119,8 +126,14 @@ def sweep(conn, user_id: str, *, k: int = 3, sent_k: int = 5,
     new_eps = [e for e in all_eps if e not in swept]
     changed = _changed_claim_ids(conn, user_id, watermark)
 
-    budget = {"pairs": 0, "stance_calls": 0}
+    budget = {"pairs": 0, "stance_calls": 0, "stance_failures": 0,
+              "consecutive_failures": 0}
     deferred: list[str] = []
+    # Episodes with at least one stance call that FAILED. Their snapshot must not be
+    # emitted: EVIDENCE_ATTACHED is what marks an episode swept (_swept_episode_ids),
+    # and a half-classified snapshot would be permanent — the pairs that failed are
+    # never revisited. Deferring costs one night; persisting a wrong verdict is forever.
+    poisoned: set[str] = set()
     # {episode_id: {(sentence_idx, claim_id): attachment}} — the delta, merged onto
     # each episode's existing rows before emit so the event stays a full snapshot.
     delta: dict[str, dict[tuple[int, str], dict]] = {}
@@ -134,9 +147,25 @@ def sweep(conn, user_id: str, *, k: int = 3, sent_k: int = 5,
         # this episode are excluded.
         if claim_id in own_claims:
             return
+        if budget["consecutive_failures"] >= STANCE_GIVE_UP_AFTER:
+            poisoned.add(ep_id)
+            return
         budget["stance_calls"] += 1
         # premise = the source (the warrant), hypothesis = the claim on trial (E2).
-        stance = classify_stance(sent_text, claim_text)
+        # STRICT: a swallowed failure would be stored as a real "neutral" verdict and
+        # the episode marked swept, so genuine backing would read as mere adjacency
+        # forever. A failure has to leave the pair unclassified instead.
+        try:
+            stance = classify_stance_strict(sent_text, claim_text)
+        except Exception as e:  # noqa: BLE001 — per-pair; the run decides what to do
+            budget["stance_failures"] += 1
+            budget["consecutive_failures"] += 1
+            poisoned.add(ep_id)
+            log.warning("evidence sweep stance failed for %s sent %d × %s (%s: %s) — "
+                        "episode deferred, not marked swept",
+                        ep_id, sent_idx, claim_id, type(e).__name__, e)
+            return
+        budget["consecutive_failures"] = 0
         delta.setdefault(ep_id, {})[(sent_idx, claim_id)] = {
             "sentence_idx": sent_idx, "claim_id": claim_id, "claim_text": claim_text,
             "stance": stance, "similarity": round(float(sim), 4)}
@@ -177,6 +206,8 @@ def sweep(conn, user_id: str, *, k: int = 3, sent_k: int = 5,
     from core.consolidate import emit
     attached = 0
     for ep_id, new_rows in delta.items():
+        if ep_id in poisoned:
+            continue   # emitting would mark it swept with an incomplete verdict set
         merged = {(a["sentence_idx"], a["claim_id"]): a
                   for a in store.evidence_attachments_for_episode(conn, user_id, ep_id)}
         merged.update(new_rows)
@@ -186,6 +217,15 @@ def sweep(conn, user_id: str, *, k: int = 3, sent_k: int = 5,
              {"evidence_episode_id": ep_id, "ts": ts, "attachments": attachments})
         attached += len(attachments)
 
+    # A poisoned episode is deferred work, which also holds the watermark back — term 2
+    # is keyed off it, so advancing past a failed night would retire those pairs too.
+    deferred = deferred + sorted(poisoned - set(deferred))
+    if budget["stance_failures"]:
+        log.error("evidence sweep: %d of %d stance call(s) FAILED — %d episode(s) held "
+                  "back for the next run. If the provider is openrouter this is most "
+                  "likely the free tier's daily cap; nothing was recorded as 'neutral' "
+                  "on account of it.", budget["stance_failures"], budget["stance_calls"],
+                  len(poisoned))
     if deferred:
         # No silent truncation: a consolidation run that re-canonicalises many claims
         # makes that night's sweep proportionally large. What got cut is named, and the
@@ -195,10 +235,11 @@ def sweep(conn, user_id: str, *, k: int = 3, sent_k: int = 5,
     else:
         store.set_evidence_watermark(conn, user_id, head, ts)
 
-    return {"status": "ok", "episodes": len(delta), "new_evidence": len(new_eps),
+    return {"status": "ok", "episodes": len(delta) - len(poisoned),
+            "new_evidence": len(new_eps),
             "changed_claims": len(changed), "deferred": deferred,
             "pairs": budget["pairs"], "stance_calls": budget["stance_calls"],
-            "attachments": attached}
+            "stance_failures": budget["stance_failures"], "attachments": attached}
 
 
 def apply_evidence_attached(conn, user_id: str, payload: dict) -> None:

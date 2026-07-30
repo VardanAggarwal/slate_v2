@@ -87,39 +87,13 @@ SELECT_CANDIDATES = """
 """
 
 
-def classify_strict(premise: str, hypothesis: str) -> str:
-    """Stance that RAISES on provider failure instead of degrading to "neutral".
-
-    encode.classify_stance() deliberately swallows failures so a save is never
-    blocked. In a bulk offline run that is exactly wrong: a 503-exhausted call
-    comes back "neutral", reads as "not a contradiction", and is silently dropped
-    — while the failure counter stays at 0 because nothing raised. Two runs over
-    identical data disagreed 13 vs 48 on the shortlist for this reason. Offline,
-    a failure must be a failure.
-    """
-    if config.STANCE_PROVIDER == "hf":
-        return encode._get_hf_stance().classify(premise, hypothesis)
-    if config.STANCE_PROVIDER == "nli":
-        scores = encode._get_nli().predict([(premise, hypothesis)])[0]
-        return ["contradiction", "entailment", "neutral"][int(scores.argmax())]
-    if config.STANCE_PROVIDER in ("openrouter", "haiku"):
-        from core import llm
-        saved = config.LLM_FALLBACK_ORDER
-        if config.STANCE_PROVIDER == "openrouter":
-            config.LLM_FALLBACK_ORDER = ["openrouter"]   # never escalate to a paid rung
-        try:
-            res = llm.call(
-                f'Premise: "{premise}"\nHypothesis: "{hypothesis}"\n'
-                'Does the hypothesis contradict, entail, or stay neutral to the premise? '
-                'Return ONLY JSON: {"stance": "contradiction"|"entailment"|"neutral"}',
-                tier="mechanical", max_tokens=2048)
-        finally:
-            config.LLM_FALLBACK_ORDER = saved
-        s = (res["json"] or {}).get("stance", "")
-        if s not in ("contradiction", "entailment", "neutral"):
-            raise RuntimeError(f"unusable stance {s!r} from {config.STANCE_PROVIDER}")
-        return s
-    return encode.classify_stance(premise, hypothesis)
+# Stance that RAISES on provider failure instead of degrading to "neutral". Lives in
+# core (encode.classify_stance_strict) because the evidence sweep needs exactly the
+# same contract: anywhere a verdict is PERSISTED or COUNTED, a swallowed failure is
+# a fabricated "neutral". Keeping a second copy here is how this script once drifted
+# into calling the swallowing path for 'openrouter' and reported 13 vs 48 on two runs
+# over identical data, with the failure counter reading 0 both times.
+classify_strict = encode.classify_stance_strict
 
 
 # Providers whose stance call IS an LLM call. For these, a cheap-recall stage 1

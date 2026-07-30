@@ -972,13 +972,63 @@ def _relations(conn, user_id: str, run_id: str, episode, bp: dict,
 
     receipt = json.loads(episode["receipt_json"] or "{}")
     episode_claim_ids = [cid for _, cid in episode_claims]
-    for contra in receipt.get("contradictions", []):
+    contras = receipt.get("contradictions", [])
+    # Attribute each contradiction to the claim that actually produced it. This used
+    # to hard-code episode_claim_ids[0] as the challenger for EVERY contradiction in
+    # the episode, so claim[0] got paired with every contradicted incumbent —
+    # `contradicts` edges between claims that have nothing to do with each other,
+    # and _reconcile then version_groups them, chaining unrelated beliefs into one
+    # rival-view group. Latent while ECHO_THRESHOLD=0.72 admitted almost nothing
+    # (9 echoes corpus-wide); lowering the gate to 0.60 makes it routine.
+    # Runs whenever the episode minted more than one claim — with a single
+    # contradiction and three claims, claim[0] is still only a 1-in-3 guess. Pure
+    # vector work over already-persisted embeddings: no LLM, no re-embed.
+    nearest = (_challengers_by_sentence(conn, user_id, episode["id"], episode_claims, contras)
+               if contras and len(episode_claim_ids) > 1 else {})
+    for contra in contras:
         old_claim = contra.get("claim_id")
-        if old_claim and episode_claim_ids:
-            emit(conn, user_id, run_id, "RELATED", {
-                "from_id": episode_claim_ids[0], "to_id": old_claim,
-                "relation": "contradicts", "weight": 1.0,
-                "evidence_episode_id": episode["id"], "ts": ts})
+        if not old_claim or not episode_claim_ids:
+            continue
+        from_id = nearest.get(contra.get("sentence")) or episode_claim_ids[0]
+        if from_id == old_claim:
+            continue  # a claim cannot contradict itself
+        emit(conn, user_id, run_id, "RELATED", {
+            "from_id": from_id, "to_id": old_claim,
+            "relation": "contradicts", "weight": 1.0,
+            "evidence_episode_id": episode["id"], "ts": ts})
+
+
+def _challengers_by_sentence(conn, user_id: str, episode_id: str,
+                             episode_claims: list[tuple[str, str]],
+                             contras: list[dict]) -> dict[str, str]:
+    """{contradicting sentence -> the episode claim it became}, by cosine over vectors
+    already persisted (W1 sentence vectors + vec_claims) — no re-embed, no LLM.
+
+    Best-effort: any sentence we cannot place is simply absent, and the caller falls
+    back to the first claim. Being wrong about WHICH challenger is better than the
+    old behaviour of being wrong about all of them at once."""
+    import numpy as np
+    try:
+        sents = {s["text"]: s["embedding"]
+                 for s in store.episode_sentences_with_vectors(conn, user_id, episode_id)}
+        cands = [(cid, store.claim_embedding(conn, user_id, cid))
+                 for _, cid in episode_claims]
+        cands = [(cid, v) for cid, v in cands if v is not None]
+        if not cands or not sents:
+            return {}
+        mat = np.array([v for _, v in cands])
+        out = {}
+        for contra in contras:
+            sent = contra.get("sentence")
+            vec = sents.get(sent)
+            if sent is None or vec is None:
+                continue
+            out[sent] = cands[int(np.argmax(mat @ np.asarray(vec)))][0]
+        return out
+    except Exception as e:  # noqa: BLE001 — attribution is an improvement, never a gate
+        log.warning("contradiction challenger attribution failed (%s: %s) — "
+                    "falling back to the episode's first claim", type(e).__name__, e)
+        return {}
 
 
 # ── Step 5b: reconcile + version conflicts (C8) ───────────────────────────────

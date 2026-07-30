@@ -266,27 +266,64 @@ def classify_stance(premise: str, hypothesis: str) -> str:
         # volume it is a billing trap: OpenRouter's free tier fails, the next rung
         # is the paid Anthropic API, and a few thousand pairs quietly bill. Pinned,
         # a provider failure is a failure — which is the safe direction here.
+        # Pinned PER CALL, never by assigning config.LLM_FALLBACK_ORDER: the write
+        # path runs its refine pass in a thread, so a save/restore pair around a
+        # module global races with any concurrent llm.call — and an unlucky
+        # interleaving leaves the chain pinned for every other caller, costing
+        # consolidation its fallback the moment the free rung hits its daily cap.
         from core import llm
-        pinned = config.STANCE_PROVIDER == "openrouter"
-        saved = config.LLM_FALLBACK_ORDER
-        if pinned:
-            config.LLM_FALLBACK_ORDER = ["openrouter"]
         try:
             result = llm.call(
                 f'Premise: "{premise}"\nHypothesis: "{hypothesis}"\n'
                 'Does the hypothesis contradict, entail, or stay neutral to the premise? '
                 'Return ONLY JSON: {"stance": "contradiction"|"entailment"|"neutral"}',
-                tier="mechanical", max_tokens=2048)
+                tier="mechanical", max_tokens=2048,
+                providers=(["openrouter"] if config.STANCE_PROVIDER == "openrouter" else None))
             stance = result["json"].get("stance", "neutral")
             return stance if stance in ("contradiction", "entailment", "neutral") else "neutral"
         except Exception as e:
             log.warning("stance %r failed (%s: %s) — degrading to neutral",
                         config.STANCE_PROVIDER, type(e).__name__, e)
             return "neutral"
-        finally:
-            if pinned:
-                config.LLM_FALLBACK_ORDER = saved
     return "neutral"
+
+
+STANCES = ("contradiction", "entailment", "neutral")
+
+
+def classify_stance_strict(premise: str, hypothesis: str) -> str:
+    """Stance that RAISES on provider failure instead of degrading to "neutral".
+
+    classify_stance() swallows failures on purpose: a save must never be blocked by
+    a flaky classifier. Anywhere the verdict gets PERSISTED or counted, that default
+    is exactly wrong — a rate-limited call returns "neutral", which is a real verdict
+    meaning "related but neither backs nor refutes", and it is indistinguishable from
+    a genuine one. The evidence sweep writes verdicts into evidence_attachments and
+    then marks the episode swept forever, so one exhausted daily quota would bury
+    real backing/refuting links as "merely related" with nothing raised. Two offline
+    runs over identical data once disagreed 13 vs 48 for this reason while the
+    failure counter read 0.
+
+    Callers decide what a failure means (defer, retry, report) — that is the point.
+    """
+    if config.STANCE_PROVIDER == "hf":
+        return _get_hf_stance().classify(premise, hypothesis)
+    if config.STANCE_PROVIDER == "nli":
+        scores = _get_nli().predict([(premise, hypothesis)])[0]
+        return ["contradiction", "entailment", "neutral"][int(scores.argmax())]
+    if config.STANCE_PROVIDER in ("openrouter", "haiku"):
+        from core import llm
+        res = llm.call(
+            f'Premise: "{premise}"\nHypothesis: "{hypothesis}"\n'
+            'Does the hypothesis contradict, entail, or stay neutral to the premise? '
+            'Return ONLY JSON: {"stance": "contradiction"|"entailment"|"neutral"}',
+            tier="mechanical", max_tokens=2048,
+            providers=(["openrouter"] if config.STANCE_PROVIDER == "openrouter" else None))
+        s = (res.get("json") or {}).get("stance", "")
+        if s not in STANCES:
+            raise RuntimeError(f"unusable stance {s!r} from {config.STANCE_PROVIDER}")
+        return s
+    raise RuntimeError(f"STANCE_PROVIDER={config.STANCE_PROVIDER!r} has no strict path")
 
 
 # ── Sentence splitter (ported from v1 engine/extract.py) ──────────────────────

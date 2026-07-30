@@ -78,28 +78,36 @@ cd /home/ubuntu/slate-engine
 cp .env.example .env && nano .env
 ```
 
-Set in `.env`: `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, **`HF_TOKEN`** (required
-on the server — copy from `/home/ubuntu/slate/.env`; it switches embeddings to
-the HF Inference API), `AUTH_USER`/`AUTH_PASS` (reuse v1's),
-`SLATE_BASE_URL=https://myslate2.duckdns.org`, and **`STANCE_PROVIDER=hf`**
-(the server image has no torch, so the local NLI cross-encoder isn't available;
-`hf` runs zero-shot MNLI over the Inference API on the `HF_TOKEN` you already
-set — no LLM call, no per-save cost). The compose file injects `DB_PATH` and
+Set in `.env`: `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`,
+**`HF_TOKEN`** (required on the server — copy from `/home/ubuntu/slate/.env`; it
+switches embeddings to the HF Inference API), `AUTH_USER`/`AUTH_PASS` (reuse
+v1's), `SLATE_BASE_URL=https://myslate.duckdns.org`, and
+**`STANCE_PROVIDER=openrouter`**. The compose file injects `DB_PATH` and
 `SLATE_V1_DB`.
+
+Provider choice (the server image has no torch, so `nli` is never an option):
+
+| value | how | why not the default |
+|---|---|---|
+| `openrouter` | free-rung LLM, chain **pinned** so it can't escalate to the paid API | **current prod.** 1000 requests/**day** free-tier cap, shared with consolidation |
+| `hf` | zero-shot MNLI over the Inference API, no LLM call | needs Inference credits; ran out 2026-07-30 (402 on every call) |
+| `haiku` | full fallback chain | bills per pair; the evidence sweep refuses it outright |
 
 > **This one is load-bearing and fails silently.** If `STANCE_PROVIDER` is
 > unset it defaults to `nli`, `_get_nli()` throws on the torch-less image,
 > `classify_stance` degrades to `"neutral"`, and `_build_receipt` files every
 > contradiction as an echo — the ⚡ line never fires and nothing errors. This
-> was live in prod 2026-07-09 → 07-30. Verify after any deploy:
+> was live in prod 2026-07-09 → 07-30. A *present but dead* credential does the
+> same thing by a different route, so the check has to be a real call, not a
+> config read. `/health` now probes once per boot; verify after any deploy:
 >
 > ```bash
-> docker exec slate-engine python -c "
-> from core import config, encode
-> print(config.STANCE_PROVIDER,
->       encode.classify_stance('I love the office.', 'I hate the office.'))"
-> # want: hf contradiction
+> curl -s localhost:8100/health | python3 -m json.tool   # want: stance.ok true
 > ```
+>
+> `stance.ok false` means every save is filing contradictions as echoes right
+> now. The usual cause is an exhausted quota — check the container log for
+> `degrading to neutral`.
 
 ## 3. Build + boot (the image's first real test)
 
