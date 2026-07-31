@@ -709,3 +709,68 @@ def test_classify_stance_strict_raises_where_classify_stance_swallows(monkeypatc
     assert enc.classify_stance("a", "b") == "neutral"       # a save is never blocked
     with pytest.raises(RuntimeError):
         enc.classify_stance_strict("a", "b")               # persistence must know
+
+
+# ── resweep: a gate change must be able to reach already-swept episodes ────────
+def test_resweep_revisits_an_episode_the_watermark_had_retired(conn, fake_llm, lane_on,
+                                                              monkeypatch, stance_counter):
+    """The watermark makes the sweep forward-only. An episode swept under ECHO=0.72
+    is recorded as swept even with ZERO attachments, so lowering the gate to 0.60
+    would never revisit it — the change would only help future saves."""
+    monkeypatch.setattr(config, "ECHO_THRESHOLD", 0.95)   # nothing can clear it
+    _seed(conn, UID, S1)
+    ev = _seed_evidence(conn)
+    consolidate(conn, UID)
+    conn.commit()
+    assert ev["episode_id"] in evidence._swept_episode_ids(conn, UID)
+    assert not store.evidence_attachments_for_episode(conn, UID, ev["episode_id"])
+
+    # gate lowered — a plain sweep is a no-op, because it is already "swept"
+    monkeypatch.setattr(config, "ECHO_THRESHOLD", 0.60)
+    with conn:
+        plain = evidence.sweep(conn, UID)
+    assert plain["pairs"] == 0, "a plain sweep must stay forward-only"
+
+    with conn:
+        again = evidence.sweep(conn, UID, resweep=True)
+    conn.commit()
+    assert again["pairs"] > 0
+    assert store.evidence_attachments_for_episode(conn, UID, ev["episode_id"]), \
+        "resweep did not reach the retired episode"
+
+
+def test_resweep_is_idempotent_and_additive(conn, fake_llm, lane_on, stance_counter):
+    """EVIDENCE_ATTACHED is a full per-episode snapshot and the applier
+    clears-then-rebuilds, so re-running must converge, not duplicate."""
+    _seed(conn, UID, S1)
+    ev = _seed_evidence(conn)
+    consolidate(conn, UID)
+    with conn:
+        evidence.sweep(conn, UID, resweep=True)
+    conn.commit()
+    first = [dict(r) for r in store.evidence_attachments_for_episode(
+        conn, UID, ev["episode_id"])]
+    with conn:
+        evidence.sweep(conn, UID, resweep=True)
+    conn.commit()
+    second = [dict(r) for r in store.evidence_attachments_for_episode(
+        conn, UID, ev["episode_id"])]
+    assert first and first == second, "resweep duplicated or dropped rows"
+
+
+def test_resweep_never_deletes_history(conn, fake_llm, lane_on, stance_counter):
+    """Attachments are derived state, rebuilt from events — the event log only grows."""
+    _seed(conn, UID, S1)
+    _seed_evidence(conn)
+    consolidate(conn, UID)
+    with conn:
+        evidence.sweep(conn, UID, resweep=True)
+    conn.commit()
+    before = conn.execute("SELECT COUNT(*) n FROM events WHERE user_id = ?",
+                          (UID,)).fetchone()["n"]
+    with conn:
+        evidence.sweep(conn, UID, resweep=True)
+    conn.commit()
+    after = conn.execute("SELECT COUNT(*) n FROM events WHERE user_id = ?",
+                         (UID,)).fetchone()["n"]
+    assert after >= before, "resweep removed events"

@@ -57,6 +57,13 @@ def main(argv=None):
     evd_sub = p_evd.add_subparsers(dest="evidence_cmd", required=True)
     e_swp = evd_sub.add_parser("sweep", help="pair research episodes with claims")
     e_swp.add_argument("--max-pairs", type=int, default=None)
+    e_swp.add_argument("--resweep", action="store_true",
+                       help="re-evaluate EVERY research episode, not just unswept ones. "
+                            "Use after changing ECHO_THRESHOLD: episodes swept under the "
+                            "old gate are recorded as swept even with zero attachments, "
+                            "so a gate change is otherwise forward-only. Idempotent "
+                            "(EVIDENCE_ATTACHED is a full snapshot), but costs one stance "
+                            "call per newly-admitted pair.")
     add_user_arg(e_swp, default=None)   # default: every user
     e_rat = evd_sub.add_parser("ratios", help="evidence:self member ratio per concept")
     add_user_arg(e_rat)
@@ -165,9 +172,11 @@ def main(argv=None):
             if args.user:
                 with conn:
                     out = evidence.sweep(conn, _resolve_user(conn, args.user),
-                                         max_pairs=args.max_pairs)
+                                         max_pairs=args.max_pairs,
+                                         resweep=args.resweep)
             else:
-                out = evidence.sweep_all_users(conn, max_pairs=args.max_pairs)
+                out = evidence.sweep_all_users(conn, max_pairs=args.max_pairs,
+                                               resweep=args.resweep)
             print(json.dumps(out, indent=2))
         elif args.evidence_cmd == "ratios":
             print(json.dumps(evidence.member_ratios(

@@ -283,12 +283,30 @@ def stage1_filter(cands, verbose=True):
     return keep, failures
 
 
-def apply_recovery(conn, user_id, confirmed, dry=True):
+def apply_recovery(conn, user_id, confirmed, dry=True, min_challenger_sim=None):
     """Emit RELATED{contradicts} for each confirmed pair, then let the normal C8
-    path (consolidate._reconcile) decide supersede / scope / version."""
-    pairs = []
+    path (consolidate._reconcile) decide supersede / scope / version.
+
+    min_challenger_sim gates the CHALLENGER side. The adjudicator confirms that a
+    SENTENCE contradicts a stored claim, but the edge has to run claim→claim, so
+    the sentence is mapped to the nearest claim its own episode minted. When that
+    nearest claim is far away, the sentence never became a claim at all (it wasn't
+    canonicalised, or it merged into a differently-worded one) and the claim we
+    would nominate is not the rival — the contradiction is real but unattributable.
+    NOVELTY_THRESHOLD is the principled floor: below it encode() would call the
+    sentence NOVEL against that claim, i.e. not the same thought.
+    """
+    floor = config.NOVELTY_THRESHOLD if min_challenger_sim is None else min_challenger_sim
+    pairs, unattributable = [], []
     seen = set()
     for c in confirmed:
+        sim = c.get("newer_claim_sim")
+        if sim is not None and sim < floor:
+            unattributable.append({"id": c["id"], "newer_claim_sim": sim,
+                                   "older_claim_id": c["older_claim_id"],
+                                   "text": c["text"], "anchor_text": c["anchor_text"],
+                                   "llm_why": c.get("llm_why")})
+            continue
         for newer in c["newer_claim_ids"]:
             if newer == c["older_claim_id"]:
                 continue
@@ -297,8 +315,18 @@ def apply_recovery(conn, user_id, confirmed, dry=True):
                 continue
             seen.add(key)
             pairs.append((newer, c["older_claim_id"], c))
+    if unattributable:
+        # Named, never silently dropped: these are confirmed contradictions that
+        # simply have no claim to hang on. They are findings, not noise.
+        print(f"[{user_id}] {len(unattributable)} confirmed contradiction(s) NOT "
+              f"applied — nearest own-episode claim below {floor} "
+              f"(sims: {sorted(u['newer_claim_sim'] for u in unattributable)})",
+              file=sys.stderr)
     if dry or not pairs:
-        return {"pairs": len(pairs), "applied": False}
+        return {"pairs": len(pairs), "applied": False,
+                "unattributable": len(unattributable),
+                "unattributable_rows": unattributable,
+                "challenger_floor": floor}
 
     run_id = "run_" + store.ulid()
     ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
@@ -338,7 +366,10 @@ def apply_recovery(conn, user_id, confirmed, dry=True):
         (run_id,)).fetchone()["n"]
     return {"pairs": len(pairs), "applied": True, "run_id": run_id,
             "claims_touched": len(touched), "versioned_events": versioned,
-            "reconcile_cost": round(cost, 4)}
+            "reconcile_cost": round(cost, 4),
+            "unattributable": len(unattributable),
+            "unattributable_rows": unattributable,
+            "challenger_floor": floor}
 
 
 def revert(conn, run_id):
@@ -364,6 +395,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--from-sweep", action="store_true")
     ap.add_argument("--from-fragments", metavar="REPORT")
+    ap.add_argument("--from-report", metavar="REPORT",
+                    help="apply the confirmed_rows of an EARLIER run's report. No "
+                         "stance calls: re-adjudicating spends the daily quota again "
+                         "and, being an LLM, may not reproduce the verdicts already "
+                         "reviewed. Use this to apply what you have read.")
     ap.add_argument("--count-only", action="store_true",
                     help="how many pairs clear the gate, with zero model calls")
     ap.add_argument("--gate", type=float,
@@ -374,6 +410,12 @@ def main():
     ap.add_argument("--k", type=int, default=3, help="claims per sentence (knn)")
     ap.add_argument("--apply", action="store_true")
     ap.add_argument("--limit", type=int, help="first N episodes (sweep only)")
+    ap.add_argument("--min-challenger-sim", type=float, default=None,
+                    metavar="S",
+                    help=f"drop a confirmed pair whose contradicting sentence is "
+                         f"further than S from the nearest claim its own episode "
+                         f"minted — there is then no claim that expresses it "
+                         f"(default NOVELTY_THRESHOLD = {config.NOVELTY_THRESHOLD})")
     ap.add_argument("--report", default="contradiction_recovery_report.json")
     ap.add_argument("--revert", metavar="RUN_ID")
     args = ap.parse_args()
@@ -396,8 +438,32 @@ def main():
               f"(NOVELTY_THRESHOLD = {config.NOVELTY_THRESHOLD})")
         return
 
-    if not (args.from_sweep or args.from_fragments):
-        sys.exit("pick a source: --from-sweep and/or --from-fragments REPORT")
+    if not (args.from_sweep or args.from_fragments or args.from_report):
+        sys.exit("pick a source: --from-sweep, --from-fragments REPORT, "
+                 "or --from-report REPORT")
+
+    if args.from_report:
+        # Pure replay of an earlier run's verdicts — zero stance calls, so no
+        # provider self-check and no quota spend.
+        with open(args.from_report) as fh:
+            prior = json.load(fh)
+        report = {"users": {}, "applied": bool(args.apply),
+                  "replayed_from": args.from_report}
+        for user_id, pu in prior.get("users", {}).items():
+            rows = pu.get("confirmed_rows") or []
+            print(f"[{user_id}] replaying {len(rows)} confirmed row(s) from "
+                  f"{args.from_report}", file=sys.stderr)
+            res = apply_recovery(conn, user_id, rows, dry=not args.apply,
+                                 min_challenger_sim=args.min_challenger_sim)
+            report["users"][user_id] = {"confirmed": len(rows), "emit": res,
+                                        "gate": pu.get("gate"),
+                                        "source": "replay"}
+        with open(args.report, "w") as fh:
+            json.dump(report, fh, indent=1, default=str)
+        print(json.dumps({u: v["emit"] for u, v in report["users"].items()},
+                         indent=1, default=str))
+        print(f"\nfull report -> {args.report}")
+        return
 
     if not args.count_only:
         probe = encode.classify_stance("I love working in the office.",
@@ -463,7 +529,8 @@ def main():
             u["rejected_rows"] = rejected
         u["confirmed"] = len(confirmed)
 
-        res = apply_recovery(conn, user_id, confirmed, dry=not args.apply)
+        res = apply_recovery(conn, user_id, confirmed, dry=not args.apply,
+                             min_challenger_sim=args.min_challenger_sim)
         u["emit"] = res
         u["confirmed_rows"] = confirmed
         report["users"][user_id] = u

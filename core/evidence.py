@@ -92,7 +92,7 @@ def _swept_episode_ids(conn, user_id: str) -> set[str]:
 
 
 def sweep(conn, user_id: str, *, k: int = 3, sent_k: int = 5,
-          max_pairs: int | None = None) -> dict:
+          max_pairs: int | None = None, resweep: bool = False) -> dict:
     """One nightly pass for one user. Emits EVIDENCE_ATTACHED (one full snapshot event
     per touched research episode) and returns a report. Caller commits.
 
@@ -105,7 +105,17 @@ def sweep(conn, user_id: str, *, k: int = 3, sent_k: int = 5,
          re-scanned wholesale.
 
     Idempotent: re-run with an unchanged corpus and both terms are empty, so it does
-    ZERO stance calls."""
+    ZERO stance calls.
+
+    resweep=True re-runs term 1 over EVERY research episode, ignoring the swept set.
+    Needed because the watermark makes the sweep forward-only, which is right for new
+    corpus content but wrong after a GATE change: episodes swept under ECHO=0.72 were
+    recorded as swept even when they attached nothing, so lowering the gate to 0.60
+    would never revisit them and the change would only ever help future saves. Safe to
+    re-run: EVIDENCE_ATTACHED is a full per-episode snapshot and apply_evidence_attached
+    clears-then-rebuilds that episode's rows, so a resweep is idempotent and additive —
+    it re-derives the same rows plus whatever the lower gate now admits. No DELETE.
+    Costs one stance call per newly-admitted pair, so it is opt-in, not the default."""
     if not config.EVIDENCE_LANE:
         return {"status": "off"}
     _stance_budget_guard()
@@ -122,7 +132,7 @@ def sweep(conn, user_id: str, *, k: int = 3, sent_k: int = 5,
         return {"status": "noop", "episodes": 0, "pairs": 0, "stance_calls": 0,
                 "attachments": 0, "deferred": []}
 
-    swept = _swept_episode_ids(conn, user_id)
+    swept = set() if resweep else _swept_episode_ids(conn, user_id)
     new_eps = [e for e in all_eps if e not in swept]
     changed = _changed_claim_ids(conn, user_id, watermark)
 
