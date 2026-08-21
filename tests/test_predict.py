@@ -79,6 +79,37 @@ def test_measure_cold_start_below_warmup():
     assert m["cold_start"] and m["anchor_id"] is None and m["residual"] == 1.0
 
 
+def test_measure_echoes_the_probe_id():
+    """X's own id comes back on the measurement. Callers that pass memory ROWS
+    (guard.forget/merge → consolidate's prune and merge-guard) map verdicts back
+    by "id"; measure() dropping it made every such caller a KeyError waiting for
+    the right corpus (it took a dormant concept to fire in prod)."""
+    rng = np.random.default_rng(SEED)
+    dirs, corpus = _corpus_AB(rng)
+    probes = [{"id": "clm_a", "text": "a", "embedding": _frag(dirs[0], rng)},
+              {"id": "clm_b", "text": "b", "embedding": _frag(dirs[1], rng)}]
+    ms = predict.measure(probes, corpus)
+    assert [m["id"] for m in ms] == ["clm_a", "clm_b"]   # order-preserving
+    # raw text has no identity — the key is still present, so consumers can rely
+    # on it existing rather than probing for it.
+    assert predict.measure(_probe(_frag(dirs[0], rng)), corpus)[0]["id"] is None
+
+
+def test_measure_cold_start_keeps_the_same_keys():
+    """The <WARMUP_MIN_CORPUS early return is a separate dict literal — it drifted
+    out of sync with the measured branch once already."""
+    rng = np.random.default_rng(SEED)
+    d = _topic_dirs(1, rng)[0]
+    thin = _rows([_frag(d, rng)], "A")               # |Y| = 1 < WARMUP_MIN_CORPUS
+    dirs, corpus = _corpus_AB(rng)
+    probe = [{"id": "clm_a", "text": "a", "embedding": _frag(d, rng)}]
+    cold = predict.measure(probe, thin)[0]
+    warm = predict.measure(probe, corpus)[0]
+    assert cold["cold_start"] and not warm["cold_start"]
+    assert cold.keys() == warm.keys()
+    assert cold["id"] == warm["id"] == "clm_a"
+
+
 def test_measure_z_orders_by_novelty():
     """The instrument, before any policy: near-dup ≪ fresh-same-topic ≪ off-topic."""
     rng = np.random.default_rng(SEED)

@@ -395,6 +395,27 @@ def test_prune_never_empties_concept(conn, fake_llm, monkeypatch):
     assert len(store.concept_member_ids(conn, UID, "cpt_d")) == 1  # one representative kept
 
 
+def test_prune_runs_against_the_real_guard(conn, fake_llm):
+    """No monkeypatch. The three tests above stub guard.forget and hand-build
+    {"id", "safe_to_drop"} dicts — inventing a contract the real function did not
+    honour, so a KeyError('id') here passed CI and killed every nightly run for
+    ten days once a concept first went dormant with >= PRUNE_MIN_MEMBERS members.
+    This test keeps the real geometry in the loop; it asserts the WIRING (verdicts
+    map back to member ids, nothing is over-dropped), not which member is
+    reconstructable — that is test_wrappers' job."""
+    ts = "2026-01-01T00:00:00+00:00"
+    _seed_dormant_concept(conn, ts)
+    before = set(store.concept_member_ids(conn, UID, "cpt_d"))
+    with conn:
+        _prune_safely(conn, UID, "run_real", ts)      # must not raise
+    after = set(store.concept_member_ids(conn, UID, "cpt_d"))
+    assert after <= before                            # only ever drops members
+    assert after                                      # never empties the concept
+    pruned = [json.loads(e["payload_json"]) for e in
+              store.events_since(conn, UID, 0, types=["PRUNED"])]
+    assert all(p["claim_id"] in before for p in pruned)   # ids, not None
+
+
 # ── C8: conflict detection + versioning. Resolver DIRECTION is mocked (it is the
 #       LLM's job); the versioning + margin-before-flip logic is what's tested. ─
 from core.consolidate import _reconcile  # noqa: E402

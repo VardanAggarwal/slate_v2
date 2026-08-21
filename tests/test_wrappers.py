@@ -152,6 +152,27 @@ def test_guard_merge_folds_covered_keeps_nuance():
     assert g[0]["safe_to_drop"] and not g[1]["safe_to_drop"]
 
 
+def test_guard_verdicts_are_keyed_by_member_id():
+    """Both guard heads are consumed by ID, not by position: consolidate's prune
+    and merge-guard build their drop lists as [v["id"] for v in verdicts]. The
+    existing wrapper tests index res[i] positionally, which is exactly how a
+    verdict with no "id" survived here and crashed the nightly run instead."""
+    rng = np.random.default_rng(SEED)
+    dirs = _topic_dirs(2, rng)
+    members = _rows([_frag(dirs[0], rng) for _ in range(4)])
+    for i, m in enumerate(members):
+        m["id"] = f"clm_{i}"
+    got = [v["id"] for v in guard.forget(members)]
+    assert got == [m["id"] for m in members]
+
+    losers, survivors = members[:2], members[2:]
+    assert [v["id"] for v in guard.merge(losers, survivors)] == ["clm_0", "clm_1"]
+
+    # cold start takes the other early return inside measure() — same contract.
+    thin = [dict(members[0], id="clm_solo")]
+    assert guard.forget(thin)[0]["id"] == "clm_solo"
+
+
 def test_guard_cold_start_never_drops():
     """Too few peers to estimate spread ⇒ cold_start ⇒ never forget blindly."""
     rng = np.random.default_rng(SEED)

@@ -143,20 +143,37 @@ def main(argv=None):
         # Write-side catch-up before the sleep phase (cron's `consolidate --all`
         # line thus also drains the refine queue — no separate cron entry needed).
         write.refine_pending(conn, _resolve_user(conn, args.user) if args.user else None)
+        # A failed run must FAIL the process. consolidate_all_users swallows a
+        # user's exception into {"status": "failed"} so one corpus can't block the
+        # others — but a zero exit code then tells cron the night went fine, and
+        # the nightly wrapper's retry never fires. Ten nights of KeyError('id') in
+        # _prune_safely went unnoticed exactly this way.
+        failed = []
         if args.user:
             user_id = _resolve_user(conn, args.user)
             while True:
                 report = consolidate(conn, user_id, max_episodes=args.max_episodes)
                 print(json.dumps(report, indent=2))
+                if report.get("status") == "failed":
+                    failed.append(report)
+                    break
                 if not args.all or report["status"] == "noop":
                     break
         else:
             while True:
                 reports = consolidate_all_users(conn, max_episodes=args.max_episodes)
                 print(json.dumps(reports, indent=2))
+                failed += [r for r in reports if r.get("status") == "failed"]
                 progress = any(r.get("episodes", 0) > 0 for r in reports)
-                if not args.all or not reports or not progress:
+                # stop on failure too: the same batch would crash the same way and
+                # `--all` would spin until the retry budget ran out.
+                if not args.all or not reports or not progress or failed:
                     break
+        if failed:
+            for r in failed:
+                print(f"consolidate FAILED for {r.get('user_id', args.user)}: "
+                      f"{r.get('error')}", file=sys.stderr)
+            sys.exit(1)
 
     elif args.cmd == "evidence":
         from core import evidence, store

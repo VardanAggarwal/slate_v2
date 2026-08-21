@@ -273,12 +273,17 @@ def compute_baselines(corpus: list[dict], C: np.ndarray | None = None) -> dict:
 # LAYER 1 — THE PREDICTOR: pure measurement. No calibration, no policy.
 # ══════════════════════════════════════════════════════════════════════════════
 def _measure_one(frag: str, e: np.ndarray, corpus: list[dict], C: np.ndarray,
-                 baselines: dict, sims: np.ndarray | None = None) -> dict:
+                 baselines: dict, sims: np.ndarray | None = None,
+                 probe_id: str | None = None) -> dict:
     """How new is `frag` relative to M, and where does it attach. Pure.
 
     `sims` is the precomputed similarity column C @ e; `measure` forms all
     fragment columns in one gemm and passes them in, avoiding a matvec per
-    fragment."""
+    fragment.
+
+    `probe_id` is X's own identity, echoed back as "id" so a caller that passed
+    memory ROWS can map a verdict back to the row it measured (guard.forget /
+    guard.merge do exactly that). None when X was raw text with no identity."""
     if sims is None:
         sims = C @ e
     nearest = int(np.argmax(sims))
@@ -328,7 +333,8 @@ def _measure_one(frag: str, e: np.ndarray, corpus: list[dict], C: np.ndarray,
     dom = max((c for c in nbr_clusters if c is not None),
               key=[c for c in nbr_clusters].count, default=None)
 
-    return {"text": frag, "residual": round(r_e, 4), "z": round(float(z), 3),
+    return {"id": probe_id, "text": frag,
+            "residual": round(r_e, 4), "z": round(float(z), 3),
             "nearest_sim": round(nearest_sim, 4),
             "anchor_id": anchor["id"], "anchor_text": anchor["text"],
             "peer_mean": round(peer_mean, 4), "peer_std": round(peer_std, 4),
@@ -343,9 +349,11 @@ def measure(x: str | list[str] | list[dict], corpus: list[dict], *,
     X (`x`) — the probes. Either:
       - a str           → split into sentence fragments (the Write entrypoint), or
       - a list[str]     → pre-split fragments, used verbatim, or
-      - a list[dict]    → items {"text","embedding"(opt)} whose embeddings are
-                          reused as-is (no re-embed) — lets a wrapper measure
-                          memory rows it already holds.
+      - a list[dict]    → items {"text","embedding"(opt),"id"(opt)} whose
+                          embeddings are reused as-is (no re-embed) — lets a
+                          wrapper measure memory rows it already holds. "id" is
+                          echoed back on the measurement so the caller can map a
+                          result to the row it came from.
     Y (`corpus`) — the measurement context: items {"id","text","embedding"(opt),
       "cluster"(opt)}. This is the ONE knob the spine turns: Write sends X=note,
       Y=memory; Scan sends X=Y=the note's own sentences; Retrieve sends
@@ -365,24 +373,29 @@ def measure(x: str | list[str] | list[dict], corpus: list[dict], *,
     if isinstance(x, str):
         frags = split(x)
         texts = frags
+        ids: list[str | None] = [None] * len(frags)
         xe = None
     elif x and isinstance(x[0], dict):
         frags = [f.get("text") for f in x]
         texts = frags
+        ids = [f.get("id") for f in x]
         xe = np.vstack([np.asarray(f["embedding"], dtype=float) for f in x]) \
             if all(f.get("embedding") is not None for f in x) else None
     else:
         frags = list(x)
         texts = frags
+        ids = [None] * len(frags)
         xe = None
     if not frags:
         return []
     fe = xe if xe is not None else embed([t for t in texts])
 
     if len(corpus) < WARMUP_MIN_CORPUS:
-        return [{"text": f, "residual": 1.0, "z": 0.0, "nearest_sim": None,
+        return [{"id": i, "text": f, "residual": 1.0, "z": 0.0,
+                 "nearest_sim": None,
                  "anchor_id": None, "anchor_text": None, "peer_mean": 0.0,
-                 "peer_std": 0.0, "cluster": None, "cold_start": True} for f in frags]
+                 "peer_std": 0.0, "cluster": None, "cold_start": True}
+                for i, f in zip(ids, frags)]
 
     missing = [c for c in corpus if c.get("embedding") is None]
     if missing:
@@ -400,7 +413,8 @@ def measure(x: str | list[str] | list[dict], corpus: list[dict], *,
             hit = np.where(S[:, j] >= 1.0 - 1e-6)[0]
             if hit.size:
                 S[hit[0], j] = -np.inf
-    return [_measure_one(f, fe[j], corpus, C, baselines, S[:, j])
+    return [_measure_one(f, fe[j], corpus, C, baselines, S[:, j],
+                         probe_id=ids[j])
             for j, f in enumerate(frags)]
 
 
