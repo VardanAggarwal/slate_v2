@@ -157,6 +157,14 @@ DEFAULT_CALIBRATION = {
     "res_fb_rerank": True,
     "res_fb_alpha": 1.0,
     "res_fb_w_pos": 0.45,
+    # Cross-encoder rerank: real (query, candidate) scoring over the top res_ce_top_n
+    # nodes by current salience, vs res_fb_rerank's query-similarity-only reweight.
+    # OFF by default — unvalidated on real events (unlike res_fb_rerank, which has a
+    # lab result), and costs one HF Inference call per retrieval when on. Flip
+    # res_ce_rerank→True to try it; a reranker failure degrades to a no-op.
+    "res_ce_rerank": False,
+    "res_ce_top_n": 15,
+    "res_ce_alpha": 1.0,
 }
 
 
@@ -358,6 +366,29 @@ def resonance_recall(conn, user_id: str, query: str, *,
             nodes, q_emb, retrieve.feedback_rerank_index(conn, user_id),
             alpha=float(calibration.get("res_fb_alpha", 1.0)),
             w_pos=float(calibration.get("res_fb_w_pos", 0.45)))
+    # Real (query, candidate) cross-encoder pass over the top N nodes by current
+    # salience — bounds the API call regardless of field size. Text lookup is by
+    # id prefix (clm_/qclm_ → claim text, cpt_ → concept canonical/label); ids
+    # this repo doesn't know how to fetch text for are silently excluded from
+    # the candidate set, not from the field.
+    if bool(calibration.get("res_ce_rerank", False)) and nodes:
+        top_n = int(calibration.get("res_ce_top_n", 15))
+        cand_ids = [nid for nid, _ in
+                   sorted(nodes.items(), key=lambda kv: -kv[1]["salience"])[:top_n]]
+        texts: dict[str, str] = {}
+        for nid in cand_ids:
+            if nid.startswith(("clm_", "qclm_")):
+                c = store.get_claim(conn, user_id, nid)
+                if c:
+                    texts[nid] = c["text"]
+            elif nid.startswith("cpt_"):
+                c = store.get_concept(conn, user_id, nid)
+                if c:
+                    texts[nid] = c["canonical"] or c["label"]
+        if texts:
+            retrieve.cross_encoder_rerank(
+                nodes, query, texts,
+                alpha=float(calibration.get("res_ce_alpha", 1.0)))
     if not nodes or field["top_sim"] < float(calibration.get("res_triage_min_rel", TRIAGE_MIN_REL)):
         if signals:
             retrieve.record_retrieval_signal(conn, user_id, query, fetched=[],

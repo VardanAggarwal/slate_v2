@@ -53,6 +53,67 @@ def get_embedder():
     return _embedder
 
 
+# ── Cross-encoder reranker (real (query, candidate) scoring) ──────────────────
+# Same split as get_embedder(): HF Inference API when HF_TOKEN is set (no torch,
+# the prod path), local sentence-transformers CrossEncoder otherwise (dev/test).
+# Unlike HFStance's zero-shot endpoint, InferenceClient.sentence_similarity has one
+# stable response shape (list[float]) across models, so no raw-POST workaround
+# is needed here.
+_reranker = None
+
+
+class HFReranker:
+    """Thin wrapper around HF Inference API sentence-similarity (cross-encoder)."""
+
+    def __init__(self, token: str, model: str | None = None):
+        from huggingface_hub import InferenceClient
+        self._client = InferenceClient(api_key=token, timeout=config.RERANK_HF_TIMEOUT)
+        self._model = model or config.RERANK_MODEL
+
+    def rank(self, query: str, candidates: list[str]) -> list[float]:
+        """Scores for (query, candidate) pairs, one per candidate, higher = more
+        relevant. Retries transient failures (cold-start 503s); a permanent
+        failure (bad model/auth, 4xx) is raised immediately — callers degrade."""
+        import time
+        last = None
+        for attempt in range(config.RERANK_HF_RETRIES):
+            try:
+                return list(self._client.sentence_similarity(
+                    query, candidates, model=self._model))
+            except Exception as e:  # noqa: BLE001 — re-raised below if all attempts fail
+                last = e
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                if status is not None and 400 <= status < 500 and status != 429:
+                    raise  # permanent — retrying just wastes time
+                if attempt < config.RERANK_HF_RETRIES - 1:
+                    time.sleep(config.RERANK_HF_BACKOFF * (2 ** attempt))
+        raise last
+
+
+class LocalReranker:
+    """Dev/test fallback: local sentence-transformers CrossEncoder (needs torch)."""
+
+    def __init__(self, model: str | None = None):
+        from sentence_transformers import CrossEncoder
+        self._model = CrossEncoder(model or config.RERANK_MODEL)
+
+    def rank(self, query: str, candidates: list[str]) -> list[float]:
+        if not candidates:
+            return []
+        scores = self._model.predict([(query, c) for c in candidates])
+        return [float(s) for s in scores]
+
+
+def get_reranker():
+    global _reranker
+    if _reranker is None:
+        if config.HF_TOKEN:
+            _reranker = HFReranker(config.HF_TOKEN)
+        else:
+            _reranker = LocalReranker()
+    return _reranker
+
+
 # ── Stance classifier (PLAN.md §9.1: local NLI first, one Haiku call fallback) ─
 # The W6 resolver answers ONE bit at write: contradiction or not. The 'nli'
 # CrossEncoder needs torch — absent on the 1GB HF-only prod host, where it throws

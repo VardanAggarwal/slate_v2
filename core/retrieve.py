@@ -29,11 +29,14 @@ consolidation and pushed down — never baked here (mirrors recall/assembly).
 from __future__ import annotations
 
 import json
+import logging
 
 import numpy as np
 
 from core import assembly, calibration as calib, predict, scan, store
-from core.encode import get_embedder, split_sentences
+from core.encode import get_embedder, get_reranker, split_sentences
+
+log = logging.getLogger("slate.retrieve")
 
 # Seed breadth: how many nearest fragments to hand the assembly loop. Wider than
 # the final assembly so the greedy selector has room to pick for COVERAGE, not just
@@ -297,6 +300,29 @@ def apply_feedback_rerank(nodes: dict, q_emb, index: list[dict], *,
                 nd["salience"] *= boost
 
 
+def cross_encoder_rerank(nodes: dict, query: str, texts: dict[str, str], *,
+                         alpha: float) -> None:
+    """Real (query, candidate) cross-encoder scoring, vs apply_feedback_rerank's
+    query-similarity-only reweight. `texts` is the caller-selected candidate set
+    (id → text) — bounds the API call to however many ids the caller passes, not
+    the whole field. Multiplies salience by (1 + alpha·score); mutates `nodes` in
+    place, only for ids present in both `nodes` and `texts`. A reranker failure
+    (offline, rate-limited, no HF_TOKEN + no torch) degrades to a no-op — this is
+    a reweight on top of existing ranking, never the only signal, so skipping it
+    silently is safe (unlike stance's degrade-to-neutral, which is load-bearing)."""
+    ids = [nid for nid in texts if nid in nodes]
+    if not ids:
+        return
+    try:
+        scores = get_reranker().rank(query, [texts[nid] for nid in ids])
+    except Exception as e:  # noqa: BLE001 — reranker is a bonus signal, never blocking
+        log.warning("cross-encoder rerank unavailable (%s: %s) — skipping",
+                   type(e).__name__, e)
+        return
+    for nid, score in zip(ids, scores):
+        nodes[nid]["salience"] *= (1.0 + alpha * float(score))
+
+
 def record_relevance_feedback(conn, user_id: str, query: str, *,
                               relevant: list[str], irrelevant: list[str],
                               run_id: str | None = None) -> None:
@@ -489,7 +515,7 @@ def assemble_context(conn, user_id: str, topic: str, max_chars: int = 6000,
     return "\n".join(out)
 
 
-__all__ = ["feedback_rerank_index", "apply_feedback_rerank",
+__all__ = ["feedback_rerank_index", "apply_feedback_rerank", "cross_encoder_rerank",
            "fragment_recall", "assemble_context", "decompose_query",
            "record_retrieval_signal", "record_relevance_feedback",
            "record_engagement", "SEED_K",

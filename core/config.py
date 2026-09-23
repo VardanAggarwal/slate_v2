@@ -19,6 +19,18 @@ SLATE_V1_DB = os.getenv("SLATE_V1_DB", str(Path.home() / "slate" / "data" / "sla
 # local SentenceTransformer only for dev/tests — identical 384-dim vectors) ───
 HF_TOKEN         = os.getenv("HF_TOKEN", "")
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "all-MiniLM-L6-v2")
+
+# Cross-encoder reranker — real (query, candidate) scoring for the top-N field
+# nodes, vs apply_feedback_rerank's query-similarity-only reweight. Same
+# HF_TOKEN/InferenceClient path as HFEmbedder (no torch); local sentence-
+# transformers CrossEncoder is the dev/test fallback when HF_TOKEN is unset,
+# same split as get_embedder(). Off by default (core/resonance.py
+# DEFAULT_CALIBRATION["res_ce_rerank"]) — unvalidated, costs one HF call per
+# retrieval when on.
+RERANK_MODEL      = os.getenv("RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+RERANK_HF_TIMEOUT = float(os.getenv("RERANK_HF_TIMEOUT", "30"))
+RERANK_HF_RETRIES = int(os.getenv("RERANK_HF_RETRIES", "3"))
+RERANK_HF_BACKOFF = float(os.getenv("RERANK_HF_BACKOFF", "1.5"))
 EMBED_DIM        = 384
 
 # ── Encode-time receipt thresholds (cosine similarity) ────────────────────────
